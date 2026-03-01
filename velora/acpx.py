@@ -141,7 +141,11 @@ def _gemini_generate_content(*, api_key: str, model: str, prompt: str, timeout_s
     This avoids relying on a local `gemini` binary, which may not be installed.
     """
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    model_name = model[len("models/") :] if model.startswith("models/") else model
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:generateContent?key={api_key}"
+    )
     body = {
         "contents": [
             {
@@ -194,7 +198,7 @@ def run_gemini_review(diff_text: str) -> CmdResult:
     env = os.environ.copy()
     api_key = get_vault_key("GEMINI_API_KEY", env=env)
 
-    model = env.get("VELORA_GEMINI_MODEL", "gemini-2.0-flash")
+    model = env.get("VELORA_GEMINI_MODEL", "gemini-2.5-flash")
     max_diff_chars = int(env.get("VELORA_GEMINI_MAX_DIFF_CHARS", "120000"))
     diff_trimmed = diff_text
     if len(diff_trimmed) > max_diff_chars:
