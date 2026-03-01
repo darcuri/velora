@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from functools import lru_cache
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from shutil import which
 from typing import Any
@@ -46,7 +46,12 @@ def resolve_acpx_cmd(env: dict[str, str] | None = None) -> str:
     )
 
 
-def run_cmd(cmd: list[str], cwd: Path | None = None, input_text: str | None = None) -> CmdResult:
+def run_cmd(
+    cmd: list[str],
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> CmdResult:
     proc = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -54,12 +59,36 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, input_text: str | None = No
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
     return CmdResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
+def ensure_codex_session(session_name: str, cwd: Path, env: dict[str, str]) -> CmdResult:
+    acpx_cmd = resolve_acpx_cmd(env=env)
+    cmd = [
+        acpx_cmd,
+        "--cwd",
+        str(cwd),
+        "codex",
+        "sessions",
+        "ensure",
+        "--name",
+        session_name,
+    ]
+    return run_cmd(cmd, env=env)
+
+
 def run_codex(session_name: str, cwd: Path, prompt: str) -> CmdResult:
-    acpx_cmd = resolve_acpx_cmd()
+    # acpx codex requires OPENAI_API_KEY; pull from env or Vault.
+    env = os.environ.copy()
+    env["OPENAI_API_KEY"] = get_vault_key("OPENAI_API_KEY", env=env)
+
+    ensure = ensure_codex_session(session_name=session_name, cwd=cwd, env=env)
+    if ensure.returncode != 0:
+        return ensure
+
+    acpx_cmd = resolve_acpx_cmd(env=env)
     cmd = [
         acpx_cmd,
         "--cwd",
@@ -74,7 +103,7 @@ def run_codex(session_name: str, cwd: Path, prompt: str) -> CmdResult:
         "-f",
         "-",
     ]
-    return run_cmd(cmd, input_text=prompt)
+    return run_cmd(cmd, input_text=prompt, env=env)
 
 
 def parse_codex_footer(output: str) -> dict[str, str]:
@@ -99,8 +128,15 @@ def run_gemini_review(diff_text: str) -> CmdResult:
         "Focus on correctness and regressions. Keep it concise.\n\n"
         f"{diff_text}"
     )
-    acpx_cmd = resolve_acpx_cmd()
-    return run_cmd([acpx_cmd, "--format", "quiet", "gemini", "exec", "-f", "-"], input_text=prompt)
+    env = os.environ.copy()
+    env["GEMINI_API_KEY"] = get_vault_key("GEMINI_API_KEY", env=env)
+
+    acpx_cmd = resolve_acpx_cmd(env=env)
+    return run_cmd(
+        [acpx_cmd, "--format", "quiet", "gemini", "exec", "-f", "-"],
+        input_text=prompt,
+        env=env,
+    )
 
 
 def _read_file(path: Path) -> str:
@@ -112,7 +148,12 @@ def _read_file(path: Path) -> str:
     return value
 
 
-def _vault_request(method: str, path: str, body: dict[str, Any] | None = None, token: str | None = None) -> dict[str, Any]:
+def _vault_request(
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    token: str | None = None,
+) -> dict[str, Any]:
     data = json.dumps(body).encode("utf-8") if body is not None else None
     url = f"{VAULT_ADDR}{path}"
     headers = {"Content-Type": "application/json"}
