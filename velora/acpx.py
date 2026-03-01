@@ -11,6 +11,8 @@ from typing import Any
 import urllib.error
 import urllib.request
 
+from .config import get_config
+
 
 @dataclass
 class CmdResult:
@@ -28,16 +30,25 @@ def _fallback_acpx_path(env: dict[str, str] | None = None) -> Path:
     raw = env_map.get("VELORA_ACPX_FALLBACK", "").strip()
     if raw:
         return Path(raw).expanduser()
+
+    cfg = get_config()
+    if cfg.acpx_fallback is not None:
+        return cfg.acpx_fallback
+
     return DEFAULT_FALLBACK_ACPX
 
 
 def _vault_addr(env: dict[str, str] | None = None) -> str:
     env_map = env if env is not None else os.environ
-    return (
-        env_map.get("VELORA_VAULT_ADDR", "").strip()
-        or env_map.get("VAULT_ADDR", "").strip()
-        or DEFAULT_VAULT_ADDR
-    )
+    raw = env_map.get("VELORA_VAULT_ADDR", "").strip() or env_map.get("VAULT_ADDR", "").strip()
+    if raw:
+        return raw
+
+    cfg = get_config()
+    if cfg.vault_addr:
+        return cfg.vault_addr
+
+    return DEFAULT_VAULT_ADDR
 
 
 def _fallback_acpx_exists(env: dict[str, str] | None = None) -> bool:
@@ -49,6 +60,10 @@ def resolve_acpx_cmd(env: dict[str, str] | None = None) -> str:
     env_cmd = env_map.get("VELORA_ACPX_CMD", "").strip()
     if env_cmd:
         return env_cmd
+
+    cfg = get_config()
+    if cfg.acpx_cmd:
+        return cfg.acpx_cmd
 
     resolved = which("acpx")
     if resolved:
@@ -305,8 +320,10 @@ def _vault_request(
 @lru_cache(maxsize=1)
 def _load_vault_api_keys() -> dict[str, str]:
     env = os.environ
-    default_role_id = Path.home() / ".openclaw" / ".vault-role-id"
-    default_secret_id = Path.home() / ".openclaw" / ".vault-secret-id"
+    cfg = get_config()
+
+    default_role_id = cfg.vault_role_id_file
+    default_secret_id = cfg.vault_secret_id_file
 
     role_id_path = Path(env.get("VELORA_VAULT_ROLE_ID_FILE", str(default_role_id))).expanduser()
     secret_id_path = Path(env.get("VELORA_VAULT_SECRET_ID_FILE", str(default_secret_id))).expanduser()
@@ -323,7 +340,7 @@ def _load_vault_api_keys() -> dict[str, str]:
     if not token:
         raise RuntimeError("Vault login succeeded but did not return client token")
 
-    secret_path = env.get("VELORA_VAULT_API_KEYS_PATH", "/v1/secret/data/openclaw/api-keys")
+    secret_path = env.get("VELORA_VAULT_API_KEYS_PATH", cfg.vault_api_keys_path)
     secret = _vault_request("GET", secret_path, token=token)
     data = secret.get("data", {}).get("data", {})
     if not isinstance(data, dict):

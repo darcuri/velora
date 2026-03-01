@@ -37,6 +37,8 @@ velora run darcuri/tiny-lab feature --unsafe-task "Add SPEED conversions with te
 
 ## Useful environment variables (v0)
 
+Velora also supports a JSON config file; see [Configuration](./config.md).
+
 - `VELORA_ALLOWED_OWNERS` (comma-separated; default: `darcuri`)
 - `VELORA_MAX_ATTEMPTS` (default: `3`)
 - `VELORA_CODEX_SESSION_PREFIX` (default: `velora-codex-`)

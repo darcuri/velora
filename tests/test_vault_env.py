@@ -4,18 +4,22 @@ from pathlib import Path
 from unittest.mock import call, patch
 
 import velora.acpx as acpx
+from velora.config import get_config
 
 
 class TestVaultEnvOverrides(unittest.TestCase):
     def setUp(self):
-        # _load_vault_api_keys() is lru_cached; clear between tests.
+        # Caches: config + Vault keys.
+        get_config.cache_clear()
         acpx._load_vault_api_keys.cache_clear()
 
     def tearDown(self):
+        get_config.cache_clear()
         acpx._load_vault_api_keys.cache_clear()
 
     def test_vault_addr_override(self):
         with patch.dict(os.environ, {"VELORA_VAULT_ADDR": "https://vault.example:8200"}, clear=False):
+            get_config.cache_clear()
             self.assertEqual(acpx._vault_addr(), "https://vault.example:8200")
 
     def test_vault_credential_and_secret_path_overrides(self):
@@ -35,6 +39,8 @@ class TestVaultEnvOverrides(unittest.TestCase):
         with patch.dict(os.environ, env, clear=False), patch(
             "velora.acpx._read_file", side_effect=["role", "secret"]
         ) as rf, patch("velora.acpx._vault_request", side_effect=fake_vault_request) as vr:
+            get_config.cache_clear()
+            acpx._load_vault_api_keys.cache_clear()
             keys = acpx._load_vault_api_keys()
 
         self.assertEqual(keys["OPENAI_API_KEY"], "x")

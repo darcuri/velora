@@ -6,6 +6,7 @@ This directory holds user-facing documentation for Velora.
 
 - [CLI](./cli.md)
 - [JSON Run Spec](./json-run-spec.md)
+- [Configuration](./config.md)
 
 ## Why Markdown (for now)
 
