@@ -135,8 +135,12 @@ class GitHubClient:
         if any(conclusion in failure_conclusions for _, _, conclusion in conclusions):
             return "failure", f"check-runs={conclusions}"
 
-        if status_state == "success" and check_runs and not pending:
-            return "success", f"checks-complete={len(check_runs)}"
+        # GitHub Actions often reports check-runs without setting commit statuses.
+        # If all check-runs are completed + successful, treat CI as success even if
+        # the combined status endpoint still says "pending".
+        if check_runs and not pending and all(conclusion == "success" for _, _, conclusion in conclusions):
+            return "success", f"check-runs-success={len(check_runs)}"
+
         if status_state == "success" and not check_runs:
             return "success", "combined-status-success"
         return "pending", f"combined-status={status_state}; checks={conclusions}"
