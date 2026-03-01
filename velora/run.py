@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -8,9 +9,16 @@ from typing import Any
 from .acpx import parse_codex_footer, run_codex, run_gemini_review
 from .github import GitHubClient
 from .state import upsert_task
+from .spec import RunSpec
 from .util import build_task_id, ensure_dir, now_iso, repo_slug, velora_home
 
-ALLOWED_OWNER = "darcuri"
+def _allowed_owners(env: dict[str, str] | None = None) -> set[str]:
+    env_map = env if env is not None else os.environ
+    raw = env_map.get("VELORA_ALLOWED_OWNERS", "darcuri")
+    owners = {p.strip() for p in raw.split(",") if p.strip()}
+    return owners or {"darcuri"}
+
+
 VALID_VERBS = {"feature", "fix", "refactor"}
 
 
@@ -19,8 +27,10 @@ def validate_repo_allowed(repo_ref: str) -> tuple[str, str]:
     if len(parts) != 2 or not parts[0] or not parts[1]:
         raise ValueError("Repo must be in owner/repo format")
     owner, repo = parts
-    if owner != ALLOWED_OWNER:
-        raise ValueError("Repository is not allowed in v0 (allowed: darcuri/*)")
+    allowed = _allowed_owners()
+    if owner not in allowed:
+        allowed_str = ", ".join(sorted(allowed))
+        raise ValueError(f"Repository owner is not allowed in v0 (allowed: {allowed_str}/*)")
     return owner, repo
 
 
@@ -53,8 +63,17 @@ def ensure_repo_checkout(owner: str, repo: str, home: Path | None = None) -> Pat
     return checkout
 
 
-def _task_title(verb: str, task: str) -> str:
+def _task_title(verb: str, task: str, title_override: str | None = None) -> str:
+    if title_override and title_override.strip():
+        return title_override.strip()
     return f"[{verb}] {task}".strip()
+
+
+def _task_body(task_id: str, summary: str, extra_body: str | None) -> str:
+    body = f"VELORA task_id: {task_id}\n\n{summary}".strip()
+    if extra_body and extra_body.strip():
+        body += "\n\n" + extra_body.strip()
+    return body + "\n"
 
 
 def _build_codex_prompt(
@@ -142,9 +161,12 @@ def _read_diff_for_review(repo_path: Path, base_ref: str, head_sha: str) -> str:
     return _run_checked(["git", "diff", f"origin/{base_ref}...{head_sha}"], cwd=repo_path)
 
 
-def run_task(repo_ref: str, verb: str, task_text: str, home: Path | None = None) -> dict[str, Any]:
+def run_task(repo_ref: str, verb: str, spec: RunSpec, home: Path | None = None) -> dict[str, Any]:
     if verb not in VALID_VERBS:
         raise ValueError(f"Invalid verb: {verb}. Allowed: {', '.join(sorted(VALID_VERBS))}")
+
+    task_text = spec.task
+
     owner, repo = validate_repo_allowed(repo_ref)
     gh = GitHubClient.from_env()
     base_branch = gh.get_default_branch(owner, repo)
@@ -173,9 +195,16 @@ def run_task(repo_ref: str, verb: str, task_text: str, home: Path | None = None)
     }
     upsert_task(record, home=base_home)
 
-    session_name = f"velora-codex-{repo_slug(owner, repo)}"
+    prefix = os.environ.get("VELORA_CODEX_SESSION_PREFIX", "velora-codex-")
+    session_name = f"{prefix}{repo_slug(owner, repo)}"
     fix_context: str | None = None
-    max_attempts = 3
+    max_attempts = spec.max_attempts
+    if max_attempts is None:
+        try:
+            max_attempts = int(os.environ.get("VELORA_MAX_ATTEMPTS", "3"))
+        except ValueError:
+            max_attempts = 3
+    max_attempts = max(1, min(int(max_attempts), 10))
 
     for attempt in range(1, max_attempts + 1):
         prompt = _build_codex_prompt(task_id, repo_ref, verb, task_text, attempt, fix_context)
@@ -203,8 +232,8 @@ def run_task(repo_ref: str, verb: str, task_text: str, home: Path | None = None)
             pr = gh.create_pull_request(
                 owner=owner,
                 repo=repo,
-                title=_task_title(verb, task_text),
-                body=f"VELORA task_id: {task_id}\n\n{footer['summary']}",
+                title=_task_title(verb, task_text, spec.title),
+                body=_task_body(task_id, footer["summary"], spec.body),
                 head=footer["branch"],
                 base=base_branch,
             )
