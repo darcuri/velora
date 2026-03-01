@@ -6,7 +6,7 @@ import sys
 
 from .run import run_task
 from .spec import RunSpec, load_run_spec
-from .state import get_status_view
+from .state import get_status_view, prune_stale_tasks
 
 VERBS = ("feature", "fix", "refactor")
 
@@ -17,6 +17,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_p = sub.add_parser("status", help="Show active and recent tasks")
     status_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    gc_p = sub.add_parser("gc", help="Mark old running-like tasks as stale")
+    gc_p.add_argument("--older-than-hours", type=int, default=24, help="Mark tasks older than this as stale")
+    gc_p.add_argument("--dry-run", action="store_true", help="Report what would change without writing")
+    gc_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     run_p = sub.add_parser("run", help="Run a VELORA task")
     run_p.add_argument("repo", help="GitHub repo in owner/repo format")
@@ -59,6 +64,19 @@ def _print_status(json_mode: bool) -> int:
     return 0
 
 
+def _print_gc_result(result: dict[str, object], json_mode: bool) -> int:
+    if json_mode:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        count = int(result.get("count") or 0)
+        dry = bool(result.get("dry_run"))
+        hrs = result.get("older_than_hours")
+        print(f"gc: marked {count} task(s) stale (older_than_hours={hrs}, dry_run={dry})")
+        for tid in result.get("stale_marked") or []:
+            print(f"- {tid}")
+    return 0
+
+
 def _print_run_result(result: dict[str, object], json_mode: bool) -> int:
     if json_mode:
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -79,6 +97,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "status":
             return _print_status(args.json)
+        if args.cmd == "gc":
+            result = prune_stale_tasks(
+                older_than_hours=int(args.older_than_hours),
+                dry_run=bool(args.dry_run),
+            )
+            return _print_gc_result(result, args.json)
         if args.cmd == "run":
             spec: RunSpec
             if args.spec:
