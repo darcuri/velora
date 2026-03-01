@@ -10,13 +10,11 @@ from .acpx import parse_codex_footer, run_codex, run_gemini_review
 from .github import GitHubClient
 from .state import upsert_task
 from .spec import RunSpec
+from .config import get_config
 from .util import build_task_id, ensure_dir, now_iso, repo_slug, velora_home
 
-def _allowed_owners(env: dict[str, str] | None = None) -> set[str]:
-    env_map = env if env is not None else os.environ
-    raw = env_map.get("VELORA_ALLOWED_OWNERS", "darcuri")
-    owners = {p.strip() for p in raw.split(",") if p.strip()}
-    return owners or {"darcuri"}
+def _allowed_owners() -> set[str]:
+    return set(get_config().allowed_owners)
 
 
 VALID_VERBS = {"feature", "fix", "refactor"}
@@ -195,15 +193,10 @@ def run_task(repo_ref: str, verb: str, spec: RunSpec, home: Path | None = None) 
     }
     upsert_task(record, home=base_home)
 
-    prefix = os.environ.get("VELORA_CODEX_SESSION_PREFIX", "velora-codex-")
-    session_name = f"{prefix}{repo_slug(owner, repo)}"
+    cfg = get_config()
+    session_name = f"{cfg.codex_session_prefix}{repo_slug(owner, repo)}"
     fix_context: str | None = None
-    max_attempts = spec.max_attempts
-    if max_attempts is None:
-        try:
-            max_attempts = int(os.environ.get("VELORA_MAX_ATTEMPTS", "3"))
-        except ValueError:
-            max_attempts = 3
+    max_attempts = spec.max_attempts if spec.max_attempts is not None else cfg.max_attempts
     max_attempts = max(1, min(int(max_attempts), 10))
 
     for attempt in range(1, max_attempts + 1):
