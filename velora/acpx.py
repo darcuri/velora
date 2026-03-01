@@ -218,8 +218,9 @@ def run_gemini_review(diff_text: str) -> CmdResult:
     api_key = get_vault_key("GEMINI_API_KEY", env=env)
 
     primary_model = env.get("VELORA_GEMINI_MODEL", "gemini-3-flash-preview")
-    fallback_model = env.get("VELORA_GEMINI_FALLBACK_MODEL", "gemini-2.5-pro")
-    models = [m for m in [primary_model, fallback_model] if m]
+    fallback_model = env.get("VELORA_GEMINI_FALLBACK_MODEL", "gemini-3.1-pro-preview")
+    fallback_model_2 = env.get("VELORA_GEMINI_FALLBACK_MODEL_2", "gemini-pro-latest")
+    models = [m for m in [primary_model, fallback_model, fallback_model_2] if m]
 
     min_chars = int(env.get("VELORA_GEMINI_MIN_CHARS", "120"))
     max_output_tokens = int(env.get("VELORA_GEMINI_MAX_OUTPUT_TOKENS", "1024"))
