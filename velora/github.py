@@ -87,6 +87,16 @@ class GitHubClient:
             data={"title": title, "body": body, "head": head, "base": base},
         )
 
+    def get_repo(self, owner: str, repo: str) -> dict[str, Any]:
+        return self._request("GET", f"/repos/{owner}/{repo}")
+
+    def get_default_branch(self, owner: str, repo: str) -> str:
+        payload = self.get_repo(owner, repo)
+        default_branch = payload.get("default_branch", "")
+        if not default_branch:
+            raise RuntimeError(f"GitHub repo metadata missing default branch for {owner}/{repo}")
+        return str(default_branch)
+
     def post_issue_comment(self, owner: str, repo: str, issue_number: int, body: str) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -130,4 +140,3 @@ class GitHubClient:
         if status_state == "success" and not check_runs:
             return "success", "combined-status-success"
         return "pending", f"combined-status={status_state}; checks={conclusions}"
-

@@ -146,6 +146,7 @@ def run_task(repo_ref: str, verb: str, task_text: str, home: Path | None = None)
         raise ValueError(f"Invalid verb: {verb}. Allowed: {', '.join(sorted(VALID_VERBS))}")
     owner, repo = validate_repo_allowed(repo_ref)
     gh = GitHubClient.from_env()
+    base_branch = gh.get_default_branch(owner, repo)
     repo_path = ensure_repo_checkout(owner, repo, home=home)
 
     base_home = home or velora_home()
@@ -205,7 +206,7 @@ def run_task(repo_ref: str, verb: str, task_text: str, home: Path | None = None)
                 title=_task_title(verb, task_text),
                 body=f"VELORA task_id: {task_id}\n\n{footer['summary']}",
                 head=footer["branch"],
-                base="main",
+                base=base_branch,
             )
             record["pr_url"] = pr["html_url"]
             record["pr_number"] = pr["number"]
@@ -232,7 +233,7 @@ def run_task(repo_ref: str, verb: str, task_text: str, home: Path | None = None)
             }
         ci_context = f"Attempt {attempt} CI failure detail: {ci_detail}"
 
-    diff_text = _read_diff_for_review(repo_path, "main", str(record["head_sha"]))
+    diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
     gemini = run_gemini_review(diff_text)
     review_text = gemini.stdout.strip()
     if gemini.returncode != 0:
@@ -254,4 +255,3 @@ def run_task(repo_ref: str, verb: str, task_text: str, home: Path | None = None)
         "pr_url": record["pr_url"],
         "summary": record["summary"],
     }
-
