@@ -4,6 +4,10 @@ VELORA (VEry LOng Running Agent): a Python CLI orchestrator that runs coding age
 
 Status: bootstrapping.
 
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md).
+
 ## Usage (v0)
 
 Prefer passing long task text via a JSON spec file (or stdin) so it doesn’t show up in your process list:
