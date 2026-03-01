@@ -10,6 +10,16 @@ velora status
 velora status --json
 ```
 
+### `velora gc`
+Mark old running-like tasks as `stale` (so `velora status` isn’t haunted by abandoned runs).
+
+```bash
+velora gc
+velora gc --older-than-hours 6
+velora gc --older-than-hours 6 --dry-run
+velora gc --json
+```
+
 ### `velora run <owner/repo> <verb> ...`
 Run a Velora task.
 
