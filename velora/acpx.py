@@ -184,7 +184,16 @@ def _gemini_generate_content(*, api_key: str, model: str, prompt: str, timeout_s
 
     payload = json.loads(raw) if raw else {}
     try:
-        return str(payload["candidates"][0]["content"]["parts"][0]["text"])
+        parts = payload["candidates"][0]["content"]["parts"]
+        if not isinstance(parts, list) or not parts:
+            raise KeyError("parts")
+        texts: list[str] = []
+        for part in parts:
+            if isinstance(part, dict) and "text" in part:
+                texts.append(str(part["text"]))
+        if not texts:
+            raise KeyError("text")
+        return "".join(texts)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"Gemini API response missing expected text field: {payload}") from exc
 
@@ -198,7 +207,7 @@ def run_gemini_review(diff_text: str) -> CmdResult:
     env = os.environ.copy()
     api_key = get_vault_key("GEMINI_API_KEY", env=env)
 
-    model = env.get("VELORA_GEMINI_MODEL", "gemini-2.5-flash")
+    model = env.get("VELORA_GEMINI_MODEL", "gemini-3-flash-preview")
     max_diff_chars = int(env.get("VELORA_GEMINI_MAX_DIFF_CHARS", "120000"))
     diff_trimmed = diff_text
     if len(diff_trimmed) > max_diff_chars:
