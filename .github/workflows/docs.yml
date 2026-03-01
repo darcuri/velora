@@ -1,0 +1,51 @@
+name: docs
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'README.md'
+  push:
+    paths:
+      - 'docs/**'
+      - 'README.md'
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate docs tree (no code files under docs/)
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import sys
+          from pathlib import Path
+
+          docs = Path('docs')
+          if not docs.exists():
+              print('docs/: not present (skipping)')
+              raise SystemExit(0)
+
+          allowed = {'.md', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'}
+          bad: list[str] = []
+
+          for p in docs.rglob('*'):
+              if p.is_file():
+                  if p.suffix.lower() not in allowed:
+                      bad.append(str(p))
+
+          if bad:
+              print('Disallowed file types detected under docs/:')
+              for p in bad:
+                  print(f'- {p}')
+              print('\nAllowed extensions: ' + ', '.join(sorted(allowed)))
+              raise SystemExit(1)
+
+          print('docs/: OK')
+          PY
