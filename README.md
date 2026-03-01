@@ -23,3 +23,7 @@ You *can* pass a task directly, but it’s unsafe (visible via `ps`):
 ```bash
 velora run darcuri/tiny-lab feature --unsafe-task "Add SPEED unit conversions (m/s, km/h, mph) with tests"
 ```
+
+## Docs
+
+See [`docs/`](./docs/) (start at [`docs/README.md`](./docs/README.md)).
