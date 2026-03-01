@@ -2,7 +2,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from velora.acpx import parse_codex_footer, resolve_acpx_cmd, run_codex
+from velora.acpx import parse_codex_footer, resolve_acpx_cmd, run_codex, run_gemini_review
 
 
 class TestAcpxDiscovery(unittest.TestCase):
@@ -47,6 +47,30 @@ class TestAcpxDiscovery(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 2)
         self.assertIn("sessions", calls[0])
         self.assertIn("ensure", calls[0])
+
+    def test_run_gemini_review_uses_rest_api(self):
+        class DummyResp:
+            def __init__(self, payload: str):
+                self._payload = payload.encode("utf-8")
+
+            def read(self):
+                return self._payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        fake_payload = '{"candidates":[{"content":{"parts":[{"text":"- NIT: looks fine"}]}}]}'
+
+        with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
+            "velora.acpx.urllib.request.urlopen", return_value=DummyResp(fake_payload)
+        ):
+            res = run_gemini_review("diff")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("NIT", res.stdout)
 
 
 if __name__ == "__main__":
