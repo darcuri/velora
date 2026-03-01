@@ -135,7 +135,14 @@ def parse_codex_footer(output: str) -> dict[str, str]:
     return parsed
 
 
-def _gemini_generate_content(*, api_key: str, model: str, prompt: str, timeout_s: int = 60) -> str:
+def _gemini_generate_content(
+    *,
+    api_key: str,
+    model: str,
+    prompt: str,
+    max_output_tokens: int = 1024,
+    timeout_s: int = 60,
+) -> str:
     """Call the Gemini REST API directly (stdlib-only).
 
     This avoids relying on a local `gemini` binary, which may not be installed.
@@ -155,7 +162,7 @@ def _gemini_generate_content(*, api_key: str, model: str, prompt: str, timeout_s
         ],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 512,
+            "maxOutputTokens": max_output_tokens,
         },
     }
 
@@ -199,25 +206,51 @@ def _gemini_generate_content(*, api_key: str, model: str, prompt: str, timeout_s
 
 
 def run_gemini_review(diff_text: str) -> CmdResult:
+    # Keep the prompt strict: short, complete, and actionable bullets.
     prompt_prefix = (
-        "Review the code diff. Output at most 5 bullet points, each labeled BLOCKER or NIT. "
+        "Review the code diff. Output at most 5 bullet points. "
+        "Each bullet MUST start with either 'BLOCKER:' or 'NIT:'. "
+        "Every bullet must be a complete sentence ending with a period. "
         "Focus on correctness and regressions. Keep it concise.\n\n"
     )
 
     env = os.environ.copy()
     api_key = get_vault_key("GEMINI_API_KEY", env=env)
 
-    model = env.get("VELORA_GEMINI_MODEL", "gemini-3-flash-preview")
+    primary_model = env.get("VELORA_GEMINI_MODEL", "gemini-3-flash-preview")
+    fallback_model = env.get("VELORA_GEMINI_FALLBACK_MODEL", "gemini-2.5-pro")
+    models = [m for m in [primary_model, fallback_model] if m]
+
+    min_chars = int(env.get("VELORA_GEMINI_MIN_CHARS", "120"))
+    max_output_tokens = int(env.get("VELORA_GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+
     max_diff_chars = int(env.get("VELORA_GEMINI_MAX_DIFF_CHARS", "120000"))
     diff_trimmed = diff_text
     if len(diff_trimmed) > max_diff_chars:
         diff_trimmed = diff_trimmed[:max_diff_chars] + "\n\n[diff truncated]\n"
 
-    try:
-        text = _gemini_generate_content(api_key=api_key, model=model, prompt=prompt_prefix + diff_trimmed)
-        return CmdResult(returncode=0, stdout=text + "\n", stderr="")
-    except Exception as exc:  # noqa: BLE001
-        return CmdResult(returncode=1, stdout="", stderr=str(exc))
+    last_err = ""
+    for model in models:
+        try:
+            text = _gemini_generate_content(
+                api_key=api_key,
+                model=model,
+                prompt=prompt_prefix + diff_trimmed,
+                max_output_tokens=max_output_tokens,
+            ).strip()
+            # Guard against the "half a sentence" failure mode.
+            if len(text) < min_chars:
+                last_err = f"Gemini review too short ({len(text)} chars) using model {model}"
+                continue
+            if "BLOCKER:" not in text and "NIT:" not in text:
+                last_err = f"Gemini review missing required labels using model {model}"
+                continue
+            return CmdResult(returncode=0, stdout=text + "\n", stderr="")
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"Gemini review failed using model {model}: {exc}"
+            continue
+
+    return CmdResult(returncode=1, stdout="", stderr=last_err or "Gemini review failed")
 
 
 def _read_file(path: Path) -> str:

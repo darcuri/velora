@@ -62,7 +62,7 @@ class TestAcpxDiscovery(unittest.TestCase):
             def __exit__(self, exc_type, exc, tb):
                 return False
 
-        fake_payload = '{"candidates":[{"content":{"parts":[{"text":"- NIT: looks "},{"text":"fine"}]}}]}'
+        fake_payload = '{"candidates":[{"content":{"parts":[{"text":"- NIT: looks "},{"text":"fine. This is a sufficiently long review bullet to pass minimum-length validation. Additional context to pad length. Additional context to pad length. Additional context to pad length. "}]}}]}'
 
         with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
             "velora.acpx.urllib.request.urlopen", return_value=DummyResp(fake_payload)

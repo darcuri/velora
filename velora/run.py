@@ -63,7 +63,7 @@ def _build_codex_prompt(
     verb: str,
     task_text: str,
     attempt: int,
-    ci_context: str | None,
+    fix_context: str | None,
 ) -> str:
     lines = [
         f"You are working on {repo_ref}.",
@@ -73,7 +73,8 @@ def _build_codex_prompt(
         f"Attempt: {attempt}",
         "",
         "Requirements:",
-        "- Create and checkout branch velora/" + task_id,
+        "- Checkout branch velora/" + task_id + " (create it if it does not exist)",
+        "- If a PR already exists for this task, continue pushing to the same branch (do not open a new PR)",
         "- Implement requested change",
         "- Run local checks/tests",
         "- Commit and push the branch",
@@ -82,8 +83,8 @@ def _build_codex_prompt(
         "HEAD_SHA: <commit-sha>",
         "SUMMARY: <one-line summary>",
     ]
-    if ci_context:
-        lines.extend(["", "CI failure context to fix:", ci_context])
+    if fix_context:
+        lines.extend(["", "Context to fix:", fix_context])
     return "\n".join(lines)
 
 
@@ -173,12 +174,11 @@ def run_task(repo_ref: str, verb: str, task_text: str, home: Path | None = None)
     upsert_task(record, home=base_home)
 
     session_name = f"velora-codex-{repo_slug(owner, repo)}"
-    ci_context: str | None = None
+    fix_context: str | None = None
     max_attempts = 3
-    review_text = ""
 
     for attempt in range(1, max_attempts + 1):
-        prompt = _build_codex_prompt(task_id, repo_ref, verb, task_text, attempt, ci_context)
+        prompt = _build_codex_prompt(task_id, repo_ref, verb, task_text, attempt, fix_context)
         if attempt == 1:
             _write_text(prompt_path, prompt)
         else:
@@ -217,41 +217,93 @@ def run_task(repo_ref: str, verb: str, task_text: str, home: Path | None = None)
         _append_text(ci_log, f"[{now_iso()}] polling CI for {footer['head_sha']}")
         ci_state, ci_detail = _poll_ci(gh, owner, repo, footer["head_sha"], ci_log)
         _append_text(ci_log, f"[{now_iso()}] final {ci_state}: {ci_detail}")
-        if ci_state == "success":
-            break
 
-        if attempt == max_attempts:
-            record["status"] = "failed"
+        if ci_state != "success":
+            if attempt == max_attempts:
+                record["status"] = "failed"
+                record["updated_at"] = now_iso()
+                record["failure_reason"] = (
+                    f"FIRE exhausted after {max_attempts} attempts; last CI detail: {ci_detail}"
+                )
+                upsert_task(record, home=base_home)
+                return {
+                    "task_id": task_id,
+                    "status": record["status"],
+                    "pr_url": record["pr_url"],
+                    "summary": record["failure_reason"],
+                    "ci_state": ci_state,
+                    "ci_detail": ci_detail,
+                }
+            fix_context = f"Attempt {attempt} CI failure detail: {ci_detail}"
+            continue
+
+        # CI success → review gate (and FIRE it too).
+        diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
+        gemini = run_gemini_review(diff_text)
+        review_text = gemini.stdout.strip()
+        if gemini.returncode != 0:
+            review_text = f"BLOCKER: Review tool failed: {gemini.stderr.strip()}"
+
+        review_attempt_path = task_dir / f"review-attempt-{attempt}.txt"
+        _write_text(review_attempt_path, review_text)
+
+        if record["pr_number"] is None:
+            raise RuntimeError("PR number missing; cannot post review comment")
+        gh.post_issue_comment(owner, repo, int(record["pr_number"]), review_text)
+
+        if gemini.returncode != 0:
+            record["status"] = "not-ready"
             record["updated_at"] = now_iso()
-            record["failure_reason"] = f"FIRE exhausted after {max_attempts} attempts; last CI detail: {ci_detail}"
             upsert_task(record, home=base_home)
             return {
                 "task_id": task_id,
                 "status": record["status"],
                 "pr_url": record["pr_url"],
-                "summary": record["failure_reason"],
+                "summary": record["summary"],
+                "ci_state": ci_state,
+                "ci_detail": ci_detail,
+                "review": review_text,
             }
-        ci_context = f"Attempt {attempt} CI failure detail: {ci_detail}"
 
-    diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
-    gemini = run_gemini_review(diff_text)
-    review_text = gemini.stdout.strip()
-    if gemini.returncode != 0:
-        review_text = f"BLOCKER: Review tool failed: {gemini.stderr.strip()}"
-    _write_text(review_path, review_text)
-    if record["pr_number"] is None:
-        raise RuntimeError("PR number missing; cannot post review comment")
-    gh.post_issue_comment(owner, repo, int(record["pr_number"]), review_text)
+        if "BLOCKER" in review_text:
+            if attempt == max_attempts:
+                record["status"] = "not-ready"
+                record["updated_at"] = now_iso()
+                upsert_task(record, home=base_home)
+                return {
+                    "task_id": task_id,
+                    "status": record["status"],
+                    "pr_url": record["pr_url"],
+                    "summary": record["summary"],
+                    "ci_state": ci_state,
+                    "ci_detail": ci_detail,
+                    "review": review_text,
+                }
 
-    if "BLOCKER" in review_text:
-        record["status"] = "not-ready"
-    else:
+            fix_context = f"Attempt {attempt} review blockers to address:\n{review_text}"
+            continue
+
         record["status"] = "ready"
+        record["updated_at"] = now_iso()
+        upsert_task(record, home=base_home)
+        return {
+            "task_id": task_id,
+            "status": record["status"],
+            "pr_url": record["pr_url"],
+            "summary": record["summary"],
+            "ci_state": ci_state,
+            "ci_detail": ci_detail,
+            "review": review_text,
+        }
+
+    # Should be unreachable.
+    record["status"] = "failed"
     record["updated_at"] = now_iso()
+    record["failure_reason"] = "FIRE exhausted"
     upsert_task(record, home=base_home)
     return {
         "task_id": task_id,
         "status": record["status"],
         "pr_url": record["pr_url"],
-        "summary": record["summary"],
+        "summary": record["failure_reason"],
     }
