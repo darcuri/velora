@@ -1,6 +1,8 @@
+import io
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from velora.spec import load_run_spec
 
@@ -15,6 +17,12 @@ class TestRunSpec(unittest.TestCase):
         self.assertEqual(spec.task, "do the thing")
         self.assertEqual(spec.title, "My PR")
         self.assertEqual(spec.max_attempts, 2)
+
+    def test_load_run_spec_from_stdin(self):
+        payload = {"task": "stdin task"}
+        with patch("sys.stdin", io.StringIO(json.dumps(payload))):
+            spec = load_run_spec("-")
+        self.assertEqual(spec.task, "stdin task")
 
 
 if __name__ == "__main__":
