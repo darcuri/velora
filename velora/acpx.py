@@ -107,16 +107,29 @@ def run_codex(session_name: str, cwd: Path, prompt: str) -> CmdResult:
 
 
 def parse_codex_footer(output: str) -> dict[str, str]:
-    parsed: dict[str, str] = {}
-    for line in output.splitlines():
-        if line.startswith("BRANCH:"):
-            parsed["branch"] = line.split(":", 1)[1].strip()
-        elif line.startswith("HEAD_SHA:"):
-            parsed["head_sha"] = line.split(":", 1)[1].strip()
-        elif line.startswith("SUMMARY:"):
-            parsed["summary"] = line.split(":", 1)[1].strip()
-    required = ("branch", "head_sha", "summary")
-    missing = [k for k in required if not parsed.get(k)]
+    """Parse the Codex machine footer.
+
+    Codex generally prints footer fields on their own lines, but in practice it may
+    accidentally glue them to the end of a previous sentence. Be tolerant: search
+    the full output for the markers.
+    """
+    import re
+
+    def _find(pattern: str) -> str | None:
+        m = re.search(pattern, output, flags=re.MULTILINE)
+        return m.group(1).strip() if m else None
+
+    branch = _find(r"BRANCH:\s*(\S+)")
+    head_sha = _find(r"HEAD_SHA:\s*([0-9a-fA-F]{6,40})")
+    summary = _find(r"SUMMARY:\s*(.+)")
+
+    parsed: dict[str, str] = {
+        "branch": branch or "",
+        "head_sha": head_sha or "",
+        "summary": summary or "",
+    }
+
+    missing = [k for k, v in parsed.items() if not v]
     if missing:
         raise RuntimeError(f"Codex output missing footer fields: {', '.join(missing)}")
     return parsed

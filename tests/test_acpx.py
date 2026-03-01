@@ -18,6 +18,11 @@ class TestAcpxDiscovery(unittest.TestCase):
         self.assertEqual(parsed["head_sha"], "deadbeef")
         self.assertEqual(parsed["summary"], "done")
 
+    def test_parse_codex_footer_when_glued_to_previous_sentence(self):
+        out = "ok. BRANCH: velora/abc\nHEAD_SHA: deadbeef\nSUMMARY: done\n"
+        parsed = parse_codex_footer(out)
+        self.assertEqual(parsed["branch"], "velora/abc")
+
     def test_raises_if_missing_everywhere(self):
         with patch("velora.acpx.which", return_value=None), patch(
             "velora.acpx._fallback_acpx_exists", return_value=False
