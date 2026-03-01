@@ -62,7 +62,7 @@ class TestAcpxDiscovery(unittest.TestCase):
             def __exit__(self, exc_type, exc, tb):
                 return False
 
-        fake_payload = '{"candidates":[{"content":{"parts":[{"text":"- NIT: looks fine"}]}}]}'
+        fake_payload = '{"candidates":[{"content":{"parts":[{"text":"- NIT: looks "},{"text":"fine"}]}}]}'
 
         with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
             "velora.acpx.urllib.request.urlopen", return_value=DummyResp(fake_payload)
@@ -71,6 +71,7 @@ class TestAcpxDiscovery(unittest.TestCase):
 
         self.assertEqual(res.returncode, 0)
         self.assertIn("NIT", res.stdout)
+        self.assertIn("looks fine", res.stdout)
 
 
 if __name__ == "__main__":
