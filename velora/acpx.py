@@ -135,21 +135,80 @@ def parse_codex_footer(output: str) -> dict[str, str]:
     return parsed
 
 
+def _gemini_generate_content(*, api_key: str, model: str, prompt: str, timeout_s: int = 60) -> str:
+    """Call the Gemini REST API directly (stdlib-only).
+
+    This avoids relying on a local `gemini` binary, which may not be installed.
+    """
+
+    model_name = model[len("models/") :] if model.startswith("models/") else model
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:generateContent?key={api_key}"
+    )
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 512,
+        },
+    }
+
+    req = urllib.request.Request(
+        url=url,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(body).encode("utf-8"),
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        # Do NOT include the URL (it contains the API key).
+        msg = detail
+        try:
+            parsed = json.loads(detail)
+            msg = str(parsed.get("error", {}).get("message") or detail)
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f"Gemini API request failed: HTTP {exc.code}: {msg}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Gemini API request failed: {exc.reason}") from exc
+
+    payload = json.loads(raw) if raw else {}
+    try:
+        return str(payload["candidates"][0]["content"]["parts"][0]["text"])
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Gemini API response missing expected text field: {payload}") from exc
+
+
 def run_gemini_review(diff_text: str) -> CmdResult:
-    prompt = (
+    prompt_prefix = (
         "Review the code diff. Output at most 5 bullet points, each labeled BLOCKER or NIT. "
         "Focus on correctness and regressions. Keep it concise.\n\n"
-        f"{diff_text}"
     )
-    env = os.environ.copy()
-    env["GEMINI_API_KEY"] = get_vault_key("GEMINI_API_KEY", env=env)
 
-    acpx_cmd = resolve_acpx_cmd(env=env)
-    return run_cmd(
-        [acpx_cmd, "--format", "quiet", "gemini", "exec", "-f", "-"],
-        input_text=prompt,
-        env=env,
-    )
+    env = os.environ.copy()
+    api_key = get_vault_key("GEMINI_API_KEY", env=env)
+
+    model = env.get("VELORA_GEMINI_MODEL", "gemini-2.5-flash")
+    max_diff_chars = int(env.get("VELORA_GEMINI_MAX_DIFF_CHARS", "120000"))
+    diff_trimmed = diff_text
+    if len(diff_trimmed) > max_diff_chars:
+        diff_trimmed = diff_trimmed[:max_diff_chars] + "\n\n[diff truncated]\n"
+
+    try:
+        text = _gemini_generate_content(api_key=api_key, model=model, prompt=prompt_prefix + diff_trimmed)
+        return CmdResult(returncode=0, stdout=text + "\n", stderr="")
+    except Exception as exc:  # noqa: BLE001
+        return CmdResult(returncode=1, stdout="", stderr=str(exc))
 
 
 def _read_file(path: Path) -> str:
