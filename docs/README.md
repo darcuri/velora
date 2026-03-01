@@ -1,0 +1,14 @@
+# Velora Docs
+
+This directory holds user-facing documentation for Velora.
+
+## Contents
+
+- [CLI](./cli.md)
+- [JSON Run Spec](./json-run-spec.md)
+
+## Why Markdown (for now)
+
+v0 goal: keep docs close to the code, readable on GitHub, and easy to update.
+
+When/if we want a rendered docs site, we can layer something like MkDocs on top of this directory without rewriting the content.
