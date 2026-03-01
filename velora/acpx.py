@@ -19,12 +19,29 @@ class CmdResult:
     stderr: str
 
 
-FALLBACK_ACPX = Path("/home/merlin/openclaw/extensions/acpx/node_modules/.bin/acpx")
-VAULT_ADDR = "https://entropy-internal.duckdns.org:8200"
+DEFAULT_FALLBACK_ACPX = Path("/home/merlin/openclaw/extensions/acpx/node_modules/.bin/acpx")
+DEFAULT_VAULT_ADDR = "https://entropy-internal.duckdns.org:8200"
 
 
-def _fallback_acpx_exists() -> bool:
-    return FALLBACK_ACPX.exists()
+def _fallback_acpx_path(env: dict[str, str] | None = None) -> Path:
+    env_map = env if env is not None else os.environ
+    raw = env_map.get("VELORA_ACPX_FALLBACK", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return DEFAULT_FALLBACK_ACPX
+
+
+def _vault_addr(env: dict[str, str] | None = None) -> str:
+    env_map = env if env is not None else os.environ
+    return (
+        env_map.get("VELORA_VAULT_ADDR", "").strip()
+        or env_map.get("VAULT_ADDR", "").strip()
+        or DEFAULT_VAULT_ADDR
+    )
+
+
+def _fallback_acpx_exists(env: dict[str, str] | None = None) -> bool:
+    return _fallback_acpx_path(env=env).exists()
 
 
 def resolve_acpx_cmd(env: dict[str, str] | None = None) -> str:
@@ -37,12 +54,13 @@ def resolve_acpx_cmd(env: dict[str, str] | None = None) -> str:
     if resolved:
         return resolved
 
-    if _fallback_acpx_exists():
-        return str(FALLBACK_ACPX)
+    fallback = _fallback_acpx_path(env=env_map)
+    if _fallback_acpx_exists(env=env_map):
+        return str(fallback)
 
     raise RuntimeError(
         "acpx command not found. Set VELORA_ACPX_CMD or install acpx in PATH "
-        f"or at {FALLBACK_ACPX}."
+        f"or set VELORA_ACPX_FALLBACK to point at a fallback binary (tried {fallback})."
     )
 
 
@@ -270,7 +288,7 @@ def _vault_request(
     token: str | None = None,
 ) -> dict[str, Any]:
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    url = f"{VAULT_ADDR}{path}"
+    url = f"{_vault_addr()}{path}"
     headers = {"Content-Type": "application/json"}
     if token:
         headers["X-Vault-Token"] = token
@@ -286,9 +304,15 @@ def _vault_request(
 
 @lru_cache(maxsize=1)
 def _load_vault_api_keys() -> dict[str, str]:
-    vault_dir = Path.home() / ".openclaw"
-    role_id = _read_file(vault_dir / ".vault-role-id")
-    secret_id = _read_file(vault_dir / ".vault-secret-id")
+    env = os.environ
+    default_role_id = Path.home() / ".openclaw" / ".vault-role-id"
+    default_secret_id = Path.home() / ".openclaw" / ".vault-secret-id"
+
+    role_id_path = Path(env.get("VELORA_VAULT_ROLE_ID_FILE", str(default_role_id))).expanduser()
+    secret_id_path = Path(env.get("VELORA_VAULT_SECRET_ID_FILE", str(default_secret_id))).expanduser()
+
+    role_id = _read_file(role_id_path)
+    secret_id = _read_file(secret_id_path)
 
     login = _vault_request(
         "POST",
@@ -299,7 +323,8 @@ def _load_vault_api_keys() -> dict[str, str]:
     if not token:
         raise RuntimeError("Vault login succeeded but did not return client token")
 
-    secret = _vault_request("GET", "/v1/secret/data/openclaw/api-keys", token=token)
+    secret_path = env.get("VELORA_VAULT_API_KEYS_PATH", "/v1/secret/data/openclaw/api-keys")
+    secret = _vault_request("GET", secret_path, token=token)
     data = secret.get("data", {}).get("data", {})
     if not isinstance(data, dict):
         raise RuntimeError("Vault secret payload missing expected data object")

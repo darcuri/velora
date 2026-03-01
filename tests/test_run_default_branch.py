@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 from velora.acpx import CmdResult
 from velora.run import run_task
+from velora.spec import RunSpec
 
 
 class TestRunUsesDefaultBranch(unittest.TestCase):
@@ -34,7 +35,7 @@ class TestRunUsesDefaultBranch(unittest.TestCase):
             patch("velora.run._read_diff_for_review", return_value="diff") as mock_diff,
             patch("velora.run.run_gemini_review", return_value=CmdResult(0, "- NIT: ok\n", "")),
         ):
-            result = run_task("darcuri/velora", "feature", "task text")
+            result = run_task("darcuri/velora", "feature", RunSpec(task="task text"))
 
         self.assertEqual(result["status"], "ready")
         mock_gh.get_default_branch.assert_called_once_with("darcuri", "velora")

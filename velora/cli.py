@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import argparse
 import json
 import sys
 
 from .run import run_task
+from .spec import RunSpec, load_run_spec
 from .state import get_status_view
 
 VERBS = ("feature", "fix", "refactor")
@@ -18,7 +21,17 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="Run a VELORA task")
     run_p.add_argument("repo", help="GitHub repo in owner/repo format")
     run_p.add_argument("verb", choices=VERBS, help="Task kind")
-    run_p.add_argument("task", help="Task description")
+
+    src = run_p.add_mutually_exclusive_group(required=True)
+    src.add_argument(
+        "--spec",
+        help="Path to JSON run spec (recommended). Use '-' to read JSON from stdin.",
+    )
+    src.add_argument(
+        "--unsafe-task",
+        help="Task description as a CLI arg (UNSAFE: visible in process list).",
+    )
+
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     return parser
 
@@ -67,7 +80,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "status":
             return _print_status(args.json)
         if args.cmd == "run":
-            result = run_task(args.repo, args.verb, args.task)
+            spec: RunSpec
+            if args.spec:
+                spec = load_run_spec(args.spec)
+            else:
+                spec = RunSpec(task=str(args.unsafe_task))
+            result = run_task(args.repo, args.verb, spec)
             return _print_run_result(result, args.json)
     except Exception as exc:  # noqa: BLE001
         if getattr(args, "json", False):
