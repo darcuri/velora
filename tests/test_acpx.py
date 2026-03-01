@@ -1,7 +1,8 @@
+import subprocess
 import unittest
 from unittest.mock import patch
 
-from velora.acpx import parse_codex_footer, resolve_acpx_cmd
+from velora.acpx import parse_codex_footer, resolve_acpx_cmd, run_codex
 
 
 class TestAcpxDiscovery(unittest.TestCase):
@@ -18,9 +19,29 @@ class TestAcpxDiscovery(unittest.TestCase):
         self.assertEqual(parsed["summary"], "done")
 
     def test_raises_if_missing_everywhere(self):
-        with patch("velora.acpx.which", return_value=None), patch("velora.acpx._fallback_acpx_exists", return_value=False):
+        with patch("velora.acpx.which", return_value=None), patch(
+            "velora.acpx._fallback_acpx_exists", return_value=False
+        ):
             with self.assertRaises(RuntimeError):
                 resolve_acpx_cmd(env={})
+
+    def test_run_codex_ensures_session_first(self):
+        # Ensure we try to create/ensure a session before prompting.
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="OK", stderr="")
+
+        with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
+            "velora.acpx.which", return_value="/usr/bin/acpx"
+        ), patch("subprocess.run", side_effect=fake_run):
+            res = run_codex(session_name="sess", cwd=__import__("pathlib").Path("/tmp"), prompt="hi")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertIn("sessions", calls[0])
+        self.assertIn("ensure", calls[0])
 
 
 if __name__ == "__main__":
