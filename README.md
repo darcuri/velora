@@ -23,13 +23,13 @@ cat > spec.json <<'JSON'
 }
 JSON
 
-velora run darcuri/tiny-lab feature --spec spec.json
+velora run octocat/hello-world feature --spec spec.json
 ```
 
 You *can* pass a task directly, but it’s unsafe (visible via `ps`):
 
 ```bash
-velora run darcuri/tiny-lab feature --unsafe-task "Add SPEED unit conversions (m/s, km/h, mph) with tests"
+velora run octocat/hello-world feature --unsafe-task "Add SPEED unit conversions (m/s, km/h, mph) with tests"
 ```
 
 ## Docs

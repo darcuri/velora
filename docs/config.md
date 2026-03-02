@@ -19,14 +19,14 @@ Velora supports configuration via a JSON config file and environment variables.
 
 ```json
 {
-  "allowed_owners": ["darcuri"],
+  "allowed_owners": ["octocat"],
   "max_attempts": 3,
   "codex_session_prefix": "velora-codex-",
 
   "vault_addr": "https://vault.example:8200",
-  "vault_role_id_file": "~/.openclaw/.vault-role-id",
-  "vault_secret_id_file": "~/.openclaw/.vault-secret-id",
-  "vault_api_keys_path": "/v1/secret/data/openclaw/api-keys",
+  "vault_role_id_file": "~/.velora/vault-role-id",
+  "vault_secret_id_file": "~/.velora/vault-secret-id",
+  "vault_api_keys_path": "/v1/secret/data/velora/api-keys",
 
   "acpx_cmd": null,
   "acpx_fallback": "/path/to/acpx"

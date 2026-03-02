@@ -66,7 +66,7 @@ Vault configuration overrides:
 
 By default Velora only runs against a conservative owner allowlist.
 
-- `VELORA_ALLOWED_OWNERS` (comma-separated, default: `darcuri`)
+- `VELORA_ALLOWED_OWNERS` (comma-separated allowlist; default: **unset** → required)
 
 ## Safe defaults / future work
 
