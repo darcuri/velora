@@ -21,7 +21,10 @@ Velora supports configuration via a JSON config file and environment variables.
 {
   "allowed_owners": ["octocat"],
   "max_attempts": 3,
+
+  "runner": "codex",
   "codex_session_prefix": "velora-codex-",
+  "claude_session_prefix": "velora-claude-",
 
   "vault_addr": "https://vault.example:8200",
   "vault_role_id_file": "~/.velora/vault-role-id",
@@ -39,7 +42,9 @@ All of these override config file values:
 
 - `VELORA_ALLOWED_OWNERS`
 - `VELORA_MAX_ATTEMPTS`
+- `VELORA_RUNNER` (codex | claude)
 - `VELORA_CODEX_SESSION_PREFIX`
+- `VELORA_CLAUDE_SESSION_PREFIX`
 - `VELORA_VAULT_ADDR` (or `VAULT_ADDR`)
 - `VELORA_VAULT_ROLE_ID_FILE`
 - `VELORA_VAULT_SECRET_ID_FILE`

@@ -37,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Task description as a CLI arg (UNSAFE: visible in process list).",
     )
 
+    run_p.add_argument(
+        "--runner",
+        choices=("codex", "claude"),
+        help="Which ACPX coding agent to use (default: config/env).",
+    )
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     return parser
 
@@ -109,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
                 spec = load_run_spec(args.spec)
             else:
                 spec = RunSpec(task=str(args.unsafe_task))
-            result = run_task(args.repo, args.verb, spec)
+            result = run_task(args.repo, args.verb, spec, runner=getattr(args, "runner", None))
             return _print_run_result(result, args.json)
     except Exception as exc:  # noqa: BLE001
         if getattr(args, "json", False):
