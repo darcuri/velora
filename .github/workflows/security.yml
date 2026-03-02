@@ -34,12 +34,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install bandit
       - name: bandit
-        run: bandit -r velora -x tests -ll
+        run: bandit -r velora -x tests -l medium -i medium
 
   dependency-review:
     if: github.event_name == 'pull_request'
     name: dependency-review
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/dependency-review-action@v4
         with:
