@@ -42,5 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/dependency-review-action@v4
+        # NOTE: this action requires GitHub Advanced Security to be enabled.
+        continue-on-error: true
         with:
           fail-on-severity: moderate
