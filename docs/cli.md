@@ -51,7 +51,9 @@ Velora also supports a JSON config file; see [Configuration](./config.md).
 
 - `VELORA_ALLOWED_OWNERS` (comma-separated allowlist; default: **unset** → required)
 - `VELORA_MAX_ATTEMPTS` (default: `3`)
+- `VELORA_RUNNER` (default: `codex`; also supports `claude`)
 - `VELORA_CODEX_SESSION_PREFIX` (default: `velora-codex-`)
+- `VELORA_CLAUDE_SESSION_PREFIX` (default: `velora-claude-`)
 
 Vault integration:
 - `VELORA_VAULT_ADDR` (or `VAULT_ADDR`)
@@ -62,3 +64,8 @@ Vault integration:
 ACPX:
 - `VELORA_ACPX_CMD`
 - `VELORA_ACPX_FALLBACK`
+
+Secrets (env-first; Vault fallback is optional):
+- `OPENAI_API_KEY` (required for runner=codex)
+- `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` (required for runner=claude)
+- `GEMINI_API_KEY` (required for Gemini review)

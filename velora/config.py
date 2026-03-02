@@ -14,7 +14,10 @@ from .util import velora_home
 class VeloraConfig:
     allowed_owners: set[str]
     max_attempts: int
+
+    runner: str  # codex | claude
     codex_session_prefix: str
+    claude_session_prefix: str
 
     vault_addr: str
     vault_role_id_file: Path
@@ -92,7 +95,10 @@ def load_config() -> VeloraConfig:
         # Safety: default-deny; user must explicitly allow owners via config/env.
         "allowed_owners": [],
         "max_attempts": 3,
+
+        "runner": "codex",
         "codex_session_prefix": "velora-codex-",
+        "claude_session_prefix": "velora-claude-",
         # Generic Vault default. Prefer VELORA_VAULT_ADDR/VAULT_ADDR; fall back to local dev.
         "vault_addr": "http://127.0.0.1:8200",
         # Optional AppRole convenience defaults (override via env/config).
@@ -117,8 +123,13 @@ def load_config() -> VeloraConfig:
         env_cfg["allowed_owners"] = env.get("VELORA_ALLOWED_OWNERS")
     if env.get("VELORA_MAX_ATTEMPTS"):
         env_cfg["max_attempts"] = env.get("VELORA_MAX_ATTEMPTS")
+
+    if env.get("VELORA_RUNNER"):
+        env_cfg["runner"] = env.get("VELORA_RUNNER")
     if env.get("VELORA_CODEX_SESSION_PREFIX"):
         env_cfg["codex_session_prefix"] = env.get("VELORA_CODEX_SESSION_PREFIX")
+    if env.get("VELORA_CLAUDE_SESSION_PREFIX"):
+        env_cfg["claude_session_prefix"] = env.get("VELORA_CLAUDE_SESSION_PREFIX")
 
     # Vault: allow both VELORA_VAULT_ADDR and VAULT_ADDR.
     if env.get("VELORA_VAULT_ADDR") or env.get("VAULT_ADDR"):
@@ -141,7 +152,13 @@ def load_config() -> VeloraConfig:
 
     allowed_owners = _parse_owners(merged.get("allowed_owners"))
     max_attempts = max(1, min(_parse_int(merged.get("max_attempts"), 3), 10))
-    prefix = str(merged.get("codex_session_prefix") or "velora-codex-")
+
+    runner = str(merged.get("runner") or defaults["runner"]).strip().lower()
+    if runner not in {"codex", "claude"}:
+        raise ValueError("runner must be one of: codex, claude")
+
+    codex_prefix = str(merged.get("codex_session_prefix") or defaults["codex_session_prefix"])
+    claude_prefix = str(merged.get("claude_session_prefix") or defaults["claude_session_prefix"])
 
     vault_addr = str(merged.get("vault_addr") or defaults["vault_addr"])
     vault_role_id_file = Path(str(merged.get("vault_role_id_file") or defaults["vault_role_id_file"]))
@@ -160,7 +177,11 @@ def load_config() -> VeloraConfig:
     return VeloraConfig(
         allowed_owners=allowed_owners,
         max_attempts=max_attempts,
-        codex_session_prefix=prefix,
+
+        runner=runner,
+        codex_session_prefix=codex_prefix,
+        claude_session_prefix=claude_prefix,
+
         vault_addr=vault_addr,
         vault_role_id_file=vault_role_id_file.expanduser(),
         vault_secret_id_file=vault_secret_id_file.expanduser(),

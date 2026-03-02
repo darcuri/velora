@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .acpx import parse_codex_footer, run_codex, run_gemini_review
+from .acpx import parse_codex_footer, run_claude, run_codex, run_gemini_review
 from .github import GitHubClient
 from .state import upsert_task
 from .spec import RunSpec
@@ -164,7 +164,13 @@ def _read_diff_for_review(repo_path: Path, base_ref: str, head_sha: str) -> str:
     return _run_checked(["git", "diff", f"origin/{base_ref}...{head_sha}"], cwd=repo_path)
 
 
-def run_task(repo_ref: str, verb: str, spec: RunSpec, home: Path | None = None) -> dict[str, Any]:
+def run_task(
+    repo_ref: str,
+    verb: str,
+    spec: RunSpec,
+    home: Path | None = None,
+    runner: str | None = None,
+) -> dict[str, Any]:
     if verb not in VALID_VERBS:
         raise ValueError(f"Invalid verb: {verb}. Allowed: {', '.join(sorted(VALID_VERBS))}")
 
@@ -199,7 +205,13 @@ def run_task(repo_ref: str, verb: str, spec: RunSpec, home: Path | None = None) 
     upsert_task(record, home=base_home)
 
     cfg = get_config()
-    session_name = f"{cfg.codex_session_prefix}{repo_slug(owner, repo)}"
+    effective_runner = (runner or cfg.runner).strip().lower()
+    if effective_runner not in {"codex", "claude"}:
+        raise ValueError("runner must be one of: codex, claude")
+
+    session_prefix = cfg.codex_session_prefix if effective_runner == "codex" else cfg.claude_session_prefix
+    session_name = f"{session_prefix}{repo_slug(owner, repo)}"
+
     fix_context: str | None = None
     max_attempts = spec.max_attempts if spec.max_attempts is not None else cfg.max_attempts
     max_attempts = max(1, min(int(max_attempts), 10))
@@ -211,15 +223,21 @@ def run_task(repo_ref: str, verb: str, spec: RunSpec, home: Path | None = None) 
         else:
             _append_text(prompt_path, f"\n---- attempt {attempt} ----\n{prompt}")
 
-        codex_result = run_codex(session_name=session_name, cwd=repo_path, prompt=prompt)
+        agent_result = (
+            run_codex(session_name=session_name, cwd=repo_path, prompt=prompt)
+            if effective_runner == "codex"
+            else run_claude(session_name=session_name, cwd=repo_path, prompt=prompt)
+        )
         _append_text(
             agent_output_path,
-            f"---- attempt {attempt} rc={codex_result.returncode} ----\n{codex_result.stdout}\n{codex_result.stderr}",
+            f"---- attempt {attempt} runner={effective_runner} rc={agent_result.returncode} ----\n{agent_result.stdout}\n{agent_result.stderr}",
         )
-        if codex_result.returncode != 0:
-            raise RuntimeError(f"acpx codex failed on attempt {attempt}: {codex_result.stderr.strip()}")
+        if agent_result.returncode != 0:
+            raise RuntimeError(
+                f"acpx {effective_runner} failed on attempt {attempt}: {(agent_result.stderr or agent_result.stdout).strip()}"
+            )
 
-        footer = parse_codex_footer(codex_result.stdout)
+        footer = parse_codex_footer(agent_result.stdout)
         record["branch"] = footer["branch"]
         record["head_sha"] = footer["head_sha"]
         record["summary"] = footer["summary"]

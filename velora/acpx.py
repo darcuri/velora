@@ -143,6 +143,85 @@ def run_codex(session_name: str, cwd: Path, prompt: str) -> CmdResult:
     return run_cmd(cmd, input_text=prompt, env=env)
 
 
+def ensure_claude_session(session_name: str, cwd: Path, env: dict[str, str]) -> CmdResult:
+    acpx_cmd = resolve_acpx_cmd(env=env)
+    cmd = [
+        acpx_cmd,
+        "--cwd",
+        str(cwd),
+        "claude",
+        "sessions",
+        "ensure",
+        "--name",
+        session_name,
+    ]
+    return run_cmd(cmd, env=env)
+
+
+def _ensure_anthropic_auth(env: dict[str, str]) -> None:
+    """Ensure Claude has credentials in env.
+
+    Support both:
+    - ANTHROPIC_AUTH_TOKEN (OAuth / Claude Code style)
+    - ANTHROPIC_API_KEY (API key)
+
+    Prefer env. If missing, use Vault/AppRole fallback only if configured.
+    """
+
+    token = env.get("ANTHROPIC_AUTH_TOKEN", "").strip()
+    api_key = env.get("ANTHROPIC_API_KEY", "").strip()
+    if token or api_key:
+        return
+
+    configured, detail = _vault_fallback_configured(env)
+    if not configured:
+        raise RuntimeError(
+            "Neither ANTHROPIC_AUTH_TOKEN nor ANTHROPIC_API_KEY is set and Vault fallback is not configured "
+            f"({detail}). Set one of those env vars to run Claude."
+        )
+
+    keys = _load_vault_api_keys()
+    token = str(keys.get("ANTHROPIC_AUTH_TOKEN", "")).strip()
+    api_key = str(keys.get("ANTHROPIC_API_KEY", "")).strip()
+
+    if token:
+        env["ANTHROPIC_AUTH_TOKEN"] = token
+        return
+    if api_key:
+        env["ANTHROPIC_API_KEY"] = api_key
+        return
+
+    raise RuntimeError(
+        "Vault did not return ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY. Set one of those env vars to run Claude."
+    )
+
+
+def run_claude(session_name: str, cwd: Path, prompt: str) -> CmdResult:
+    env = os.environ.copy()
+    _ensure_anthropic_auth(env)
+
+    ensure = ensure_claude_session(session_name=session_name, cwd=cwd, env=env)
+    if ensure.returncode != 0:
+        return ensure
+
+    acpx_cmd = resolve_acpx_cmd(env=env)
+    cmd = [
+        acpx_cmd,
+        "--cwd",
+        str(cwd),
+        "--approve-all",
+        "--format",
+        "quiet",
+        "claude",
+        "prompt",
+        "-s",
+        session_name,
+        "-f",
+        "-",
+    ]
+    return run_cmd(cmd, input_text=prompt, env=env)
+
+
 def parse_codex_footer(output: str) -> dict[str, str]:
     """Parse the Codex machine footer.
 
