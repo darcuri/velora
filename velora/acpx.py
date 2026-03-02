@@ -352,14 +352,54 @@ def _load_vault_api_keys() -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items()}
 
 
+def _vault_fallback_configured(env_map: dict[str, str]) -> tuple[bool, str]:
+    cfg = get_config()
+    role_id_path = Path(env_map.get("VELORA_VAULT_ROLE_ID_FILE", str(cfg.vault_role_id_file))).expanduser()
+    secret_id_path = Path(env_map.get("VELORA_VAULT_SECRET_ID_FILE", str(cfg.vault_secret_id_file))).expanduser()
+
+    missing: list[str] = []
+    if not role_id_path.exists():
+        missing.append(str(role_id_path))
+    if not secret_id_path.exists():
+        missing.append(str(secret_id_path))
+
+    if missing:
+        return False, "missing AppRole credential file(s): " + ", ".join(missing)
+    return True, ""
+
+
 def get_vault_key(key: str, env: dict[str, str] | None = None) -> str:
+    """Get a secret value.
+
+    Order:
+    1) Environment variable named `key` (e.g. OPENAI_API_KEY)
+    2) Vault/AppRole fallback (only if configured)
+
+    Rationale: Vault is optional; env vars must always work without any Vault/OpenBao setup.
+    """
+
     env_map = env if env is not None else os.environ
     env_val = env_map.get(key, "").strip()
     if env_val:
         return env_val
 
-    keys = _load_vault_api_keys()
+    configured, detail = _vault_fallback_configured(env_map)
+    if not configured:
+        raise RuntimeError(
+            f"{key} is not set and Vault fallback is not configured ({detail}). "
+            f"Set {key} in the environment, or configure Vault via VELORA_VAULT_ADDR/VAULT_ADDR and "
+            "VELORA_VAULT_ROLE_ID_FILE/VELORA_VAULT_SECRET_ID_FILE."
+        )
+
+    try:
+        keys = _load_vault_api_keys()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"{key} is not set and Vault fallback failed: {exc}. "
+            f"Set {key} in the environment to bypass Vault."
+        ) from exc
+
     value = keys.get(key, "").strip()
     if not value:
-        raise RuntimeError(f"Vault key '{key}' not found")
+        raise RuntimeError(f"Vault did not return a value for '{key}'. Set {key} in the environment.")
     return value
