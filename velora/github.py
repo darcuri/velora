@@ -65,7 +65,7 @@ class GitHubClient:
 
         req = urllib.request.Request(url=url, method=method, headers=headers, data=body)
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req) as resp:  # nosec B310 (controlled URL)
                 payload = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
