@@ -21,7 +21,7 @@ Velora stores state under `~/.velora/` by default.
 
 Common env vars:
 - `VELORA_HOME` (override state dir)
-- `VELORA_ALLOWED_OWNERS` (comma-separated owner allowlist; default: `darcuri`)
+- `VELORA_ALLOWED_OWNERS` (comma-separated owner allowlist; default: **unset** → required)
 
 To avoid leaking prompts in your process list, prefer JSON run specs:
 

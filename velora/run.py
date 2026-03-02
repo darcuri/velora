@@ -26,6 +26,11 @@ def validate_repo_allowed(repo_ref: str) -> tuple[str, str]:
         raise ValueError("Repo must be in owner/repo format")
     owner, repo = parts
     allowed = _allowed_owners()
+    if not allowed:
+        raise ValueError(
+            "No allowed owners configured. Set allowed_owners in config.json or set VELORA_ALLOWED_OWNERS "
+            "(comma-separated, e.g. VELORA_ALLOWED_OWNERS=octocat)."
+        )
     if owner not in allowed:
         allowed_str = ", ".join(sorted(allowed))
         raise ValueError(f"Repository owner is not allowed in v0 (allowed: {allowed_str}/*)")

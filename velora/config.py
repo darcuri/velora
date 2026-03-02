@@ -89,13 +89,16 @@ def _parse_int(value: object, default: int) -> int:
 def load_config() -> VeloraConfig:
     # Defaults.
     defaults = {
-        "allowed_owners": ["darcuri"],
+        # Safety: default-deny; user must explicitly allow owners via config/env.
+        "allowed_owners": [],
         "max_attempts": 3,
         "codex_session_prefix": "velora-codex-",
-        "vault_addr": "https://entropy-internal.duckdns.org:8200",
-        "vault_role_id_file": str(Path.home() / ".openclaw" / ".vault-role-id"),
-        "vault_secret_id_file": str(Path.home() / ".openclaw" / ".vault-secret-id"),
-        "vault_api_keys_path": "/v1/secret/data/openclaw/api-keys",
+        # Generic Vault default. Prefer VELORA_VAULT_ADDR/VAULT_ADDR; fall back to local dev.
+        "vault_addr": "http://127.0.0.1:8200",
+        # Optional AppRole convenience defaults (override via env/config).
+        "vault_role_id_file": str(velora_home() / "vault-role-id"),
+        "vault_secret_id_file": str(velora_home() / "vault-secret-id"),
+        "vault_api_keys_path": "/v1/secret/data/velora/api-keys",
         "acpx_cmd": None,
         "acpx_fallback": None,
     }
@@ -136,7 +139,7 @@ def load_config() -> VeloraConfig:
     merged.update(file_cfg)
     merged.update(env_cfg)
 
-    allowed_owners = _parse_owners(merged.get("allowed_owners")) or {"darcuri"}
+    allowed_owners = _parse_owners(merged.get("allowed_owners"))
     max_attempts = max(1, min(_parse_int(merged.get("max_attempts"), 3), 10))
     prefix = str(merged.get("codex_session_prefix") or "velora-codex-")
 

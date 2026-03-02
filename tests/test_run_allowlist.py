@@ -13,14 +13,16 @@ class TestRepoAllowlist(unittest.TestCase):
     def tearDown(self):
         get_config.cache_clear()
 
-    def test_allows_darcuri_repo_by_default(self):
-        owner, repo = validate_repo_allowed("darcuri/velora")
-        self.assertEqual(owner, "darcuri")
-        self.assertEqual(repo, "velora")
-
-    def test_rejects_other_owner_by_default(self):
+    def test_rejects_when_allowlist_missing(self):
+        # Defaults are intentionally empty (default-deny).
         with self.assertRaises(ValueError):
             validate_repo_allowed("octocat/hello-world")
+
+    def test_rejects_owner_not_in_allowlist(self):
+        with patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False):
+            get_config.cache_clear()
+            with self.assertRaises(ValueError):
+                validate_repo_allowed("someoneelse/hello-world")
 
     def test_allows_owner_from_env(self):
         with patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False):

@@ -32,16 +32,16 @@ This is primarily a **privacy/safety feature**: passing long task prompts as CLI
 ## Usage
 
 ```bash
-velora run darcuri/tiny-lab feature --spec spec.json
+velora run octocat/hello-world feature --spec spec.json
 
 # stdin
-cat spec.json | velora run darcuri/tiny-lab feature --spec -
+cat spec.json | velora run octocat/hello-world feature --spec -
 ```
 
 ## Unsafe alternative
 
 ```bash
-velora run darcuri/tiny-lab feature --unsafe-task "..."
+velora run octocat/hello-world feature --unsafe-task "..."
 ```
 
 Use this only for short throwaway tasks where prompt privacy doesn’t matter.

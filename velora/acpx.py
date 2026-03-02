@@ -21,8 +21,12 @@ class CmdResult:
     stderr: str
 
 
-DEFAULT_FALLBACK_ACPX = Path("/home/merlin/openclaw/extensions/acpx/node_modules/.bin/acpx")
-DEFAULT_VAULT_ADDR = "https://entropy-internal.duckdns.org:8200"
+# Optional fallback for developers running Velora inside an OpenClaw checkout.
+# Prefer PATH (acpx), VELORA_ACPX_CMD, or config.json.
+DEFAULT_FALLBACK_ACPX = Path("./extensions/acpx/node_modules/.bin/acpx")
+
+# Generic Vault default. Prefer VELORA_VAULT_ADDR/VAULT_ADDR or config.json; fall back to local dev.
+DEFAULT_VAULT_ADDR = "http://127.0.0.1:8200"
 
 
 def _fallback_acpx_path(env: dict[str, str] | None = None) -> Path:
