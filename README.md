@@ -1,5 +1,9 @@
 # velora
 
+<p align="center">
+  <img src="docs/assets/velora-icon.png" alt="Velora" width="220" />
+</p>
+
 VELORA (VEry LOng Running Agent): a Python CLI orchestrator that runs coding agents (via ACPX), creates PRs, gates on CI, and applies FIRE (Fix-and-Retry).
 
 Status: bootstrapping.
