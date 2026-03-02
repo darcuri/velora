@@ -1,7 +1,7 @@
 # Velora Docs
 
 <p align="center">
-  <img src="./assets/velora-icon.png" alt="Velora" width="220" />
+  <img src="../assets/velora-icon.png" alt="Velora" width="220" />
 </p>
 
 This directory holds user-facing documentation for Velora.
