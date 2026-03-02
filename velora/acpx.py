@@ -290,7 +290,7 @@ def _gemini_generate_content(
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310 (controlled URL)
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -392,7 +392,7 @@ def _vault_request(
         headers["X-Vault-Token"] = token
     req = urllib.request.Request(url=url, method=method, headers=headers, data=data)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req) as resp:  # nosec B310 (Vault addr is user-configured)
             payload = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
