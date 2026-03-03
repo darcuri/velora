@@ -46,6 +46,14 @@ def _task_body(task_id: str, summary: str, extra_body: str | None) -> str:
     return body + "\n"
 
 
+def _mode_a_status_for_terminal_decision(decision: str) -> str:
+    if decision == "finalize_success":
+        return "ready"
+    if decision == "stop_failure":
+        return "failed"
+    raise ValueError(f"Unsupported terminal decision: {decision}")
+
+
 def _build_codex_prompt(
     task_id: str,
     repo_ref: str,
@@ -623,9 +631,13 @@ def run_task_mode_a(
 
         if coord_resp.decision != "execute_work_item":
             # In Mode A, finalize/stop must be explicit and we should surface it.
-            record["status"] = "failed" if coord_resp.decision == "stop_failure" else "not-ready"
+            record["status"] = _mode_a_status_for_terminal_decision(coord_resp.decision)
+            if record["status"] == "failed":
+                record["failure_reason"] = coord_resp.reason
+            else:
+                record.pop("failure_reason", None)
+
             record["updated_at"] = now_iso()
-            record["failure_reason"] = coord_resp.reason
             upsert_task(record, home=base_home)
             return {
                 "task_id": task_id,
