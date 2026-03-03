@@ -292,3 +292,56 @@ def validate_coordinator_response(payload: object) -> CoordinatorResponse:
     """
 
     return CoordinatorResponse.from_dict(payload)
+
+
+def enforce_specialist_matrix(resp: CoordinatorResponse, matrix: object) -> None:
+    """Enforce role→runner/model allowlists.
+
+    This is a *hard-fail* policy gate: out-of-bounds coordinator selections raise
+    ProtocolError rather than being remapped.
+
+    Matrix shape (JSON-serializable):
+      { role: {"runners": ["codex"|"claude"], "models": ["..."]} }
+
+    Models list is optional; if empty, model overrides are treated as disallowed.
+    """
+
+    if matrix is None:
+        return
+    if not isinstance(matrix, dict):
+        raise ProtocolError("policy.specialist_matrix must be an object")
+
+    role = resp.selected_specialist.role
+    rule = matrix.get(role)
+    if not isinstance(rule, dict):
+        raise ProtocolError(f"policy.specialist_matrix missing rule for role: {role}")
+
+    runners_raw = rule.get("runners")
+    if not isinstance(runners_raw, list) or not runners_raw:
+        raise ProtocolError(f"policy.specialist_matrix[{role}].runners must be a non-empty list")
+    allowed_runners = {str(r).strip().lower() for r in runners_raw if isinstance(r, str) and str(r).strip()}
+
+    if resp.selected_specialist.runner not in allowed_runners:
+        allowed_str = ", ".join(sorted(allowed_runners))
+        raise ProtocolError(
+            f"selected_specialist.runner '{resp.selected_specialist.runner}' is not allowed for role '{role}' (allowed: {allowed_str})"
+        )
+
+    if resp.selected_specialist.model is None:
+        return
+
+    models_raw = rule.get("models", [])
+    if models_raw is None:
+        models_raw = []
+    if not isinstance(models_raw, list):
+        raise ProtocolError(f"policy.specialist_matrix[{role}].models must be a list")
+    allowed_models = {str(m).strip() for m in models_raw if isinstance(m, str) and str(m).strip()}
+
+    if not allowed_models:
+        raise ProtocolError(f"selected_specialist.model is not allowed for role '{role}' (no model overrides permitted)")
+
+    if resp.selected_specialist.model not in allowed_models:
+        allowed_str = ", ".join(sorted(allowed_models))
+        raise ProtocolError(
+            f"selected_specialist.model '{resp.selected_specialist.model}' is not allowed for role '{role}' (allowed: {allowed_str})"
+        )
