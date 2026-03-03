@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from .config import get_config
-from .github import GitHubClient
+from .constants import VALID_VERBS
+from .repo import ensure_repo_checkout, get_default_branch, validate_repo_allowed
 from .spec import RunSpec
-from .run import VALID_VERBS, ensure_repo_checkout, validate_repo_allowed
 from .util import build_task_id, now_iso, repo_slug, velora_home
 
 
@@ -54,9 +54,7 @@ def build_initial_coordinator_request(
 
     owner, repo = validate_repo_allowed(repo_ref)
 
-    gh = GitHubClient.from_env()
-    default_branch = gh.get_default_branch(owner, repo)
-
+    default_branch = get_default_branch(owner, repo)
     repo_path = ensure_repo_checkout(owner, repo, home=home)
 
     head_sha = _run_checked(["git", "rev-parse", "HEAD"], cwd=repo_path).strip()
@@ -64,6 +62,8 @@ def build_initial_coordinator_request(
     working_tree_clean = not bool(status)
 
     base_home = home or velora_home()
+    _ = base_home  # reserved for later task-dir linkage
+
     run_id = build_task_id()
 
     request: dict[str, Any] = {

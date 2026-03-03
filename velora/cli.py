@@ -7,11 +7,10 @@ from dataclasses import asdict
 
 from .coordinator import run_coordinator_v1
 from .orchestrator import build_initial_coordinator_request, coordinator_session_name
+from .constants import VERBS
 from .run import run_task
 from .spec import RunSpec, load_run_spec
 from .state import get_status_view, prune_stale_tasks
-
-VERBS = ("feature", "fix", "refactor")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("codex", "claude"),
         help="Which ACPX coding agent to use (default: config/env).",
     )
+    run_p.add_argument("--coordinator", action="store_true", help="Use Mode A coordinator loop")
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     coord_p = sub.add_parser("coord", help="Coordinator utilities (Mode A scaffolding)")
@@ -141,7 +141,13 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "run":
             spec = _load_spec_from_args(args)
-            result = run_task(args.repo, args.verb, spec, runner=getattr(args, "runner", None))
+            result = run_task(
+                args.repo,
+                args.verb,
+                spec,
+                runner=getattr(args, "runner", None),
+                use_coordinator=bool(getattr(args, "coordinator", False)),
+            )
             return _print_run_result(result, args.json)
 
         if args.cmd == "coord":
