@@ -4,7 +4,7 @@ from __future__ import annotations
 
 This module is intentionally small:
 - Render a strict coordinator prompt from a CoordinatorRequest JSON object.
-- Execute the coordinator (Claude runner for now) via ACPX.
+- Execute the coordinator via ACPX (Claude or Codex).
 - Parse strict JSON output.
 - Validate it against protocol v1.
 
@@ -36,13 +36,48 @@ CoordinatorRequest:
 {request_json}
 
 ### Output (STRICT)
-Return only a single JSON object. No markdown. No prose outside JSON.
+Return ONLY a single JSON object. No markdown. No prose outside JSON.
 
-The JSON MUST be a CoordinatorResponse object using protocol_version=1.
-Hard requirements:
-- selected_specialist is required for ALL decisions (attribution)
-- work_item is required only for decision=execute_work_item; forbidden otherwise
-- runner must be codex or claude (Gemini is review-only; never a WorkItem executor)
+The JSON MUST conform to this CoordinatorResponse schema (protocol_version=1):
+
+{{
+  "protocol_version": 1,
+  "decision": "execute_work_item" | "finalize_success" | "stop_failure",
+  "reason": "string",
+
+  "selected_specialist": {{
+    "role": "implementer" | "docs" | "refactor" | "investigator",
+    "runner": "codex" | "claude",
+    "model": "string (optional)"
+  }},
+
+  "work_item": {{
+    "id": "WI-####",
+    "kind": "implement" | "repair" | "refactor" | "docs" | "test_only" | "investigate",
+    "rationale": "string",
+    "instructions": ["string", "..."],
+    "scope_hints": {{"likely_files": ["..."], "search_terms": ["..."]}},
+    "acceptance": {{
+      "must": ["..."],
+      "must_not": ["..."],
+      "gates": ["tests" | "lint" | "security" | "ci" | "docs", "..."]
+    }},
+    "limits": {{"max_diff_lines": 50|100|200|400, "max_commits": 1}},
+    "commit": {{
+      "message": "string",
+      "footer": {{
+        "VELORA_RUN_ID": "string",
+        "VELORA_ITERATION": 1,
+        "WORK_ITEM_ID": "WI-####"
+      }}
+    }}
+  }}
+}}
+
+Rules:
+- selected_specialist is REQUIRED for ALL decisions (attribution)
+- work_item is REQUIRED only when decision=execute_work_item; it must be omitted otherwise
+- reason MUST be a string
 - Unknown keys are forbidden
 """
 
@@ -95,9 +130,14 @@ def run_coordinator_v1(
         if runner_key == "claude"
         else run_codex(session_name=session_name, cwd=cwd, prompt=prompt)
     )
+
     if result.returncode != 0:
         msg = (result.stderr or result.stdout).strip() or "unknown error"
         raise RuntimeError(f"Coordinator runner failed: {msg}")
 
-    payload = _parse_strict_json_object(result.stdout)
-    return validate_coordinator_response(payload)
+    try:
+        payload = _parse_strict_json_object(result.stdout)
+        return validate_coordinator_response(payload)
+    except ProtocolError as exc:
+        excerpt = (result.stdout or "").strip().replace("\n", " ")[:500]
+        raise ProtocolError(f"{exc} | coordinator_output_excerpt={excerpt!r}") from exc
