@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .acpx import CmdResult, run_claude
+from .acpx import CmdResult, run_claude, run_codex
 from .protocol import CoordinatorResponse, ProtocolError, validate_coordinator_response
 
 
@@ -75,11 +75,26 @@ def _parse_strict_json_object(text: str) -> dict[str, Any]:
     return payload
 
 
-def run_coordinator_v1(*, session_name: str, cwd: Path, request: dict[str, Any]) -> CoordinatorResponse:
+def run_coordinator_v1(
+    *,
+    session_name: str,
+    cwd: Path,
+    request: dict[str, Any],
+    runner: str = "claude",
+) -> CoordinatorResponse:
     """Run the coordinator model and return a validated CoordinatorResponse."""
 
     prompt = render_coordinator_prompt_v1(request)
-    result: CmdResult = run_claude(session_name=session_name, cwd=cwd, prompt=prompt)
+
+    runner_key = (runner or "claude").strip().lower()
+    if runner_key not in {"claude", "codex"}:
+        raise ValueError("coordinator runner must be one of: claude, codex")
+
+    result: CmdResult = (
+        run_claude(session_name=session_name, cwd=cwd, prompt=prompt)
+        if runner_key == "claude"
+        else run_codex(session_name=session_name, cwd=cwd, prompt=prompt)
+    )
     if result.returncode != 0:
         msg = (result.stderr or result.stdout).strip() or "unknown error"
         raise RuntimeError(f"Coordinator runner failed: {msg}")

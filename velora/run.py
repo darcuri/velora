@@ -441,6 +441,7 @@ def run_task_mode_a(
     }
 
     coord_session = coordinator_session_name(owner, repo)
+    coord_runner = os.environ.get("VELORA_COORDINATOR_RUNNER", "claude").strip().lower() or "claude"
 
     max_attempts = spec.max_attempts if spec.max_attempts is not None else cfg.max_attempts
     max_attempts = max(1, min(int(max_attempts), 10))
@@ -450,7 +451,12 @@ def run_task_mode_a(
     for attempt in range(1, max_attempts + 1):
         request["iteration"] = attempt
 
-        coord_resp = run_coordinator_v1(session_name=coord_session, cwd=repo_path, request=request)
+        coord_resp = run_coordinator_v1(
+            session_name=coord_session,
+            cwd=repo_path,
+            request=request,
+            runner=coord_runner,
+        )
         _append_text(coord_output_path, f"---- iteration {attempt} decision={coord_resp.decision} ----\n{coord_resp.reason}")
 
         if coord_resp.decision != "execute_work_item":
