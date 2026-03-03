@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+"""Coordinator execution (control-plane) for Mode A.
+
+This module is intentionally small:
+- Render a strict coordinator prompt from a CoordinatorRequest JSON object.
+- Execute the coordinator (Claude runner for now) via ACPX.
+- Parse strict JSON output.
+- Validate it against protocol v1.
+
+Any protocol violation is a hard failure (no remaps).
+"""
+
+import json
+from pathlib import Path
+from typing import Any
+
+from .acpx import CmdResult, run_claude
+from .protocol import CoordinatorResponse, ProtocolError, validate_coordinator_response
+
+
+COORDINATOR_PROMPT_TEMPLATE_V1 = """You are Velora Coordinator, the control-plane orchestrator for an autonomous engineering loop.
+
+### Operating mode
+- Mode A only: single branch, sequential work. Exactly one WorkItem per iteration.
+- You do not run commands, edit code, or browse files directly. You decide what to do next and delegate to a specialist worker.
+- You must follow the provided policy and required gates.
+- Prefer the smallest change that makes measurable progress.
+- Do not request or reveal secrets. If auth is missing, stop with a clear message.
+
+### Input
+You will be given a single JSON object called CoordinatorRequest.
+Treat it as the authoritative state of the run. Do not assume additional context.
+
+CoordinatorRequest:
+{request_json}
+
+### Output (STRICT)
+Return only a single JSON object. No markdown. No prose outside JSON.
+
+The JSON MUST be a CoordinatorResponse object using protocol_version=1.
+Hard requirements:
+- selected_specialist is required for ALL decisions (attribution)
+- work_item is required only for decision=execute_work_item; forbidden otherwise
+- runner must be codex or claude (Gemini is review-only; never a WorkItem executor)
+- Unknown keys are forbidden
+"""
+
+
+def render_coordinator_prompt_v1(request: dict[str, Any]) -> str:
+    request_json = json.dumps(request, indent=2, sort_keys=True)
+    return COORDINATOR_PROMPT_TEMPLATE_V1.format(request_json=request_json)
+
+
+def _parse_strict_json_object(text: str) -> dict[str, Any]:
+    """Parse a strict JSON object.
+
+    Coordinator output is required to be JSON-only. If the model emits any extra
+    characters beyond surrounding whitespace, treat it as a protocol violation.
+    """
+
+    raw = text.strip()
+    if not raw:
+        raise ProtocolError("Coordinator output was empty")
+    if raw.startswith("```") or raw.endswith("```"):
+        raise ProtocolError("Coordinator output must not be wrapped in markdown fences")
+    if not (raw.startswith("{") and raw.endswith("}")):
+        raise ProtocolError("Coordinator output must be a single JSON object")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProtocolError(f"Coordinator output was not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ProtocolError("Coordinator output JSON must be an object")
+    return payload
+
+
+def run_coordinator_v1(*, session_name: str, cwd: Path, request: dict[str, Any]) -> CoordinatorResponse:
+    """Run the coordinator model and return a validated CoordinatorResponse."""
+
+    prompt = render_coordinator_prompt_v1(request)
+    result: CmdResult = run_claude(session_name=session_name, cwd=cwd, prompt=prompt)
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout).strip() or "unknown error"
+        raise RuntimeError(f"Coordinator runner failed: {msg}")
+
+    payload = _parse_strict_json_object(result.stdout)
+    return validate_coordinator_response(payload)
