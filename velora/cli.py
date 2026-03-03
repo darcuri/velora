@@ -9,7 +9,7 @@ from dataclasses import asdict
 from .coordinator import run_coordinator_v1
 from .orchestrator import build_initial_coordinator_request, coordinator_session_name
 from .constants import VERBS
-from .run import run_task
+from .run import resume_task, run_task
 from .spec import RunSpec, load_run_spec
 from .state import get_status_view, prune_stale_tasks
 
@@ -47,6 +47,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument("--coordinator", action="store_true", help="Use Mode A coordinator loop")
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    resume_p = sub.add_parser("resume", help="Resume a VELORA task by task_id")
+    resume_p.add_argument("task_id", help="Task id (from velora status)")
+    resume_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     coord_p = sub.add_parser("coord", help="Coordinator utilities (Mode A scaffolding)")
     coord_sub = coord_p.add_subparsers(dest="coord_cmd", required=True)
@@ -149,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
                 runner=getattr(args, "runner", None),
                 use_coordinator=bool(getattr(args, "coordinator", False)),
             )
+            return _print_run_result(result, args.json)
+
+        if args.cmd == "resume":
+            result = resume_task(str(args.task_id))
             return _print_run_result(result, args.json)
 
         if args.cmd == "coord":

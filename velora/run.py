@@ -15,7 +15,7 @@ from .github import GitHubClient
 from .orchestrator import coordinator_session_name
 from .repo import ensure_repo_checkout, validate_repo_allowed
 from .spec import RunSpec
-from .state import upsert_task
+from .state import get_task, upsert_task
 from .util import build_task_id, ensure_dir, now_iso, repo_slug, velora_home
 from .worker_prompt import build_worker_prompt_v1
 
@@ -210,6 +210,110 @@ def run_task(
     if use_coordinator:
         return run_task_mode_a(repo_ref, verb, spec, home=home)
     return run_task_legacy(repo_ref, verb, spec, home=home, runner=runner)
+
+
+def resume_task(task_id: str, home: Path | None = None) -> dict[str, Any]:
+    """Resume a previously started task.
+
+    v0 scope: take an existing branch/commit and finish the remaining pipeline:
+    ensure PR exists → poll CI → run review → set final status.
+
+    This is designed to recover from transient failures (GitHub 500s, network hiccups,
+    process interruptions) without starting a new task/branch.
+    """
+
+    base_home = home or velora_home()
+    task = get_task(task_id, home=base_home)
+    if task is None:
+        raise ValueError(f"Unknown task_id: {task_id}")
+
+    repo_ref = str(task.get("repo") or "")
+    verb = str(task.get("verb") or "")
+    task_text = str(task.get("task") or "")
+    if not repo_ref or not verb or not task_text:
+        raise ValueError(f"Task record missing required fields (repo/verb/task): {task_id}")
+
+    owner, repo = validate_repo_allowed(repo_ref)
+    gh = GitHubClient.from_env()
+    base_branch = gh.get_default_branch(owner, repo)
+
+    repo_path = ensure_repo_checkout(owner, repo, home=home)
+
+    branch = str(task.get("branch") or f"velora/{task_id}")
+    _run_checked(["git", "checkout", branch], cwd=repo_path)
+
+    head_sha = str(task.get("head_sha") or "").strip()
+    if not head_sha:
+        head_sha = _run_checked(["git", "rev-parse", "HEAD"], cwd=repo_path).strip()
+        task["head_sha"] = head_sha
+
+    summary = str(task.get("summary") or "(resume)").strip()
+
+    task_dir = ensure_dir(base_home / "tasks" / task_id)
+
+    # Create PR if missing.
+    if not task.get("pr_number"):
+        pr = gh.create_pull_request(
+            owner=owner,
+            repo=repo,
+            title=_task_title(verb, task_text, None),
+            body=_task_body(task_id, summary, None),
+            head=branch,
+            base=base_branch,
+        )
+        task["pr_url"] = pr["html_url"]
+        task["pr_number"] = pr["number"]
+
+    # Poll CI.
+    ci_log = task_dir / "ci-resume.log"
+    _append_text(ci_log, f"[{now_iso()}] resuming CI poll for {head_sha}")
+    ci_state, ci_detail = _poll_ci(gh, owner, repo, head_sha, ci_log)
+    _append_text(ci_log, f"[{now_iso()}] final {ci_state}: {ci_detail}")
+
+    if ci_state != "success":
+        task["status"] = "not-ready"
+        task["updated_at"] = now_iso()
+        task["failure_reason"] = f"CI not successful on resume: {ci_detail}"
+        upsert_task(task, home=base_home)
+        return {
+            "task_id": task_id,
+            "status": task["status"],
+            "pr_url": task.get("pr_url"),
+            "summary": task.get("failure_reason"),
+            "ci_state": ci_state,
+            "ci_detail": ci_detail,
+        }
+
+    # Review gate.
+    diff_text = _read_diff_for_review(repo_path, base_branch, head_sha)
+    gemini = run_gemini_review(diff_text)
+    review_text = gemini.stdout.strip()
+    if gemini.returncode != 0:
+        review_text = f"BLOCKER: Review tool failed: {gemini.stderr.strip()}"
+
+    review_path = task_dir / "review-resume.txt"
+    _write_text(review_path, review_text)
+
+    pr_number = int(task["pr_number"])
+    gh.post_issue_comment(owner, repo, pr_number, review_text)
+
+    if gemini.returncode != 0 or "BLOCKER" in review_text:
+        task["status"] = "not-ready"
+    else:
+        task["status"] = "ready"
+
+    task["updated_at"] = now_iso()
+    upsert_task(task, home=base_home)
+
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "pr_url": task.get("pr_url"),
+        "summary": task.get("summary"),
+        "ci_state": ci_state,
+        "ci_detail": ci_detail,
+        "review": review_text,
+    }
 
 
 def run_task_legacy(

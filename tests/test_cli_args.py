@@ -14,6 +14,13 @@ class TestCliArgs(unittest.TestCase):
         self.assertIsNone(args.spec)
         self.assertTrue(args.json)
 
+    def test_resume_args_parsing(self):
+        parser = build_parser()
+        args = parser.parse_args(["resume", "task123", "--json"])
+        self.assertEqual(args.cmd, "resume")
+        self.assertEqual(args.task_id, "task123")
+        self.assertTrue(args.json)
+
     def test_coord_request_args_parsing(self):
         parser = build_parser()
         args = parser.parse_args(
