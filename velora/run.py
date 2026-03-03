@@ -11,7 +11,7 @@ from .config import get_config
 from .constants import VALID_VERBS
 from .coordinator import run_coordinator_v1
 from .github import GitHubClient
-from .orchestrator import build_initial_coordinator_request, coordinator_session_name
+from .orchestrator import coordinator_session_name
 from .repo import ensure_repo_checkout, validate_repo_allowed
 from .spec import RunSpec
 from .state import upsert_task
@@ -131,6 +131,20 @@ def _read_diff_for_review(repo_path: Path, base_ref: str, head_sha: str) -> str:
     return _run_checked(["git", "diff", f"origin/{base_ref}...{head_sha}"], cwd=repo_path)
 
 
+def _format_preflight_error(exc: Exception) -> str:
+    msg = str(exc).strip() or exc.__class__.__name__
+
+    # GitHub transient clone/fetch issues.
+    if "requested URL returned error: 500" in msg or "Internal Server Error" in msg or "HTTP 500" in msg:
+        return (
+            "GitHub returned HTTP 500 during repo sync (clone/fetch/pull). "
+            "This appears transient/outside Velora. Retry in a few minutes. "
+            f"(detail: {msg})"
+        )
+
+    return msg
+
+
 def run_task(
     repo_ref: str,
     verb: str,
@@ -164,11 +178,6 @@ def run_task_legacy(
 
     task_text = spec.task
 
-    owner, repo = validate_repo_allowed(repo_ref)
-    gh = GitHubClient.from_env()
-    base_branch = gh.get_default_branch(owner, repo)
-    repo_path = ensure_repo_checkout(owner, repo, home=home)
-
     base_home = home or velora_home()
     task_id = build_task_id()
     task_dir = ensure_dir(base_home / "tasks" / task_id)
@@ -190,6 +199,19 @@ def run_task_legacy(
         "summary": None,
     }
     upsert_task(record, home=base_home)
+
+    try:
+        owner, repo = validate_repo_allowed(repo_ref)
+        gh = GitHubClient.from_env()
+        base_branch = gh.get_default_branch(owner, repo)
+        repo_path = ensure_repo_checkout(owner, repo, home=home)
+    except Exception as exc:  # noqa: BLE001
+        detail = _format_preflight_error(exc)
+        record["status"] = "failed"
+        record["updated_at"] = now_iso()
+        record["failure_reason"] = detail
+        upsert_task(record, home=base_home)
+        return {"task_id": task_id, "status": record["status"], "pr_url": None, "summary": detail}
 
     cfg = get_config()
     effective_runner = (runner or cfg.runner).strip().lower()
@@ -340,18 +362,10 @@ def run_task_mode_a(
 ) -> dict[str, Any]:
     """Mode A loop: coordinator → work_item → worker → evaluate → repeat."""
 
-    # CoordinatorRequest builder also validates allowlist and ensures clean checkout.
-    request, repo_path = build_initial_coordinator_request(repo_ref, verb, spec, home=home)
-    owner = str(request["repo"]["owner"])
-    repo = str(request["repo"]["name"])
-    base_branch = str(request["repo"]["default_branch"])
-    work_branch = str(request["repo"]["work_branch"])
-
-    gh = GitHubClient.from_env()
     base_home = home or velora_home()
 
-    # Use run_id as the durable task_id so coordinator/work items line up with filesystem artifacts.
-    task_id = str(request["run_id"])
+    # Use our own durable run_id/task_id so failures during preflight still get recorded.
+    task_id = build_task_id()
     task_text = spec.task
 
     task_dir = ensure_dir(base_home / "tasks" / task_id)
@@ -375,6 +389,57 @@ def run_task_mode_a(
     upsert_task(record, home=base_home)
 
     cfg = get_config()
+
+    try:
+        owner, repo = validate_repo_allowed(repo_ref)
+        gh = GitHubClient.from_env()
+        base_branch = gh.get_default_branch(owner, repo)
+        repo_path = ensure_repo_checkout(owner, repo, home=home)
+    except Exception as exc:  # noqa: BLE001
+        detail = _format_preflight_error(exc)
+        record["status"] = "failed"
+        record["updated_at"] = now_iso()
+        record["failure_reason"] = detail
+        upsert_task(record, home=base_home)
+        return {"task_id": task_id, "status": record["status"], "pr_url": None, "summary": detail}
+
+    work_branch = f"velora/{task_id}"
+
+    request: dict[str, Any] = {
+        "protocol_version": 1,
+        "run_id": task_id,
+        "iteration": 1,
+        "objective": task_text,
+        "repo": {
+            "owner": owner,
+            "name": repo,
+            "default_branch": base_branch,
+            "work_branch": work_branch,
+        },
+        "policy": {
+            "max_cost_usd": 20,
+            "no_progress_max": 4,
+            "allow_self_merge": False,
+            "required_gates": ["tests", "security"],
+        },
+        "state": {
+            "working_tree_clean": True,
+            "last_commit": "",
+            "diff_summary": "",
+            "notes": [f"created_at={now_iso()}", f"verb={verb}"],
+        },
+        "evaluation": {
+            "status": "none",
+            "failing_checks": [],
+            "logs_excerpt": "",
+        },
+        "history": {
+            "work_items_executed": [],
+            "no_progress_streak": 0,
+            "cost_usd_estimate": 0.0,
+        },
+    }
+
     coord_session = coordinator_session_name(owner, repo)
 
     max_attempts = spec.max_attempts if spec.max_attempts is not None else cfg.max_attempts
