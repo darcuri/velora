@@ -66,13 +66,18 @@ def _is_oscillating_failure_signatures(sigs: list[str]) -> bool:
 
 def _truncate_text(text: str, limit: int) -> str:
     text = " ".join(str(text or "").split())
-    if limit <= 0 or len(text) <= limit:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
         return text
+    if limit <= 3:
+        return "..."[:limit]
     keep = max(0, limit - 3)
     cut = text[:keep]
     if " " in cut:
         cut = cut.rsplit(" ", 1)[0]
-    return (cut or text[:keep]) + "..."
+    out = (cut or text[:keep]) + "..."
+    return out[:limit]
 
 
 def _parse_failing_check_runs_payload(payload: dict[str, Any]) -> tuple[list[dict[str, str]], str]:

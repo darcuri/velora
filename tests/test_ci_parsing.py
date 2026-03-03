@@ -1,9 +1,24 @@
 import unittest
 
-from velora.run import _build_ci_logs_excerpt, _parse_failing_check_runs_payload
+from velora.run import _build_ci_logs_excerpt, _parse_failing_check_runs_payload, _truncate_text
 
 
 class TestCiParsing(unittest.TestCase):
+    def test_truncate_text_small_limits_are_never_exceeded(self):
+        sample = "alpha beta gamma"
+        for limit in range(0, 5):
+            out = _truncate_text(sample, limit)
+            self.assertLessEqual(len(out), limit)
+        self.assertEqual(_truncate_text(sample, 0), "")
+        self.assertEqual(_truncate_text(sample, 1), ".")
+        self.assertEqual(_truncate_text(sample, 2), "..")
+        self.assertEqual(_truncate_text(sample, 3), "...")
+
+    def test_truncate_text_long_string_keeps_limit(self):
+        out = _truncate_text("word " * 50, 17)
+        self.assertLessEqual(len(out), 17)
+        self.assertTrue(out.endswith("..."))
+
     def test_parse_multiple_failing_checks_and_signature_order_invariant(self):
         payload_a = {
             "check_runs": [
