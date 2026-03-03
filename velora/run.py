@@ -7,34 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from .acpx import parse_codex_footer, run_claude, run_codex, run_gemini_review
-from .github import GitHubClient
-from .state import upsert_task
-from .spec import RunSpec
 from .config import get_config
+from .constants import VALID_VERBS
+from .coordinator import run_coordinator_v1
+from .github import GitHubClient
+from .orchestrator import build_initial_coordinator_request, coordinator_session_name
+from .repo import ensure_repo_checkout, validate_repo_allowed
+from .spec import RunSpec
+from .state import upsert_task
 from .util import build_task_id, ensure_dir, now_iso, repo_slug, velora_home
-
-def _allowed_owners() -> set[str]:
-    return set(get_config().allowed_owners)
-
-
-VALID_VERBS = {"feature", "fix", "refactor"}
-
-
-def validate_repo_allowed(repo_ref: str) -> tuple[str, str]:
-    parts = repo_ref.split("/")
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise ValueError("Repo must be in owner/repo format")
-    owner, repo = parts
-    allowed = _allowed_owners()
-    if not allowed:
-        raise ValueError(
-            "No allowed owners configured. Set allowed_owners in config.json or set VELORA_ALLOWED_OWNERS "
-            "(comma-separated, e.g. VELORA_ALLOWED_OWNERS=octocat)."
-        )
-    if owner not in allowed:
-        allowed_str = ", ".join(sorted(allowed))
-        raise ValueError(f"Repository owner is not allowed in v0 (allowed: {allowed_str}/*)")
-    return owner, repo
+from .worker_prompt import build_worker_prompt_v1
 
 
 def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
@@ -48,22 +30,6 @@ def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{proc.stderr.strip()}")
     return proc.stdout
-
-
-def ensure_repo_checkout(owner: str, repo: str, home: Path | None = None) -> Path:
-    base = ensure_dir((home or velora_home()) / "repos")
-    checkout = base / repo_slug(owner, repo)
-    full_name = f"{owner}/{repo}"
-    if not checkout.exists():
-        _run_checked(["gh", "repo", "clone", full_name, str(checkout)])
-        return checkout
-
-    status = _run_checked(["git", "status", "--porcelain"], cwd=checkout).strip()
-    if status:
-        raise RuntimeError(f"Local repo is not clean: {checkout}")
-    _run_checked(["git", "fetch", "--all", "--prune"], cwd=checkout)
-    _run_checked(["git", "pull", "--ff-only"], cwd=checkout)
-    return checkout
 
 
 def _task_title(verb: str, task: str, title_override: str | None = None) -> str:
@@ -87,6 +53,7 @@ def _build_codex_prompt(
     attempt: int,
     fix_context: str | None,
 ) -> str:
+    # Legacy prompt (pre-coordinator path).
     lines = [
         f"You are working on {repo_ref}.",
         f"Task ID: {task_id}",
@@ -170,6 +137,27 @@ def run_task(
     spec: RunSpec,
     home: Path | None = None,
     runner: str | None = None,
+    *,
+    use_coordinator: bool = False,
+) -> dict[str, Any]:
+    """Run a VELORA task.
+
+    - Legacy mode (default): direct worker prompt (Codex/Claude) + FIRE loop.
+    - Mode A (use_coordinator=True): Coordinator (control-plane) emits WorkItems;
+      workers execute; CI + review feed back into coordinator.
+    """
+
+    if use_coordinator:
+        return run_task_mode_a(repo_ref, verb, spec, home=home)
+    return run_task_legacy(repo_ref, verb, spec, home=home, runner=runner)
+
+
+def run_task_legacy(
+    repo_ref: str,
+    verb: str,
+    spec: RunSpec,
+    home: Path | None = None,
+    runner: str | None = None,
 ) -> dict[str, Any]:
     if verb not in VALID_VERBS:
         raise ValueError(f"Invalid verb: {verb}. Allowed: {', '.join(sorted(VALID_VERBS))}")
@@ -186,7 +174,6 @@ def run_task(
     task_dir = ensure_dir(base_home / "tasks" / task_id)
     prompt_path = task_dir / "prompt.txt"
     agent_output_path = task_dir / "agent-output.txt"
-    review_path = task_dir / "review.txt"
 
     record: dict[str, Any] = {
         "task_id": task_id,
@@ -267,9 +254,7 @@ def run_task(
             if attempt == max_attempts:
                 record["status"] = "failed"
                 record["updated_at"] = now_iso()
-                record["failure_reason"] = (
-                    f"FIRE exhausted after {max_attempts} attempts; last CI detail: {ci_detail}"
-                )
+                record["failure_reason"] = f"FIRE exhausted after {max_attempts} attempts; last CI detail: {ci_detail}"
                 upsert_task(record, home=base_home)
                 return {
                     "task_id": task_id,
@@ -282,7 +267,6 @@ def run_task(
             fix_context = f"Attempt {attempt} CI failure detail: {ci_detail}"
             continue
 
-        # CI success → review gate (and FIRE it too).
         diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
         gemini = run_gemini_review(diff_text)
         review_text = gemini.stdout.strip()
@@ -341,14 +325,250 @@ def run_task(
             "review": review_text,
         }
 
-    # Should be unreachable.
     record["status"] = "failed"
     record["updated_at"] = now_iso()
     record["failure_reason"] = "FIRE exhausted"
     upsert_task(record, home=base_home)
-    return {
+    return {"task_id": task_id, "status": record["status"], "pr_url": record["pr_url"], "summary": record["failure_reason"]}
+
+
+def run_task_mode_a(
+    repo_ref: str,
+    verb: str,
+    spec: RunSpec,
+    home: Path | None = None,
+) -> dict[str, Any]:
+    """Mode A loop: coordinator → work_item → worker → evaluate → repeat."""
+
+    # CoordinatorRequest builder also validates allowlist and ensures clean checkout.
+    request, repo_path = build_initial_coordinator_request(repo_ref, verb, spec, home=home)
+    owner = str(request["repo"]["owner"])
+    repo = str(request["repo"]["name"])
+    base_branch = str(request["repo"]["default_branch"])
+    work_branch = str(request["repo"]["work_branch"])
+
+    gh = GitHubClient.from_env()
+    base_home = home or velora_home()
+
+    # Use run_id as the durable task_id so coordinator/work items line up with filesystem artifacts.
+    task_id = str(request["run_id"])
+    task_text = spec.task
+
+    task_dir = ensure_dir(base_home / "tasks" / task_id)
+    coord_output_path = task_dir / "coord-output.txt"
+    agent_output_path = task_dir / "agent-output.txt"
+
+    record: dict[str, Any] = {
         "task_id": task_id,
-        "status": record["status"],
-        "pr_url": record["pr_url"],
-        "summary": record["failure_reason"],
+        "repo": repo_ref,
+        "verb": verb,
+        "task": task_text,
+        "status": "running",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "pr_url": None,
+        "pr_number": None,
+        "branch": None,
+        "head_sha": None,
+        "summary": None,
     }
+    upsert_task(record, home=base_home)
+
+    cfg = get_config()
+    coord_session = coordinator_session_name(owner, repo)
+
+    max_attempts = spec.max_attempts if spec.max_attempts is not None else cfg.max_attempts
+    max_attempts = max(1, min(int(max_attempts), 10))
+
+    last_failure_sig: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        request["iteration"] = attempt
+
+        coord_resp = run_coordinator_v1(session_name=coord_session, cwd=repo_path, request=request)
+        _append_text(coord_output_path, f"---- iteration {attempt} decision={coord_resp.decision} ----\n{coord_resp.reason}")
+
+        if coord_resp.decision != "execute_work_item":
+            # In Mode A, finalize/stop must be explicit and we should surface it.
+            record["status"] = "failed" if coord_resp.decision == "stop_failure" else "not-ready"
+            record["updated_at"] = now_iso()
+            record["failure_reason"] = coord_resp.reason
+            upsert_task(record, home=base_home)
+            return {
+                "task_id": task_id,
+                "status": record["status"],
+                "pr_url": record["pr_url"],
+                "summary": coord_resp.reason,
+            }
+
+        if coord_resp.work_item is None:
+            raise RuntimeError("CoordinatorResponse missing work_item")
+
+        worker_runner = coord_resp.selected_specialist.runner
+        if worker_runner not in {"codex", "claude"}:
+            # Protocol should prevent this.
+            raise RuntimeError(f"Unsupported worker runner: {worker_runner}")
+
+        # One stable worker session per repo/runner.
+        session_prefix = cfg.codex_session_prefix if worker_runner == "codex" else cfg.claude_session_prefix
+        worker_session = f"{session_prefix}{repo_slug(owner, repo)}"
+
+        prompt = build_worker_prompt_v1(
+            repo_ref=repo_ref,
+            verb=verb,
+            objective=str(request["objective"]),
+            run_id=task_id,
+            iteration=attempt,
+            work_branch=work_branch,
+            work_item=coord_resp.work_item,
+        )
+
+        agent_result = (
+            run_codex(session_name=worker_session, cwd=repo_path, prompt=prompt)
+            if worker_runner == "codex"
+            else run_claude(session_name=worker_session, cwd=repo_path, prompt=prompt)
+        )
+        _append_text(
+            agent_output_path,
+            f"---- iteration {attempt} runner={worker_runner} rc={agent_result.returncode} ----\n{agent_result.stdout}\n{agent_result.stderr}",
+        )
+        if agent_result.returncode != 0:
+            raise RuntimeError(
+                f"acpx {worker_runner} failed on iteration {attempt}: {(agent_result.stderr or agent_result.stdout).strip()}"
+            )
+
+        footer = parse_codex_footer(agent_result.stdout)
+        record["branch"] = footer["branch"]
+        record["head_sha"] = footer["head_sha"]
+        record["summary"] = footer["summary"]
+        record["updated_at"] = now_iso()
+        upsert_task(record, home=base_home)
+
+        # Update coordinator state snapshot.
+        request.setdefault("state", {})
+        request["state"]["last_commit"] = footer["head_sha"]
+
+        if attempt == 1:
+            pr = gh.create_pull_request(
+                owner=owner,
+                repo=repo,
+                title=_task_title(verb, task_text, spec.title),
+                body=_task_body(task_id, footer["summary"], spec.body),
+                head=footer["branch"],
+                base=base_branch,
+            )
+            record["pr_url"] = pr["html_url"]
+            record["pr_number"] = pr["number"]
+            record["updated_at"] = now_iso()
+            upsert_task(record, home=base_home)
+
+        ci_log = task_dir / f"ci-iter-{attempt}.log"
+        _append_text(ci_log, f"[{now_iso()}] polling CI for {footer['head_sha']}")
+        ci_state, ci_detail = _poll_ci(gh, owner, repo, footer["head_sha"], ci_log)
+        _append_text(ci_log, f"[{now_iso()}] final {ci_state}: {ci_detail}")
+
+        # Record history entry skeleton.
+        hist = request.setdefault("history", {})
+        work_items = hist.setdefault("work_items_executed", [])
+
+        if ci_state != "success":
+            failure_sig = f"ci:{ci_detail}"
+            no_prog = int(hist.get("no_progress_streak") or 0)
+            no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
+            last_failure_sig = failure_sig
+            hist["no_progress_streak"] = no_prog
+
+            request["evaluation"] = {
+                "status": "fail",
+                "failing_checks": [{"name": "ci", "kind": "ci", "url": record.get("pr_url"), "summary": ci_detail}],
+                "logs_excerpt": ci_detail,
+            }
+            work_items.append(
+                {
+                    "id": coord_resp.work_item.id,
+                    "kind": coord_resp.work_item.kind,
+                    "result": "fail",
+                    "patch_suggestion": {
+                        "progress": "none" if no_prog > 1 else "some",
+                        "evidence": [f"ci_state={ci_state}", f"ci_detail={ci_detail}"],
+                        "next_guess": "repair failing CI checks",
+                    },
+                }
+            )
+            continue
+
+        # CI success → review gate.
+        diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
+        gemini = run_gemini_review(diff_text)
+        review_text = gemini.stdout.strip()
+        if gemini.returncode != 0:
+            review_text = f"BLOCKER: Review tool failed: {gemini.stderr.strip()}"
+
+        review_attempt_path = task_dir / f"review-iter-{attempt}.txt"
+        _write_text(review_attempt_path, review_text)
+
+        if record["pr_number"] is None:
+            raise RuntimeError("PR number missing; cannot post review comment")
+        gh.post_issue_comment(owner, repo, int(record["pr_number"]), review_text)
+
+        if gemini.returncode != 0 or "BLOCKER" in review_text:
+            detail = "review-tool-failed" if gemini.returncode != 0 else "review-blocker"
+            failure_sig = f"review:{detail}"
+            no_prog = int(hist.get("no_progress_streak") or 0)
+            no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
+            last_failure_sig = failure_sig
+            hist["no_progress_streak"] = no_prog
+
+            request["evaluation"] = {
+                "status": "fail",
+                "failing_checks": [{"name": "review", "kind": "review", "url": record.get("pr_url"), "summary": review_text[:2000]}],
+                "logs_excerpt": review_text[:2000],
+            }
+            work_items.append(
+                {
+                    "id": coord_resp.work_item.id,
+                    "kind": coord_resp.work_item.kind,
+                    "result": "fail",
+                    "patch_suggestion": {
+                        "progress": "none" if no_prog > 1 else "some",
+                        "evidence": [detail],
+                        "next_guess": "address review blockers",
+                    },
+                }
+            )
+            continue
+
+        # Success.
+        request["evaluation"] = {"status": "success", "failing_checks": [], "logs_excerpt": ""}
+        hist["no_progress_streak"] = 0
+        work_items.append(
+            {
+                "id": coord_resp.work_item.id,
+                "kind": coord_resp.work_item.kind,
+                "result": "pass",
+                "patch_suggestion": {
+                    "progress": "clear",
+                    "evidence": ["ci_success", "review_clear"],
+                    "next_guess": "",
+                },
+            }
+        )
+
+        record["status"] = "ready"
+        record["updated_at"] = now_iso()
+        upsert_task(record, home=base_home)
+        return {
+            "task_id": task_id,
+            "status": record["status"],
+            "pr_url": record["pr_url"],
+            "summary": record["summary"],
+            "ci_state": ci_state,
+            "ci_detail": ci_detail,
+            "review": review_text,
+        }
+
+    record["status"] = "failed"
+    record["updated_at"] = now_iso()
+    record["failure_reason"] = f"Mode A loop exhausted after {max_attempts} iterations"
+    upsert_task(record, home=base_home)
+    return {"task_id": task_id, "status": record["status"], "pr_url": record["pr_url"], "summary": record["failure_reason"]}
