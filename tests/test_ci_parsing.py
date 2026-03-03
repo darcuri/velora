@@ -4,19 +4,31 @@ from velora.run import _build_ci_logs_excerpt, _parse_failing_check_runs_payload
 
 
 class TestCiParsing(unittest.TestCase):
-    def test_truncate_text_small_limits_are_never_exceeded(self):
+    def test_truncate_text_edge_limits_are_safe_and_deterministic(self):
         sample = "alpha beta gamma"
-        for limit in range(0, 5):
+        cases = [
+            (0, ""),
+            (1, "a"),
+            (2, "al"),
+            (3, "..."),
+        ]
+        for limit, expected in cases:
             out = _truncate_text(sample, limit)
+            self.assertEqual(out, expected)
             self.assertLessEqual(len(out), limit)
-        self.assertEqual(_truncate_text(sample, 0), "")
-        self.assertEqual(_truncate_text(sample, 1), ".")
-        self.assertEqual(_truncate_text(sample, 2), "..")
-        self.assertEqual(_truncate_text(sample, 3), "...")
+            self.assertEqual(_truncate_text(sample, limit), expected)
+
+    def test_truncate_text_exact_length_unchanged(self):
+        text = "alpha beta"
+        out = _truncate_text(text, len(text))
+        self.assertEqual(out, text)
+        self.assertLessEqual(len(out), len(text))
 
     def test_truncate_text_long_string_keeps_limit(self):
-        out = _truncate_text("word " * 50, 17)
+        long_text = "word " * 50
+        out = _truncate_text(long_text, 17)
         self.assertLessEqual(len(out), 17)
+        self.assertEqual(out, _truncate_text(long_text, 17))
         self.assertTrue(out.endswith("..."))
 
     def test_parse_multiple_failing_checks_and_signature_order_invariant(self):
@@ -71,6 +83,8 @@ class TestCiParsing(unittest.TestCase):
         self.assertLessEqual(len(excerpt), 220)
         self.assertIn("(+1 more failing checks)", excerpt)
         self.assertTrue(excerpt.endswith("...") or len(excerpt) < 220)
+        tiny = _build_ci_logs_excerpt(checks, max_checks=1, max_chars=2)
+        self.assertLessEqual(len(tiny), 2)
 
 
 if __name__ == "__main__":

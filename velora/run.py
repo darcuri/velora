@@ -70,8 +70,10 @@ def _truncate_text(text: str, limit: int) -> str:
         return ""
     if len(text) <= limit:
         return text
-    if limit <= 3:
-        return "..."[:limit]
+    if limit < 3:
+        return text[:limit]
+    if limit == 3:
+        return "..."
     keep = max(0, limit - 3)
     cut = text[:keep]
     if " " in cut:
