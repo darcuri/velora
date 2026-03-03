@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 
@@ -163,7 +164,8 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.coord_cmd == "run":
                 session = coordinator_session_name(request["repo"]["owner"], request["repo"]["name"])
-                resp = run_coordinator_v1(session_name=session, cwd=repo_path, request=request)
+                coord_runner = os.environ.get("VELORA_COORDINATOR_RUNNER", "claude")
+                resp = run_coordinator_v1(session_name=session, cwd=repo_path, request=request, runner=str(coord_runner))
                 payload = asdict(resp)
                 if args.json:
                     print(json.dumps(payload, sort_keys=True))
