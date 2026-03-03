@@ -145,6 +145,31 @@ def _format_preflight_error(exc: Exception) -> str:
     return msg
 
 
+def _fail_task(record: dict[str, Any], *, home: Path, task_dir: Path, detail: str) -> dict[str, Any]:
+    """Mark a task record as failed and write an error artifact.
+
+    This is used to avoid "silent" failures where the process dies after creating a task.
+    """
+
+    record["status"] = "failed"
+    record["updated_at"] = now_iso()
+    record["failure_reason"] = detail
+    upsert_task(record, home=home)
+
+    try:
+        _write_text(task_dir / "error.txt", detail)
+    except Exception:
+        # Best-effort; never mask the original failure.
+        pass
+
+    return {
+        "task_id": record.get("task_id"),
+        "status": record.get("status"),
+        "pr_url": record.get("pr_url"),
+        "summary": detail,
+    }
+
+
 def run_task(
     repo_ref: str,
     verb: str,
@@ -451,12 +476,22 @@ def run_task_mode_a(
     for attempt in range(1, max_attempts + 1):
         request["iteration"] = attempt
 
-        coord_resp = run_coordinator_v1(
-            session_name=coord_session,
-            cwd=repo_path,
-            request=request,
-            runner=coord_runner,
-        )
+        try:
+            coord_resp = run_coordinator_v1(
+                session_name=coord_session,
+                cwd=repo_path,
+                request=request,
+                runner=coord_runner,
+            )
+        except Exception as exc:  # noqa: BLE001
+            detail = _format_preflight_error(exc)
+            return _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Coordinator failed on iteration {attempt}: {detail}",
+            )
+
         _append_text(coord_output_path, f"---- iteration {attempt} decision={coord_resp.decision} ----\n{coord_resp.reason}")
 
         if coord_resp.decision != "execute_work_item":
@@ -494,18 +529,34 @@ def run_task_mode_a(
             work_item=coord_resp.work_item,
         )
 
-        agent_result = (
-            run_codex(session_name=worker_session, cwd=repo_path, prompt=prompt)
-            if worker_runner == "codex"
-            else run_claude(session_name=worker_session, cwd=repo_path, prompt=prompt)
-        )
+        try:
+            agent_result = (
+                run_codex(session_name=worker_session, cwd=repo_path, prompt=prompt)
+                if worker_runner == "codex"
+                else run_claude(session_name=worker_session, cwd=repo_path, prompt=prompt)
+            )
+        except Exception as exc:  # noqa: BLE001
+            detail = _format_preflight_error(exc)
+            return _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Worker runner '{worker_runner}' failed on iteration {attempt}: {detail}",
+            )
+
         _append_text(
             agent_output_path,
             f"---- iteration {attempt} runner={worker_runner} rc={agent_result.returncode} ----\n{agent_result.stdout}\n{agent_result.stderr}",
         )
         if agent_result.returncode != 0:
-            raise RuntimeError(
-                f"acpx {worker_runner} failed on iteration {attempt}: {(agent_result.stderr or agent_result.stdout).strip()}"
+            return _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=(
+                    f"acpx {worker_runner} returned non-zero on iteration {attempt}: "
+                    f"{(agent_result.stderr or agent_result.stdout).strip()}"
+                ),
             )
 
         footer = parse_codex_footer(agent_result.stdout)
@@ -520,14 +571,24 @@ def run_task_mode_a(
         request["state"]["last_commit"] = footer["head_sha"]
 
         if attempt == 1:
-            pr = gh.create_pull_request(
-                owner=owner,
-                repo=repo,
-                title=_task_title(verb, task_text, spec.title),
-                body=_task_body(task_id, footer["summary"], spec.body),
-                head=footer["branch"],
-                base=base_branch,
-            )
+            try:
+                pr = gh.create_pull_request(
+                    owner=owner,
+                    repo=repo,
+                    title=_task_title(verb, task_text, spec.title),
+                    body=_task_body(task_id, footer["summary"], spec.body),
+                    head=footer["branch"],
+                    base=base_branch,
+                )
+            except Exception as exc:  # noqa: BLE001
+                detail = _format_preflight_error(exc)
+                return _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Failed to create PR on iteration {attempt}: {detail}",
+                )
+
             record["pr_url"] = pr["html_url"]
             record["pr_number"] = pr["number"]
             record["updated_at"] = now_iso()
@@ -535,7 +596,16 @@ def run_task_mode_a(
 
         ci_log = task_dir / f"ci-iter-{attempt}.log"
         _append_text(ci_log, f"[{now_iso()}] polling CI for {footer['head_sha']}")
-        ci_state, ci_detail = _poll_ci(gh, owner, repo, footer["head_sha"], ci_log)
+        try:
+            ci_state, ci_detail = _poll_ci(gh, owner, repo, footer["head_sha"], ci_log)
+        except Exception as exc:  # noqa: BLE001
+            detail = _format_preflight_error(exc)
+            return _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"CI polling failed on iteration {attempt}: {detail}",
+            )
         _append_text(ci_log, f"[{now_iso()}] final {ci_state}: {ci_detail}")
 
         # Record history entry skeleton.
