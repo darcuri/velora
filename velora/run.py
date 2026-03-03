@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -89,6 +90,26 @@ def _write_text(path: Path, text: str) -> None:
         fh.write(text)
         if not text.endswith("\n"):
             fh.write("\n")
+
+
+def _cleanup_repo_detritus(repo_path: Path) -> None:
+    """Best-effort cleanup of common untracked junk.
+
+    This prevents Velora's repo cleanliness preflight from getting tripped by things
+    like __pycache__ and .pytest_cache.
+
+    We intentionally only remove well-known, safe-to-delete directories.
+    """
+
+    candidates = [
+        "__pycache__",
+        "tests/__pycache__",
+        ".pytest_cache",
+    ]
+    for rel in candidates:
+        p = repo_path / rel
+        if p.exists():
+            shutil.rmtree(p, ignore_errors=True)
 
 
 def _poll_ci(
@@ -270,6 +291,8 @@ def run_task_legacy(
             raise RuntimeError(
                 f"acpx {effective_runner} failed on attempt {attempt}: {(agent_result.stderr or agent_result.stdout).strip()}"
             )
+
+        _cleanup_repo_detritus(repo_path)
 
         footer = parse_codex_footer(agent_result.stdout)
         record["branch"] = footer["branch"]
@@ -558,6 +581,8 @@ def run_task_mode_a(
                     f"{(agent_result.stderr or agent_result.stdout).strip()}"
                 ),
             )
+
+        _cleanup_repo_detritus(repo_path)
 
         footer = parse_codex_footer(agent_result.stdout)
         record["branch"] = footer["branch"]
