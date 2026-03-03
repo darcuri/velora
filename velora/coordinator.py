@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .acpx import CmdResult, run_claude, run_codex
-from .protocol import CoordinatorResponse, ProtocolError, validate_coordinator_response
+from .protocol import CoordinatorResponse, ProtocolError, enforce_specialist_matrix, validate_coordinator_response
 
 
 COORDINATOR_PROMPT_TEMPLATE_V1 = """You are Velora Coordinator, the control-plane orchestrator for an autonomous engineering loop.
@@ -76,6 +76,7 @@ The JSON MUST conform to this CoordinatorResponse schema (protocol_version=1):
 
 Rules:
 - selected_specialist is REQUIRED for ALL decisions (attribution)
+- You MUST choose selected_specialist within CoordinatorRequest.policy.specialist_matrix (out-of-bounds is a hard failure)
 - work_item is REQUIRED only when decision=execute_work_item; it must be omitted otherwise
 - reason MUST be a string
 - Unknown keys are forbidden
@@ -137,7 +138,12 @@ def run_coordinator_v1(
 
     try:
         payload = _parse_strict_json_object(result.stdout)
-        return validate_coordinator_response(payload)
+        resp = validate_coordinator_response(payload)
+        # Hard-fail if coordinator selected an out-of-policy specialist/runner/model.
+        policy = request.get("policy") if isinstance(request, dict) else None
+        matrix = policy.get("specialist_matrix") if isinstance(policy, dict) else None
+        enforce_specialist_matrix(resp, matrix)
+        return resp
     except ProtocolError as exc:
         excerpt = (result.stdout or "").strip().replace("\n", " ")[:500]
         raise ProtocolError(f"{exc} | coordinator_output_excerpt={excerpt!r}") from exc

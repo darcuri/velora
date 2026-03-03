@@ -66,6 +66,8 @@ def build_initial_coordinator_request(
 
     run_id = build_task_id()
 
+    cfg = get_config()
+
     request: dict[str, Any] = {
         "protocol_version": 1,
         "run_id": run_id,
@@ -78,10 +80,12 @@ def build_initial_coordinator_request(
             "work_branch": f"velora/{run_id}",
         },
         "policy": {
-            "max_cost_usd": 20,
-            "no_progress_max": 4,
+            "max_cost_usd": cfg.mode_a_max_cost_usd,
+            "no_progress_max": cfg.mode_a_no_progress_max,
+            "max_wall_seconds": cfg.mode_a_max_wall_seconds,
             "allow_self_merge": False,
             "required_gates": ["tests", "security"],
+            "specialist_matrix": cfg.specialist_matrix,
         },
         "state": {
             "working_tree_clean": working_tree_clean,

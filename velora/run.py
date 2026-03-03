@@ -54,6 +54,15 @@ def _mode_a_status_for_terminal_decision(decision: str) -> str:
     raise ValueError(f"Unsupported terminal decision: {decision}")
 
 
+def _is_oscillating_failure_signatures(sigs: list[str]) -> bool:
+    """Detect a simple ABAB oscillation in the last 4 failure signatures."""
+
+    if len(sigs) < 4:
+        return False
+    a, b, c, d = sigs[-4:]
+    return a == c and b == d and a != b
+
+
 def _build_codex_prompt(
     task_id: str,
     repo_ref: str,
@@ -577,10 +586,12 @@ def run_task_mode_a(
             "work_branch": work_branch,
         },
         "policy": {
-            "max_cost_usd": 20,
-            "no_progress_max": 4,
+            "max_cost_usd": cfg.mode_a_max_cost_usd,
+            "no_progress_max": cfg.mode_a_no_progress_max,
+            "max_wall_seconds": cfg.mode_a_max_wall_seconds,
             "allow_self_merge": False,
             "required_gates": ["tests", "security"],
+            "specialist_matrix": cfg.specialist_matrix,
         },
         "state": {
             "working_tree_clean": True,
@@ -606,10 +617,43 @@ def run_task_mode_a(
     max_attempts = spec.max_attempts if spec.max_attempts is not None else cfg.max_attempts
     max_attempts = max(1, min(int(max_attempts), 10))
 
+    policy = request.get("policy") if isinstance(request, dict) else {}
+    if not isinstance(policy, dict):
+        policy = {}
+
+    no_progress_max = int(policy.get("no_progress_max") or cfg.mode_a_no_progress_max)
+    max_wall_seconds = int(policy.get("max_wall_seconds") or cfg.mode_a_max_wall_seconds)
+    max_cost_usd = float(policy.get("max_cost_usd") or cfg.mode_a_max_cost_usd)
+
+    loop_start = time.monotonic()
     last_failure_sig: str | None = None
 
     for attempt in range(1, max_attempts + 1):
         request["iteration"] = attempt
+
+        # Breakers: wall clock and cost.
+        hist = request.setdefault("history", {})
+        elapsed = time.monotonic() - loop_start
+        hist["elapsed_seconds"] = round(elapsed, 2)
+
+        if max_wall_seconds and elapsed > max_wall_seconds:
+            return _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Wall-clock breaker tripped: elapsed={elapsed:.1f}s > max_wall_seconds={max_wall_seconds}",
+            )
+
+        cost_est = float(hist.get("cost_usd_estimate") or 0.0)
+        if max_cost_usd and cost_est > max_cost_usd:
+            return _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Cost breaker tripped: cost_usd_estimate={cost_est:.2f} > max_cost_usd={max_cost_usd:.2f}",
+            )
+
+        iter_start = time.monotonic()
 
         try:
             coord_resp = run_coordinator_v1(
@@ -636,6 +680,9 @@ def run_task_mode_a(
                 record["failure_reason"] = coord_resp.reason
             else:
                 record.pop("failure_reason", None)
+
+            hist = request.setdefault("history", {})
+            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
 
             record["updated_at"] = now_iso()
             upsert_task(record, home=base_home)
@@ -759,6 +806,30 @@ def run_task_mode_a(
             no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
             last_failure_sig = failure_sig
             hist["no_progress_streak"] = no_prog
+            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
+
+            sigs = hist.setdefault("failure_signatures", [])
+            sigs.append(failure_sig)
+            del sigs[:-6]
+
+            if _is_oscillating_failure_signatures(sigs):
+                return _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+                )
+
+            if no_prog >= no_progress_max:
+                return _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=(
+                        f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
+                        f"(failure_sig={failure_sig})"
+                    ),
+                )
 
             request["evaluation"] = {
                 "status": "fail",
@@ -800,6 +871,30 @@ def run_task_mode_a(
             no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
             last_failure_sig = failure_sig
             hist["no_progress_streak"] = no_prog
+            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
+
+            sigs = hist.setdefault("failure_signatures", [])
+            sigs.append(failure_sig)
+            del sigs[:-6]
+
+            if _is_oscillating_failure_signatures(sigs):
+                return _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+                )
+
+            if no_prog >= no_progress_max:
+                return _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=(
+                        f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
+                        f"(failure_sig={failure_sig})"
+                    ),
+                )
 
             request["evaluation"] = {
                 "status": "fail",
@@ -823,6 +918,9 @@ def run_task_mode_a(
         # Success.
         request["evaluation"] = {"status": "success", "failing_checks": [], "logs_excerpt": ""}
         hist["no_progress_streak"] = 0
+        hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
+        hist.pop("failure_signatures", None)
+        last_failure_sig = None
         work_items.append(
             {
                 "id": coord_resp.work_item.id,

@@ -15,6 +15,15 @@ class VeloraConfig:
     allowed_owners: set[str]
     max_attempts: int
 
+    # Mode A policy defaults (coordinator loop).
+    mode_a_max_cost_usd: int
+    mode_a_no_progress_max: int
+    mode_a_max_wall_seconds: int
+
+    # Coordinator-selected specialist policy.
+    # JSON shape: { role: {"runners": ["codex"|"claude"], "models": ["..."]} }
+    specialist_matrix: dict[str, dict[str, list[str]]]
+
     runner: str  # codex | claude
     codex_session_prefix: str
     claude_session_prefix: str
@@ -89,12 +98,83 @@ def _parse_int(value: object, default: int) -> int:
     return default
 
 
+def _parse_specialist_matrix(value: object, default: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
+    """Parse the coordinator-selected specialist policy matrix.
+
+    Shape:
+      { role: {"runners": ["codex"|"claude"], "models": ["..."]} }
+
+    Notes:
+    - Unknown roles are rejected (hard fail).
+    - Missing roles fall back to defaults.
+    """
+
+    allowed_roles = {"implementer", "docs", "refactor", "investigator"}
+    allowed_runners = {"codex", "claude"}
+
+    if value is None:
+        raw = dict(default)
+    elif isinstance(value, dict):
+        raw = dict(default)
+        raw.update(value)
+    else:
+        raise ValueError("specialist_matrix must be an object")
+
+    matrix: dict[str, dict[str, list[str]]] = {}
+
+    for role, rule in raw.items():
+        if role not in allowed_roles:
+            raise ValueError(f"specialist_matrix has unknown role: {role}")
+        if not isinstance(rule, dict):
+            raise ValueError(f"specialist_matrix[{role}] must be an object")
+
+        runners_raw = rule.get("runners")
+        if not isinstance(runners_raw, list) or not runners_raw:
+            raise ValueError(f"specialist_matrix[{role}].runners must be a non-empty list")
+        runners: list[str] = []
+        for r in runners_raw:
+            if not isinstance(r, str) or not r.strip():
+                raise ValueError(f"specialist_matrix[{role}].runners must contain strings")
+            rs = r.strip().lower()
+            if rs not in allowed_runners:
+                raise ValueError(f"specialist_matrix[{role}].runners contains invalid runner: {rs}")
+            runners.append(rs)
+
+        models_raw = rule.get("models", [])
+        if models_raw is None:
+            models_raw = []
+        if not isinstance(models_raw, list):
+            raise ValueError(f"specialist_matrix[{role}].models must be a list")
+        models: list[str] = []
+        for m in models_raw:
+            if not isinstance(m, str) or not m.strip():
+                raise ValueError(f"specialist_matrix[{role}].models must contain strings")
+            models.append(m.strip())
+
+        matrix[role] = {"runners": runners, "models": models}
+
+    return matrix
+
+
 def load_config() -> VeloraConfig:
     # Defaults.
     defaults = {
         # Safety: default-deny; user must explicitly allow owners via config/env.
         "allowed_owners": [],
         "max_attempts": 3,
+
+        # Mode A policy defaults.
+        "mode_a_max_cost_usd": 20,
+        "mode_a_no_progress_max": 4,
+        "mode_a_max_wall_seconds": 30 * 60,
+
+        # Coordinator-selected specialist policy.
+        "specialist_matrix": {
+            "implementer": {"runners": ["codex"], "models": []},
+            "docs": {"runners": ["codex", "claude"], "models": []},
+            "refactor": {"runners": ["codex"], "models": []},
+            "investigator": {"runners": ["codex", "claude"], "models": []},
+        },
 
         "runner": "codex",
         "codex_session_prefix": "velora-codex-",
@@ -123,6 +203,13 @@ def load_config() -> VeloraConfig:
         env_cfg["allowed_owners"] = env.get("VELORA_ALLOWED_OWNERS")
     if env.get("VELORA_MAX_ATTEMPTS"):
         env_cfg["max_attempts"] = env.get("VELORA_MAX_ATTEMPTS")
+
+    if env.get("VELORA_MODE_A_MAX_COST_USD"):
+        env_cfg["mode_a_max_cost_usd"] = env.get("VELORA_MODE_A_MAX_COST_USD")
+    if env.get("VELORA_MODE_A_NO_PROGRESS_MAX"):
+        env_cfg["mode_a_no_progress_max"] = env.get("VELORA_MODE_A_NO_PROGRESS_MAX")
+    if env.get("VELORA_MODE_A_MAX_WALL_SECONDS"):
+        env_cfg["mode_a_max_wall_seconds"] = env.get("VELORA_MODE_A_MAX_WALL_SECONDS")
 
     if env.get("VELORA_RUNNER"):
         env_cfg["runner"] = env.get("VELORA_RUNNER")
@@ -153,6 +240,12 @@ def load_config() -> VeloraConfig:
     allowed_owners = _parse_owners(merged.get("allowed_owners"))
     max_attempts = max(1, min(_parse_int(merged.get("max_attempts"), 3), 10))
 
+    mode_a_max_cost_usd = max(1, min(_parse_int(merged.get("mode_a_max_cost_usd"), 20), 500))
+    mode_a_no_progress_max = max(1, min(_parse_int(merged.get("mode_a_no_progress_max"), 4), 50))
+    mode_a_max_wall_seconds = max(60, min(_parse_int(merged.get("mode_a_max_wall_seconds"), 30 * 60), 24 * 60 * 60))
+
+    specialist_matrix = _parse_specialist_matrix(merged.get("specialist_matrix"), defaults["specialist_matrix"])
+
     runner = str(merged.get("runner") or defaults["runner"]).strip().lower()
     if runner not in {"codex", "claude"}:
         raise ValueError("runner must be one of: codex, claude")
@@ -177,6 +270,12 @@ def load_config() -> VeloraConfig:
     return VeloraConfig(
         allowed_owners=allowed_owners,
         max_attempts=max_attempts,
+
+        mode_a_max_cost_usd=mode_a_max_cost_usd,
+        mode_a_no_progress_max=mode_a_no_progress_max,
+        mode_a_max_wall_seconds=mode_a_max_wall_seconds,
+
+        specialist_matrix=specialist_matrix,
 
         runner=runner,
         codex_session_prefix=codex_prefix,
