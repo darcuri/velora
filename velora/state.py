@@ -120,3 +120,17 @@ def prune_stale_tasks(
         "count": len(changed),
     }
 
+
+def get_task(task_id: str, home: Path | None = None) -> dict[str, Any] | None:
+    """Fetch a task record by id from tasks.json."""
+
+    tid = str(task_id or "").strip()
+    if not tid:
+        raise ValueError("task_id must be a non-empty string")
+
+    reg = load_tasks(home)
+    for task in reg.get("tasks", []):
+        if task.get("task_id") == tid:
+            return task
+    return None
+
