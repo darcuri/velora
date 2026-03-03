@@ -119,6 +119,8 @@ def ensure_codex_session(session_name: str, cwd: Path, env: dict[str, str]) -> C
 def run_codex(session_name: str, cwd: Path, prompt: str) -> CmdResult:
     # acpx codex requires OPENAI_API_KEY; pull from env or Vault.
     env = os.environ.copy()
+    # Keep repo checkouts clean: many tools create __pycache__ by default.
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env["OPENAI_API_KEY"] = get_vault_key("OPENAI_API_KEY", env=env)
 
     ensure = ensure_codex_session(session_name=session_name, cwd=cwd, env=env)
@@ -198,6 +200,8 @@ def _ensure_anthropic_auth(env: dict[str, str]) -> None:
 
 def run_claude(session_name: str, cwd: Path, prompt: str) -> CmdResult:
     env = os.environ.copy()
+    # Keep repo checkouts clean: many tools create __pycache__ by default.
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     _ensure_anthropic_auth(env)
 
     ensure = ensure_claude_session(session_name=session_name, cwd=cwd, env=env)
