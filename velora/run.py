@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import time
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,82 @@ def _is_oscillating_failure_signatures(sigs: list[str]) -> bool:
         return False
     a, b, c, d = sigs[-4:]
     return a == c and b == d and a != b
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    if limit <= 0 or len(text) <= limit:
+        return text
+    keep = max(0, limit - 3)
+    cut = text[:keep]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return (cut or text[:keep]) + "..."
+
+
+def _parse_failing_check_runs_payload(payload: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
+    runs = payload.get("check_runs", [])
+    if not isinstance(runs, list):
+        return [], ""
+
+    failure_conclusions = {"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"}
+    pairs: list[tuple[str, str]] = []
+    failing: list[dict[str, str]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        conclusion = str(run.get("conclusion") or "none").strip().lower()
+        if conclusion not in failure_conclusions:
+            continue
+        name = _truncate_text(str(run.get("name") or "unnamed-check"), 120)
+        status = str(run.get("status") or "unknown").strip().lower()
+        url = str(run.get("details_url") or run.get("html_url") or "")
+        output = run.get("output")
+        title = ""
+        summary = ""
+        if isinstance(output, dict):
+            title = _truncate_text(str(output.get("title") or ""), 160)
+            summary = _truncate_text(str(output.get("summary") or ""), 240)
+        summary_parts = [f"status={status}", f"conclusion={conclusion}"]
+        if title:
+            summary_parts.append(f"title={title}")
+        if summary:
+            summary_parts.append(f"summary={summary}")
+        failing.append({"name": name, "kind": "ci", "url": url, "summary": _truncate_text("; ".join(summary_parts), 420)})
+        pairs.append((name.lower(), conclusion))
+
+    if not pairs:
+        return failing, ""
+    sig_base = "|".join(f"{name}:{conclusion}" for name, conclusion in sorted(pairs))
+    digest = hashlib.sha256(sig_base.encode("utf-8")).hexdigest()[:16]
+    return failing, f"checks-{len(pairs)}-{digest}"
+
+
+def _build_ci_logs_excerpt(failing_checks: list[dict[str, str]], max_checks: int = 3, max_chars: int = 600) -> str:
+    if not failing_checks:
+        return ""
+    lines: list[str] = []
+    shown = 0
+    for check in failing_checks[: max(1, max_checks)]:
+        name = _truncate_text(str(check.get("name") or "unnamed-check"), 80)
+        summary = _truncate_text(str(check.get("summary") or ""), 180)
+        lines.append(f"- {name}: {summary}".strip())
+        shown += 1
+    remaining = max(0, len(failing_checks) - shown)
+    if not remaining:
+        return _truncate_text("\n".join(lines), max_chars)
+
+    marker = f"(+{remaining} more failing checks)"
+    budget = max(0, max_chars - len(marker) - 1)
+    body = _truncate_text("\n".join(lines), budget)
+    if not body:
+        return _truncate_text(marker, max_chars)
+    return f"{body}\n{marker}"
+
+
+def _digest_failure_detail(detail: str) -> str:
+    digest = hashlib.sha256(str(detail).encode("utf-8")).hexdigest()[:16]
+    return f"detail-{digest}"
 
 
 def _build_codex_prompt(
@@ -801,7 +878,23 @@ def run_task_mode_a(
         work_items = hist.setdefault("work_items_executed", [])
 
         if ci_state != "success":
-            failure_sig = f"ci:{ci_detail}"
+            failing_checks: list[dict[str, str]] = []
+            ci_sig = ""
+            if ci_state == "failure":
+                try:
+                    checks_payload = gh.get_check_runs(owner, repo, footer["head_sha"])
+                    if isinstance(checks_payload, dict):
+                        failing_checks, ci_sig = _parse_failing_check_runs_payload(checks_payload)
+                except Exception as exc:  # noqa: BLE001
+                    _append_text(ci_log, f"[{now_iso()}] warning unable to fetch check-runs for evidence: {exc}")
+
+            if not failing_checks:
+                failing_checks = [{"name": "ci", "kind": "ci", "url": record.get("pr_url"), "summary": _truncate_text(ci_detail, 420)}]
+            logs_excerpt = _build_ci_logs_excerpt(failing_checks)
+            if not logs_excerpt:
+                logs_excerpt = _truncate_text(ci_detail, 600)
+
+            failure_sig = f"ci:{ci_sig or _digest_failure_detail(ci_detail)}"
             no_prog = int(hist.get("no_progress_streak") or 0)
             no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
             last_failure_sig = failure_sig
@@ -833,8 +926,8 @@ def run_task_mode_a(
 
             request["evaluation"] = {
                 "status": "fail",
-                "failing_checks": [{"name": "ci", "kind": "ci", "url": record.get("pr_url"), "summary": ci_detail}],
-                "logs_excerpt": ci_detail,
+                "failing_checks": failing_checks,
+                "logs_excerpt": logs_excerpt,
             }
             work_items.append(
                 {
