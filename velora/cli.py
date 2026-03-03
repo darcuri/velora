@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 
+from .coordinator import run_coordinator_v1
+from .orchestrator import build_initial_coordinator_request, coordinator_session_name
 from .run import run_task
 from .spec import RunSpec, load_run_spec
 from .state import get_status_view, prune_stale_tasks
@@ -43,6 +46,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Which ACPX coding agent to use (default: config/env).",
     )
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    coord_p = sub.add_parser("coord", help="Coordinator utilities (Mode A scaffolding)")
+    coord_sub = coord_p.add_subparsers(dest="coord_cmd", required=True)
+
+    coord_req = coord_sub.add_parser("request", help="Emit the initial CoordinatorRequest JSON for a task")
+    coord_req.add_argument("repo", help="GitHub repo in owner/repo format")
+    coord_req.add_argument("verb", choices=VERBS, help="Task kind")
+    coord_req_src = coord_req.add_mutually_exclusive_group(required=True)
+    coord_req_src.add_argument("--spec", help="Path to JSON run spec (recommended). Use '-' for stdin.")
+    coord_req_src.add_argument("--unsafe-task", help="Task description as a CLI arg (UNSAFE)")
+    coord_req.add_argument("--json", action="store_true", help="Emit compact machine-readable JSON")
+
+    coord_run = coord_sub.add_parser("run", help="Run coordinator once and emit validated CoordinatorResponse JSON")
+    coord_run.add_argument("repo", help="GitHub repo in owner/repo format")
+    coord_run.add_argument("verb", choices=VERBS, help="Task kind")
+    coord_run_src = coord_run.add_mutually_exclusive_group(required=True)
+    coord_run_src.add_argument("--spec", help="Path to JSON run spec (recommended). Use '-' for stdin.")
+    coord_run_src.add_argument("--unsafe-task", help="Task description as a CLI arg (UNSAFE)")
+    coord_run.add_argument("--json", action="store_true", help="Emit compact machine-readable JSON")
+
     return parser
 
 
@@ -95,6 +118,12 @@ def _print_run_result(result: dict[str, object], json_mode: bool) -> int:
     return 0 if result["status"] in {"ready", "not-ready"} else 1
 
 
+def _load_spec_from_args(args: argparse.Namespace) -> RunSpec:
+    if getattr(args, "spec", None):
+        return load_run_spec(args.spec)
+    return RunSpec(task=str(getattr(args, "unsafe_task")))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -102,20 +131,40 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "status":
             return _print_status(args.json)
+
         if args.cmd == "gc":
             result = prune_stale_tasks(
                 older_than_hours=int(args.older_than_hours),
                 dry_run=bool(args.dry_run),
             )
             return _print_gc_result(result, args.json)
+
         if args.cmd == "run":
-            spec: RunSpec
-            if args.spec:
-                spec = load_run_spec(args.spec)
-            else:
-                spec = RunSpec(task=str(args.unsafe_task))
+            spec = _load_spec_from_args(args)
             result = run_task(args.repo, args.verb, spec, runner=getattr(args, "runner", None))
             return _print_run_result(result, args.json)
+
+        if args.cmd == "coord":
+            spec = _load_spec_from_args(args)
+            request, repo_path = build_initial_coordinator_request(args.repo, args.verb, spec)
+
+            if args.coord_cmd == "request":
+                if args.json:
+                    print(json.dumps(request, sort_keys=True))
+                else:
+                    print(json.dumps(request, indent=2, sort_keys=True))
+                return 0
+
+            if args.coord_cmd == "run":
+                session = coordinator_session_name(request["repo"]["owner"], request["repo"]["name"])
+                resp = run_coordinator_v1(session_name=session, cwd=repo_path, request=request)
+                payload = asdict(resp)
+                if args.json:
+                    print(json.dumps(payload, sort_keys=True))
+                else:
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                return 0
+
     except Exception as exc:  # noqa: BLE001
         if getattr(args, "json", False):
             print(json.dumps({"status": "error", "error": str(exc)}))

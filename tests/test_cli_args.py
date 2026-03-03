@@ -14,6 +14,27 @@ class TestCliArgs(unittest.TestCase):
         self.assertIsNone(args.spec)
         self.assertTrue(args.json)
 
+    def test_coord_request_args_parsing(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "coord",
+                "request",
+                "octocat/velora",
+                "fix",
+                "--unsafe-task",
+                "do thing",
+                "--json",
+            ]
+        )
+        self.assertEqual(args.cmd, "coord")
+        self.assertEqual(args.coord_cmd, "request")
+        self.assertEqual(args.repo, "octocat/velora")
+        self.assertEqual(args.verb, "fix")
+        self.assertEqual(args.unsafe_task, "do thing")
+        self.assertIsNone(args.spec)
+        self.assertTrue(args.json)
+
 
 if __name__ == "__main__":
     unittest.main()
