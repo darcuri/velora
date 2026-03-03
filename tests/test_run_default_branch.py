@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from velora.acpx import CmdResult
@@ -53,6 +54,36 @@ class TestRunUsesDefaultBranch(unittest.TestCase):
         self.assertEqual(mock_gh.create_pull_request.call_args.kwargs["base"], "develop")
         self.assertEqual(mock_diff.call_args.args[1], "develop")
 
+    def test_mode_a_missing_head_sha_skips_ci_poll_and_check_runs(self):
+        mock_gh = MagicMock()
+        mock_gh.get_default_branch.return_value = "develop"
+        mock_gh.create_pull_request.return_value = {"html_url": "https://example/pr/1", "number": 1}
+        mock_coord = SimpleNamespace(
+            decision="execute_work_item",
+            reason="go",
+            selected_specialist=SimpleNamespace(runner="codex"),
+            work_item=SimpleNamespace(id="WI-1", kind="implement"),
+        )
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.GitHubClient.from_env", return_value=mock_gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run.run_coordinator_v1", return_value=mock_coord),
+            patch("velora.run.build_worker_prompt_v1", return_value="prompt"),
+            patch("velora.run.run_codex", return_value=CmdResult(0, "ignored", "")),
+            patch("velora.run.parse_codex_footer", return_value={"branch": "velora/task123", "summary": "done"}),
+            patch("velora.run._poll_ci") as mock_poll_ci,
+        ):
+            result = run_task("octocat/velora", "feature", RunSpec(task="task text", max_attempts=1), use_coordinator=True)
+        self.assertEqual(result["status"], "failed")
+        mock_poll_ci.assert_not_called()
+        mock_gh.get_check_runs.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

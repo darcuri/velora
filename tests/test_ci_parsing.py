@@ -1,9 +1,19 @@
 import unittest
 
-from velora.run import _build_ci_logs_excerpt, _parse_failing_check_runs_payload, _truncate_text
+from velora.run import _build_ci_logs_excerpt, _footer_head_sha, _parse_failing_check_runs_payload, _truncate_text
 
 
 class TestCiParsing(unittest.TestCase):
+    def test_footer_head_sha_handles_missing_or_invalid_footer(self):
+        self.assertEqual(_footer_head_sha(None), "")
+        self.assertEqual(_footer_head_sha("not-a-dict"), "")
+        self.assertEqual(_footer_head_sha({}), "")
+        self.assertEqual(_footer_head_sha({"head_sha": None}), "")
+
+    def test_footer_head_sha_valid_path(self):
+        self.assertEqual(_footer_head_sha({"head_sha": "abc123"}), "abc123")
+        self.assertEqual(_footer_head_sha({"head_sha": "  abc123  "}), "abc123")
+
     def test_truncate_text_edge_limits_are_safe_and_deterministic(self):
         sample = "alpha beta gamma"
         cases = [

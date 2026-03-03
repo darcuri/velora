@@ -147,6 +147,12 @@ def _digest_failure_detail(detail: str) -> str:
     return f"detail-{digest}"
 
 
+def _footer_head_sha(footer: object) -> str:
+    if not isinstance(footer, dict):
+        return ""
+    return str(footer.get("head_sha") or "").strip()
+
+
 def _build_codex_prompt(
     task_id: str,
     repo_ref: str,
@@ -831,16 +837,18 @@ def run_task_mode_a(
 
         _cleanup_repo_detritus(repo_path)
 
-        footer = parse_codex_footer(agent_result.stdout)
-        record["branch"] = footer["branch"]
-        record["head_sha"] = footer["head_sha"]
-        record["summary"] = footer["summary"]
+        footer_raw = parse_codex_footer(agent_result.stdout)
+        footer = footer_raw if isinstance(footer_raw, dict) else {}
+        head_sha = _footer_head_sha(footer)
+        record["branch"] = str(footer.get("branch") or "").strip() or None
+        record["head_sha"] = head_sha or None
+        record["summary"] = str(footer.get("summary") or "").strip()
         record["updated_at"] = now_iso()
         upsert_task(record, home=base_home)
 
         # Update coordinator state snapshot.
         request.setdefault("state", {})
-        request["state"]["last_commit"] = footer["head_sha"]
+        request["state"]["last_commit"] = head_sha
 
         if attempt == 1:
             try:
@@ -848,8 +856,8 @@ def run_task_mode_a(
                     owner=owner,
                     repo=repo,
                     title=_task_title(verb, task_text, spec.title),
-                    body=_task_body(task_id, footer["summary"], spec.body),
-                    head=footer["branch"],
+                    body=_task_body(task_id, str(footer.get("summary") or ""), spec.body),
+                    head=str(footer.get("branch") or ""),
                     base=base_branch,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -867,17 +875,21 @@ def run_task_mode_a(
             upsert_task(record, home=base_home)
 
         ci_log = task_dir / f"ci-iter-{attempt}.log"
-        _append_text(ci_log, f"[{now_iso()}] polling CI for {footer['head_sha']}")
-        try:
-            ci_state, ci_detail = _poll_ci(gh, owner, repo, footer["head_sha"], ci_log)
-        except Exception as exc:  # noqa: BLE001
-            detail = _format_preflight_error(exc)
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"CI polling failed on iteration {attempt}: {detail}",
-            )
+        _append_text(ci_log, f"[{now_iso()}] polling CI for {head_sha or '<missing-head-sha>'}")
+        if not head_sha:
+            ci_state, ci_detail = "failure", "missing-head-sha"
+            _append_text(ci_log, f"[{now_iso()}] warning missing head_sha; skipping CI poll")
+        else:
+            try:
+                ci_state, ci_detail = _poll_ci(gh, owner, repo, head_sha, ci_log)
+            except Exception as exc:  # noqa: BLE001
+                detail = _format_preflight_error(exc)
+                return _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"CI polling failed on iteration {attempt}: {detail}",
+                )
         _append_text(ci_log, f"[{now_iso()}] final {ci_state}: {ci_detail}")
 
         # Record history entry skeleton.
@@ -887,9 +899,9 @@ def run_task_mode_a(
         if ci_state != "success":
             failing_checks: list[dict[str, str]] = []
             ci_sig = ""
-            if ci_state == "failure":
+            if ci_state == "failure" and head_sha:
                 try:
-                    checks_payload = gh.get_check_runs(owner, repo, footer["head_sha"])
+                    checks_payload = gh.get_check_runs(owner, repo, head_sha)
                     if isinstance(checks_payload, dict):
                         failing_checks, ci_sig = _parse_failing_check_runs_payload(checks_payload)
                 except Exception as exc:  # noqa: BLE001
