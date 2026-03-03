@@ -46,6 +46,74 @@ def _task_body(task_id: str, summary: str, extra_body: str | None) -> str:
     return body + "\n"
 
 
+_DEFAULT_PR_TEMPLATE = """## Summary
+
+## Testing
+- [ ] Unit tests pass
+
+## Notes
+"""
+
+
+def _load_repo_pr_template(repo_path: Path) -> str | None:
+    """Load a PR template from the target repo checkout if present.
+
+    GitHub-supported locations include (common cases):
+    - PULL_REQUEST_TEMPLATE.md (repo root)
+    - .github/PULL_REQUEST_TEMPLATE.md
+    - docs/PULL_REQUEST_TEMPLATE.md
+
+    Also support the multi-template directory style:
+    - .github/PULL_REQUEST_TEMPLATE/*.md
+
+    If multiple templates exist, prefer default.md, else pick the first .md alphabetically.
+    """
+
+    candidates = [
+        repo_path / "PULL_REQUEST_TEMPLATE.md",
+        repo_path / ".github" / "PULL_REQUEST_TEMPLATE.md",
+        repo_path / ".github" / "pull_request_template.md",
+        repo_path / "docs" / "PULL_REQUEST_TEMPLATE.md",
+    ]
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return path.read_text(encoding="utf-8")
+
+    for dir_path in (
+        repo_path / ".github" / "PULL_REQUEST_TEMPLATE",
+        repo_path / ".github" / "pull_request_template",
+    ):
+        if not dir_path.exists() or not dir_path.is_dir():
+            continue
+
+        default_md = dir_path / "default.md"
+        if default_md.exists() and default_md.is_file():
+            return default_md.read_text(encoding="utf-8")
+
+        md_files = sorted(p for p in dir_path.glob("*.md") if p.is_file())
+        if md_files:
+            return md_files[0].read_text(encoding="utf-8")
+
+    return None
+
+
+def _build_pr_body(
+    *,
+    repo_path: Path,
+    task_id: str,
+    summary: str,
+    extra_body: str | None,
+) -> str:
+    base = _task_body(task_id, summary, extra_body).strip()
+    template = _load_repo_pr_template(repo_path)
+    if template and template.strip():
+        # Respect the repo's template first; append Velora metadata at the end.
+        return template.strip() + "\n\n---\n\n" + base + "\n"
+
+    # Default template (kept lightweight).
+    return base + "\n\n---\n\n" + _DEFAULT_PR_TEMPLATE
+
+
 def _mode_a_status_for_terminal_decision(decision: str) -> str:
     if decision == "finalize_success":
         return "ready"
@@ -274,7 +342,7 @@ def resume_task(task_id: str, home: Path | None = None) -> dict[str, Any]:
             owner=owner,
             repo=repo,
             title=_task_title(verb, task_text, None),
-            body=_task_body(task_id, summary, None),
+            body=_build_pr_body(repo_path=repo_path, task_id=task_id, summary=summary, extra_body=None),
             head=branch,
             base=base_branch,
         )
@@ -427,7 +495,7 @@ def run_task_legacy(
                 owner=owner,
                 repo=repo,
                 title=_task_title(verb, task_text, spec.title),
-                body=_task_body(task_id, footer["summary"], spec.body),
+                body=_build_pr_body(repo_path=repo_path, task_id=task_id, summary=footer["summary"], extra_body=spec.body),
                 head=footer["branch"],
                 base=base_branch,
             )
@@ -764,7 +832,7 @@ def run_task_mode_a(
                     owner=owner,
                     repo=repo,
                     title=_task_title(verb, task_text, spec.title),
-                    body=_task_body(task_id, footer["summary"], spec.body),
+                    body=_build_pr_body(repo_path=repo_path, task_id=task_id, summary=footer["summary"], extra_body=spec.body),
                     head=footer["branch"],
                     base=base_branch,
                 )
