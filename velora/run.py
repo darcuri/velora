@@ -33,10 +33,47 @@ def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
     return proc.stdout
 
 
+def _compact_title_fragment(text: str, max_len: int) -> str:
+    # Collapse whitespace and strip common “loud” prefixes.
+    t = " ".join((text or "").split()).strip()
+    for prefix in (
+        "IMPORTANT:",
+        "IMPORTANT",
+        "Mode A complex dogfood:",
+    ):
+        if t.lower().startswith(prefix.lower()):
+            t = t[len(prefix) :].strip()
+
+    # Prefer something sentence-like.
+    for sep in (". ", "; "):
+        if sep in t:
+            t = t.split(sep, 1)[0].strip()
+            break
+
+    if max_len < 1:
+        return ""
+    if len(t) <= max_len:
+        return t
+
+    # Ellipsis truncation.
+    cut = max(1, max_len - 1)
+    return t[:cut].rstrip() + "…"
+
+
 def _task_title(verb: str, task: str, title_override: str | None = None) -> str:
+    # Keep PR titles socially acceptable (and avoid leaking full prompts).
+    max_total = 96
+    prefix = f"[{verb}] "
+
     if title_override and title_override.strip():
-        return title_override.strip()
-    return f"[{verb}] {task}".strip()
+        frag = " ".join(title_override.split()).strip()
+    else:
+        frag = _compact_title_fragment(task, max_total - len(prefix))
+
+    title = (prefix + frag).strip()
+    if len(title) > max_total:
+        title = title[: max_total - 1].rstrip() + "…"
+    return title
 
 
 def _task_body(task_id: str, summary: str, extra_body: str | None) -> str:
