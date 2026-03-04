@@ -12,6 +12,7 @@ Any protocol violation is a hard failure (no remaps).
 """
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,12 @@ Rules:
 """
 
 
+@dataclass(frozen=True)
+class CoordinatorRunResult:
+    response: CoordinatorResponse
+    cmd: CmdResult
+
+
 def render_coordinator_prompt_v1(request: dict[str, Any]) -> str:
     request_json = json.dumps(request, indent=2, sort_keys=True)
     return COORDINATOR_PROMPT_TEMPLATE_V1.format(request_json=request_json)
@@ -111,14 +118,18 @@ def _parse_strict_json_object(text: str) -> dict[str, Any]:
     return payload
 
 
-def run_coordinator_v1(
+def run_coordinator_v1_with_cmd(
     *,
     session_name: str,
     cwd: Path,
     request: dict[str, Any],
     runner: str = "claude",
-) -> CoordinatorResponse:
-    """Run the coordinator model and return a validated CoordinatorResponse."""
+) -> CoordinatorRunResult:
+    """Run the coordinator and return response + raw command result.
+
+    The raw CmdResult contains best-effort usage metadata (tokens/context usage)
+    from acpx, which Mode A uses for token budgeting.
+    """
 
     prompt = render_coordinator_prompt_v1(request)
 
@@ -143,7 +154,24 @@ def run_coordinator_v1(
         policy = request.get("policy") if isinstance(request, dict) else None
         matrix = policy.get("specialist_matrix") if isinstance(policy, dict) else None
         enforce_specialist_matrix(resp, matrix)
-        return resp
+        return CoordinatorRunResult(response=resp, cmd=result)
     except ProtocolError as exc:
         excerpt = (result.stdout or "").strip().replace("\n", " ")[:500]
         raise ProtocolError(f"{exc} | coordinator_output_excerpt={excerpt!r}") from exc
+
+
+def run_coordinator_v1(
+    *,
+    session_name: str,
+    cwd: Path,
+    request: dict[str, Any],
+    runner: str = "claude",
+) -> CoordinatorResponse:
+    """Run the coordinator model and return a validated CoordinatorResponse."""
+
+    return run_coordinator_v1_with_cmd(
+        session_name=session_name,
+        cwd=cwd,
+        request=request,
+        runner=runner,
+    ).response

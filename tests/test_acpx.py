@@ -2,7 +2,14 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from velora.acpx import parse_codex_footer, resolve_acpx_cmd, review_has_blocker, run_codex, run_gemini_review
+from velora.acpx import (
+    _parse_acpx_json_prompt_output,
+    parse_codex_footer,
+    resolve_acpx_cmd,
+    review_has_blocker,
+    run_codex,
+    run_gemini_review,
+)
 
 
 class TestAcpxDiscovery(unittest.TestCase):
@@ -102,6 +109,20 @@ class TestAcpxDiscovery(unittest.TestCase):
         self.assertTrue(review_has_blocker("- BLOCKER: This will crash."))
         self.assertFalse(review_has_blocker("NIT: Style."))
         self.assertFalse(review_has_blocker("OK: Looks good."))
+
+    def test_parse_acpx_json_prompt_output_extracts_text_and_usage(self):
+        raw = "\n".join(
+            [
+                '{"jsonrpc":"2.0","id":2,"result":{"models":{"currentModelId":"gpt-5.3-codex/medium"}}}',
+                '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}}}',
+                '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"usage_update","used":123,"size":1000}}}',
+            ]
+        )
+        text, usage = _parse_acpx_json_prompt_output(raw)
+        self.assertEqual(text, "hello")
+        self.assertEqual(usage.used, 123)
+        self.assertEqual(usage.size, 1000)
+        self.assertEqual(usage.model_id, "gpt-5.3-codex/medium")
 
 
 if __name__ == "__main__":

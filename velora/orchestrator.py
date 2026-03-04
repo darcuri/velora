@@ -80,6 +80,7 @@ def build_initial_coordinator_request(
             "work_branch": f"velora/{run_id}",
         },
         "policy": {
+            "max_tokens": cfg.mode_a_max_tokens,
             "max_cost_usd": cfg.mode_a_max_cost_usd,
             "no_progress_max": cfg.mode_a_no_progress_max,
             "max_wall_seconds": cfg.mode_a_max_wall_seconds,
@@ -101,7 +102,9 @@ def build_initial_coordinator_request(
         "history": {
             "work_items_executed": [],
             "no_progress_streak": 0,
+            "tokens_used_estimate": 0,
             "cost_usd_estimate": 0.0,
+            "session_usage": {},
         },
     }
 

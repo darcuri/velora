@@ -16,6 +16,7 @@ class VeloraConfig:
     max_attempts: int
 
     # Mode A policy defaults (coordinator loop).
+    mode_a_max_tokens: int
     mode_a_max_cost_usd: int
     mode_a_no_progress_max: int
     mode_a_max_wall_seconds: int
@@ -164,6 +165,7 @@ def load_config() -> VeloraConfig:
         "max_attempts": 3,
 
         # Mode A policy defaults.
+        "mode_a_max_tokens": 200_000,
         "mode_a_max_cost_usd": 20,
         "mode_a_no_progress_max": 4,
         "mode_a_max_wall_seconds": 30 * 60,
@@ -204,6 +206,8 @@ def load_config() -> VeloraConfig:
     if env.get("VELORA_MAX_ATTEMPTS"):
         env_cfg["max_attempts"] = env.get("VELORA_MAX_ATTEMPTS")
 
+    if env.get("VELORA_MODE_A_MAX_TOKENS"):
+        env_cfg["mode_a_max_tokens"] = env.get("VELORA_MODE_A_MAX_TOKENS")
     if env.get("VELORA_MODE_A_MAX_COST_USD"):
         env_cfg["mode_a_max_cost_usd"] = env.get("VELORA_MODE_A_MAX_COST_USD")
     if env.get("VELORA_MODE_A_NO_PROGRESS_MAX"):
@@ -240,6 +244,7 @@ def load_config() -> VeloraConfig:
     allowed_owners = _parse_owners(merged.get("allowed_owners"))
     max_attempts = max(1, min(_parse_int(merged.get("max_attempts"), 3), 10))
 
+    mode_a_max_tokens = max(10_000, min(_parse_int(merged.get("mode_a_max_tokens"), 200_000), 5_000_000))
     mode_a_max_cost_usd = max(1, min(_parse_int(merged.get("mode_a_max_cost_usd"), 20), 500))
     mode_a_no_progress_max = max(1, min(_parse_int(merged.get("mode_a_no_progress_max"), 4), 50))
     mode_a_max_wall_seconds = max(60, min(_parse_int(merged.get("mode_a_max_wall_seconds"), 30 * 60), 24 * 60 * 60))
@@ -271,6 +276,7 @@ def load_config() -> VeloraConfig:
         allowed_owners=allowed_owners,
         max_attempts=max_attempts,
 
+        mode_a_max_tokens=mode_a_max_tokens,
         mode_a_max_cost_usd=mode_a_max_cost_usd,
         mode_a_no_progress_max=mode_a_no_progress_max,
         mode_a_max_wall_seconds=mode_a_max_wall_seconds,
