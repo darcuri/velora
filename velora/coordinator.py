@@ -105,6 +105,13 @@ def _parse_strict_json_object(text: str) -> dict[str, Any]:
     raw = text.strip()
     if not raw:
         raise ProtocolError("Coordinator output was empty")
+    if raw.startswith("```"):
+        # Tolerate a single outer code-fence wrapper (common model failure mode).
+        # We still require the *inner* content to be a single JSON object.
+        lines = raw.splitlines()
+        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].strip() == "```":
+            raw = "\n".join(lines[1:-1]).strip()
+
     if raw.startswith("```") or raw.endswith("```"):
         raise ProtocolError("Coordinator output must not be wrapped in markdown fences")
     if not (raw.startswith("{") and raw.endswith("}")):
