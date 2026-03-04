@@ -45,6 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("codex", "claude"),
         help="Which ACPX coding agent to use (default: config/env).",
     )
+    run_p.add_argument(
+        "--base-branch",
+        help="Override the base branch to target (defaults to repo default branch).",
+    )
     run_p.add_argument("--coordinator", action="store_true", help="Use Mode A coordinator loop")
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
@@ -151,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.verb,
                 spec,
                 runner=getattr(args, "runner", None),
+                base_branch=getattr(args, "base_branch", None),
                 use_coordinator=bool(getattr(args, "coordinator", False)),
             )
             return _print_run_result(result, args.json)

@@ -386,6 +386,7 @@ def run_task(
     spec: RunSpec,
     home: Path | None = None,
     runner: str | None = None,
+    base_branch: str | None = None,
     *,
     use_coordinator: bool = False,
 ) -> dict[str, Any]:
@@ -397,8 +398,8 @@ def run_task(
     """
 
     if use_coordinator:
-        return run_task_mode_a(repo_ref, verb, spec, home=home)
-    return run_task_legacy(repo_ref, verb, spec, home=home, runner=runner)
+        return run_task_mode_a(repo_ref, verb, spec, home=home, base_branch=base_branch)
+    return run_task_legacy(repo_ref, verb, spec, home=home, runner=runner, base_branch=base_branch)
 
 
 def resume_task(task_id: str, home: Path | None = None) -> dict[str, Any]:
@@ -426,7 +427,7 @@ def resume_task(task_id: str, home: Path | None = None) -> dict[str, Any]:
     gh = GitHubClient.from_env()
     base_branch = gh.get_default_branch(owner, repo)
 
-    repo_path = ensure_repo_checkout(owner, repo, home=home)
+    repo_path = ensure_repo_checkout(owner, repo, home=home, base_branch=base_branch)
 
     branch = str(task.get("branch") or f"velora/{task_id}")
     _run_checked(["git", "checkout", branch], cwd=repo_path)
@@ -511,6 +512,7 @@ def run_task_legacy(
     spec: RunSpec,
     home: Path | None = None,
     runner: str | None = None,
+    base_branch: str | None = None,
 ) -> dict[str, Any]:
     if verb not in VALID_VERBS:
         raise ValueError(f"Invalid verb: {verb}. Allowed: {', '.join(sorted(VALID_VERBS))}")
@@ -542,8 +544,8 @@ def run_task_legacy(
     try:
         owner, repo = validate_repo_allowed(repo_ref)
         gh = GitHubClient.from_env()
-        base_branch = gh.get_default_branch(owner, repo)
-        repo_path = ensure_repo_checkout(owner, repo, home=home)
+        base_branch = (base_branch or "").strip() or gh.get_default_branch(owner, repo)
+        repo_path = ensure_repo_checkout(owner, repo, home=home, base_branch=base_branch)
     except Exception as exc:  # noqa: BLE001
         detail = _format_preflight_error(exc)
         record["status"] = "failed"
@@ -700,6 +702,7 @@ def run_task_mode_a(
     verb: str,
     spec: RunSpec,
     home: Path | None = None,
+    base_branch: str | None = None,
 ) -> dict[str, Any]:
     """Mode A loop: coordinator → work_item → worker → evaluate → repeat."""
 
@@ -734,8 +737,8 @@ def run_task_mode_a(
     try:
         owner, repo = validate_repo_allowed(repo_ref)
         gh = GitHubClient.from_env()
-        base_branch = gh.get_default_branch(owner, repo)
-        repo_path = ensure_repo_checkout(owner, repo, home=home)
+        base_branch = (base_branch or "").strip() or gh.get_default_branch(owner, repo)
+        repo_path = ensure_repo_checkout(owner, repo, home=home, base_branch=base_branch)
     except Exception as exc:  # noqa: BLE001
         detail = _format_preflight_error(exc)
         record["status"] = "failed"

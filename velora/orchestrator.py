@@ -55,7 +55,7 @@ def build_initial_coordinator_request(
     owner, repo = validate_repo_allowed(repo_ref)
 
     default_branch = get_default_branch(owner, repo)
-    repo_path = ensure_repo_checkout(owner, repo, home=home)
+    repo_path = ensure_repo_checkout(owner, repo, home=home, base_branch=default_branch)
 
     head_sha = _run_checked(["git", "rev-parse", "HEAD"], cwd=repo_path).strip()
     status = _run_checked(["git", "status", "--porcelain"], cwd=repo_path).strip()
