@@ -14,11 +14,27 @@ import urllib.request
 from .config import get_config
 
 
+@dataclass(frozen=True)
+class AcpUsage:
+    """Best-effort usage metadata extracted from acpx JSON output.
+
+    Notes:
+    - `used`/`size` come from acp `usage_update` events. In practice this is
+      *context usage*, not guaranteed-billed token counts.
+    - `model_id` is best-effort from session/new or session/load results.
+    """
+
+    used: int | None = None
+    size: int | None = None
+    model_id: str | None = None
+
+
 @dataclass
 class CmdResult:
     returncode: int
     stdout: str
     stderr: str
+    usage: AcpUsage | None = None
 
 
 # Optional fallback for developers running Velora inside an OpenClaw checkout.
@@ -101,6 +117,67 @@ def run_cmd(
     return CmdResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
+def _parse_acpx_json_prompt_output(raw_stdout: str) -> tuple[str, AcpUsage]:
+    """Parse acpx --format json --json-strict output into plain text + usage.
+
+    acpx emits JSON-RPC messages (one JSON object per line).
+
+    We extract:
+    - output text from session/update.agent_message_chunk
+    - latest usage_update (used/size)
+    - best-effort model_id from any result.models.currentModelId
+    """
+
+    out_chunks: list[str] = []
+    used: int | None = None
+    size: int | None = None
+    model_id: str | None = None
+
+    for raw_line in (raw_stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        res = obj.get("result")
+        if isinstance(res, dict):
+            models = res.get("models")
+            if isinstance(models, dict):
+                mid = models.get("currentModelId")
+                if isinstance(mid, str) and mid.strip():
+                    model_id = mid.strip()
+
+        if obj.get("method") != "session/update":
+            continue
+
+        params = obj.get("params")
+        if not isinstance(params, dict):
+            continue
+        update = params.get("update")
+        if not isinstance(update, dict):
+            continue
+
+        kind = update.get("sessionUpdate")
+        if kind == "agent_message_chunk":
+            content = update.get("content")
+            if isinstance(content, dict) and content.get("type") == "text":
+                out_chunks.append(str(content.get("text") or ""))
+        elif kind == "usage_update":
+            u = update.get("used")
+            s = update.get("size")
+            if isinstance(u, int):
+                used = u
+            if isinstance(s, int):
+                size = s
+
+    return "".join(out_chunks), AcpUsage(used=used, size=size, model_id=model_id)
+
+
 def ensure_codex_session(session_name: str, cwd: Path, env: dict[str, str]) -> CmdResult:
     acpx_cmd = resolve_acpx_cmd(env=env)
     cmd = [
@@ -134,7 +211,8 @@ def run_codex(session_name: str, cwd: Path, prompt: str) -> CmdResult:
         str(cwd),
         "--approve-all",
         "--format",
-        "quiet",
+        "json",
+        "--json-strict",
         "codex",
         "prompt",
         "-s",
@@ -142,7 +220,16 @@ def run_codex(session_name: str, cwd: Path, prompt: str) -> CmdResult:
         "-f",
         "-",
     ]
-    return run_cmd(cmd, input_text=prompt, env=env)
+    res = run_cmd(cmd, input_text=prompt, env=env)
+    if res.returncode != 0:
+        return res
+
+    try:
+        text, usage = _parse_acpx_json_prompt_output(res.stdout)
+        return CmdResult(returncode=0, stdout=text, stderr=res.stderr, usage=usage)
+    except Exception as exc:  # noqa: BLE001
+        # Fallback: preserve raw output for debugging.
+        return CmdResult(returncode=0, stdout=res.stdout, stderr=f"failed to parse acpx json output: {exc}")
 
 
 def ensure_claude_session(session_name: str, cwd: Path, env: dict[str, str]) -> CmdResult:
@@ -215,7 +302,8 @@ def run_claude(session_name: str, cwd: Path, prompt: str) -> CmdResult:
         str(cwd),
         "--approve-all",
         "--format",
-        "quiet",
+        "json",
+        "--json-strict",
         "claude",
         "prompt",
         "-s",
@@ -223,7 +311,15 @@ def run_claude(session_name: str, cwd: Path, prompt: str) -> CmdResult:
         "-f",
         "-",
     ]
-    return run_cmd(cmd, input_text=prompt, env=env)
+    res = run_cmd(cmd, input_text=prompt, env=env)
+    if res.returncode != 0:
+        return res
+
+    try:
+        text, usage = _parse_acpx_json_prompt_output(res.stdout)
+        return CmdResult(returncode=0, stdout=text, stderr=res.stderr, usage=usage)
+    except Exception as exc:  # noqa: BLE001
+        return CmdResult(returncode=0, stdout=res.stdout, stderr=f"failed to parse acpx json output: {exc}")
 
 
 def parse_codex_footer(output: str) -> dict[str, str]:

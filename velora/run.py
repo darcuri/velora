@@ -10,7 +10,7 @@ from typing import Any
 from .acpx import parse_codex_footer, review_has_blocker, run_claude, run_codex, run_gemini_review
 from .config import get_config
 from .constants import VALID_VERBS
-from .coordinator import run_coordinator_v1
+from .coordinator import run_coordinator_v1_with_cmd
 from .github import GitHubClient
 from .orchestrator import coordinator_session_name
 from .repo import ensure_repo_checkout, validate_repo_allowed
@@ -31,6 +31,73 @@ def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{proc.stderr.strip()}")
     return proc.stdout
+
+
+def _usd_equiv_rate_per_1m_tokens() -> float:
+    raw = os.environ.get("VELORA_USD_EQUIV_PER_1M_TOKENS", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.0
+
+
+def _accumulate_acpx_usage(request: dict[str, Any], *, session_name: str, result: Any) -> None:
+    """Accumulate best-effort token usage from an acpx CmdResult into Mode A history.
+
+    This uses acpx's `usage_update.used` counter, which reflects context usage.
+    It's good enough for a budget breaker, but not guaranteed to equal billed tokens.
+    """
+
+    usage = getattr(result, "usage", None)
+    if usage is None:
+        return
+
+    used = getattr(usage, "used", None)
+    if not isinstance(used, int):
+        return
+
+    hist = request.setdefault("history", {})
+    sess_usage = hist.setdefault("session_usage", {})
+    if not isinstance(sess_usage, dict):
+        sess_usage = {}
+        hist["session_usage"] = sess_usage
+
+    prev = sess_usage.get(session_name)
+    prev_used = int(prev) if isinstance(prev, int) else 0
+
+    delta = used - prev_used
+    # If the session was reset/compacted, used may go backwards. Treat that as
+    # a fresh baseline (delta=used).
+    if delta < 0:
+        delta = used
+
+    sess_usage[session_name] = used
+
+    hist["tokens_used_estimate"] = int(hist.get("tokens_used_estimate") or 0) + int(delta)
+
+    # USD-equivalent is informational only. Disabled unless user configures a rate.
+    rate = _usd_equiv_rate_per_1m_tokens()
+    hist["usd_equiv_per_1m_tokens"] = rate
+    hist["cost_usd_estimate"] = float(hist.get("cost_usd_estimate") or 0.0) + (float(delta) / 1_000_000.0) * rate
+
+    model_id = getattr(usage, "model_id", None)
+    if isinstance(model_id, str) and model_id.strip():
+        models = hist.setdefault("models_seen", [])
+        if isinstance(models, list) and model_id not in models:
+            models.append(model_id)
+            del models[:-10]
+
+
+def _sync_budget_to_record(record: dict[str, Any], request: dict[str, Any]) -> None:
+    hist = request.get("history") if isinstance(request, dict) else None
+    if not isinstance(hist, dict):
+        return
+
+    for key in ("tokens_used_estimate", "cost_usd_estimate", "usd_equiv_per_1m_tokens", "models_seen"):
+        if key in hist:
+            record[key] = hist.get(key)
 
 
 def _compact_title_fragment(text: str, max_len: int) -> str:
@@ -691,6 +758,7 @@ def run_task_mode_a(
             "work_branch": work_branch,
         },
         "policy": {
+            "max_tokens": cfg.mode_a_max_tokens,
             "max_cost_usd": cfg.mode_a_max_cost_usd,
             "no_progress_max": cfg.mode_a_no_progress_max,
             "max_wall_seconds": cfg.mode_a_max_wall_seconds,
@@ -712,7 +780,9 @@ def run_task_mode_a(
         "history": {
             "work_items_executed": [],
             "no_progress_streak": 0,
+            "tokens_used_estimate": 0,
             "cost_usd_estimate": 0.0,
+            "session_usage": {},
         },
     }
 
@@ -728,7 +798,7 @@ def run_task_mode_a(
 
     no_progress_max = int(policy.get("no_progress_max") or cfg.mode_a_no_progress_max)
     max_wall_seconds = int(policy.get("max_wall_seconds") or cfg.mode_a_max_wall_seconds)
-    max_cost_usd = float(policy.get("max_cost_usd") or cfg.mode_a_max_cost_usd)
+    max_tokens = int(policy.get("max_tokens") or cfg.mode_a_max_tokens)
 
     loop_start = time.monotonic()
     last_failure_sig: str | None = None
@@ -736,7 +806,7 @@ def run_task_mode_a(
     for attempt in range(1, max_attempts + 1):
         request["iteration"] = attempt
 
-        # Breakers: wall clock and cost.
+        # Breakers: wall clock and token budget.
         hist = request.setdefault("history", {})
         elapsed = time.monotonic() - loop_start
         hist["elapsed_seconds"] = round(elapsed, 2)
@@ -749,24 +819,38 @@ def run_task_mode_a(
                 detail=f"Wall-clock breaker tripped: elapsed={elapsed:.1f}s > max_wall_seconds={max_wall_seconds}",
             )
 
-        cost_est = float(hist.get("cost_usd_estimate") or 0.0)
-        if max_cost_usd and cost_est > max_cost_usd:
+        tokens_used = int(hist.get("tokens_used_estimate") or 0)
+        if max_tokens and tokens_used > max_tokens:
             return _fail_task(
                 record,
                 home=base_home,
                 task_dir=task_dir,
-                detail=f"Cost breaker tripped: cost_usd_estimate={cost_est:.2f} > max_cost_usd={max_cost_usd:.2f}",
+                detail=f"Token breaker tripped: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
             )
 
         iter_start = time.monotonic()
 
         try:
-            coord_resp = run_coordinator_v1(
+            coord_run = run_coordinator_v1_with_cmd(
                 session_name=coord_session,
                 cwd=repo_path,
                 request=request,
                 runner=coord_runner,
             )
+            coord_resp = coord_run.response
+            _accumulate_acpx_usage(request, session_name=coord_session, result=coord_run.cmd)
+            _sync_budget_to_record(record, request)
+
+            # Trip immediately if the coordinator itself blew the token budget.
+            hist = request.setdefault("history", {})
+            tokens_used = int(hist.get("tokens_used_estimate") or 0)
+            if max_tokens and tokens_used > max_tokens:
+                return _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Token breaker tripped after coordinator: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
+                )
         except Exception as exc:  # noqa: BLE001
             detail = _format_preflight_error(exc)
             return _fail_task(
@@ -833,6 +917,18 @@ def run_task_mode_a(
                 home=base_home,
                 task_dir=task_dir,
                 detail=f"Worker runner '{worker_runner}' failed on iteration {attempt}: {detail}",
+            )
+
+        _accumulate_acpx_usage(request, session_name=worker_session, result=agent_result)
+        _sync_budget_to_record(record, request)
+        hist = request.setdefault("history", {})
+        tokens_used = int(hist.get("tokens_used_estimate") or 0)
+        if max_tokens and tokens_used > max_tokens:
+            return _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Token breaker tripped after worker: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
             )
 
         _append_text(
