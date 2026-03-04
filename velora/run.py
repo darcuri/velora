@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .acpx import parse_codex_footer, run_claude, run_codex, run_gemini_review
+from .acpx import parse_codex_footer, review_has_blocker, run_claude, run_codex, run_gemini_review
 from .config import get_config
 from .constants import VALID_VERBS
 from .coordinator import run_coordinator_v1
@@ -419,7 +419,7 @@ def resume_task(task_id: str, home: Path | None = None) -> dict[str, Any]:
     pr_number = int(task["pr_number"])
     gh.post_issue_comment(owner, repo, pr_number, review_text)
 
-    if gemini.returncode != 0 or "BLOCKER" in review_text:
+    if gemini.returncode != 0 or review_has_blocker(review_text):
         task["status"] = "not-ready"
     else:
         task["status"] = "ready"
@@ -590,7 +590,7 @@ def run_task_legacy(
                 "review": review_text,
             }
 
-        if "BLOCKER" in review_text:
+        if review_has_blocker(review_text):
             if attempt == max_attempts:
                 record["status"] = "not-ready"
                 record["updated_at"] = now_iso()
@@ -969,7 +969,7 @@ def run_task_mode_a(
             raise RuntimeError("PR number missing; cannot post review comment")
         gh.post_issue_comment(owner, repo, int(record["pr_number"]), review_text)
 
-        if gemini.returncode != 0 or "BLOCKER" in review_text:
+        if gemini.returncode != 0 or review_has_blocker(review_text):
             detail = "review-tool-failed" if gemini.returncode != 0 else "review-blocker"
             failure_sig = f"review:{detail}"
             no_prog = int(hist.get("no_progress_streak") or 0)
