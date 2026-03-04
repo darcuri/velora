@@ -22,6 +22,11 @@ Velora supports configuration via a JSON config file and environment variables.
   "allowed_owners": ["octocat"],
   "max_attempts": 3,
 
+  "mode_a_max_tokens": 200000,
+  "mode_a_max_cost_usd": 20,
+  "mode_a_no_progress_max": 4,
+  "mode_a_max_wall_seconds": 1800,
+
   "runner": "codex",
   "codex_session_prefix": "velora-codex-",
   "claude_session_prefix": "velora-claude-",
@@ -42,6 +47,15 @@ All of these override config file values:
 
 - `VELORA_ALLOWED_OWNERS`
 - `VELORA_MAX_ATTEMPTS`
+
+Mode A:
+- `VELORA_MODE_A_MAX_TOKENS`
+- `VELORA_MODE_A_MAX_COST_USD`
+- `VELORA_MODE_A_NO_PROGRESS_MAX`
+- `VELORA_MODE_A_MAX_WALL_SECONDS`
+- `VELORA_COORDINATOR_RUNNER`
+- `VELORA_USD_EQUIV_PER_1M_TOKENS`
+
 - `VELORA_RUNNER` (codex | claude)
 - `VELORA_CODEX_SESSION_PREFIX`
 - `VELORA_CLAUDE_SESSION_PREFIX`
