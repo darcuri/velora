@@ -44,19 +44,41 @@ def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
     return proc.stdout
 
 
-def ensure_repo_checkout(owner: str, repo: str, home: Path | None = None) -> Path:
+def _resolve_origin_head_branch(checkout: Path) -> str | None:
+    try:
+        ref = _run_checked(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], cwd=checkout).strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+    prefix = "refs/remotes/origin/"
+    if ref.startswith(prefix):
+        name = ref[len(prefix) :].strip()
+        return name or None
+    return None
+
+
+def ensure_repo_checkout(owner: str, repo: str, home: Path | None = None, *, base_branch: str | None = None) -> Path:
     base = ensure_dir((home or velora_home()) / "repos")
     checkout = base / repo_slug(owner, repo)
     full_name = f"{owner}/{repo}"
     if not checkout.exists():
         _run_checked(["gh", "repo", "clone", full_name, str(checkout)])
+        # If the caller requested a non-default base branch, ensure we are on it.
+        bb = (base_branch or "").strip()
+        if bb:
+            _run_checked(["git", "fetch", "--all", "--prune"], cwd=checkout)
+            _run_checked(["git", "checkout", "-B", bb, f"origin/{bb}"], cwd=checkout)
         return checkout
 
     status = _run_checked(["git", "status", "--porcelain"], cwd=checkout).strip()
     if status:
         raise RuntimeError(f"Local repo is not clean: {checkout}")
+
     _run_checked(["git", "fetch", "--all", "--prune"], cwd=checkout)
-    _run_checked(["git", "pull", "--ff-only"], cwd=checkout)
+
+    bb = (base_branch or "").strip() or _resolve_origin_head_branch(checkout) or "main"
+    _run_checked(["git", "checkout", "-B", bb, f"origin/{bb}"], cwd=checkout)
+
     return checkout
 
 
