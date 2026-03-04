@@ -38,6 +38,23 @@ class TestCoordinator(unittest.TestCase):
             resp = run_coordinator_v1(session_name="s", cwd=Path("."), request={"x": 1})
             self.assertEqual(resp.decision, "finalize_success")
 
+    def test_run_coordinator_accepts_fenced_json(self) -> None:
+        valid = {
+            "protocol_version": 1,
+            "decision": "finalize_success",
+            "reason": "done",
+            "selected_specialist": {"role": "investigator", "runner": "claude"},
+        }
+        fenced = "```json\n" + __import__("json").dumps(valid) + "\n```"
+        with patch("velora.coordinator.run_claude") as mocked:
+            mocked.return_value = type(
+                "R",
+                (),
+                {"returncode": 0, "stdout": fenced, "stderr": ""},
+            )()
+            resp = run_coordinator_v1(session_name="s", cwd=Path("."), request={"x": 1})
+            self.assertEqual(resp.decision, "finalize_success")
+
     def test_can_run_coordinator_on_codex_runner(self) -> None:
         valid = {
             "protocol_version": 1,
