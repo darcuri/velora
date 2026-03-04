@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import time
@@ -281,6 +282,23 @@ def _write_text(path: Path, text: str) -> None:
             fh.write("\n")
 
 
+def _dbg(task_dir: Path | None, event: str, data: dict[str, Any] | None = None) -> None:
+    """Best-effort structured debug logging to task_dir/debug.jsonl."""
+
+    if task_dir is None:
+        return
+
+    payload: dict[str, Any] = {"ts": now_iso(), "event": event}
+    if data:
+        payload.update(data)
+
+    try:
+        _append_text(task_dir / "debug.jsonl", json.dumps(payload, sort_keys=True))
+    except Exception:
+        # Never fail the run due to debug logging.
+        pass
+
+
 def _cleanup_repo_detritus(repo_path: Path) -> None:
     """Best-effort cleanup of common untracked junk.
 
@@ -389,6 +407,7 @@ def run_task(
     base_branch: str | None = None,
     *,
     use_coordinator: bool = False,
+    debug: bool = False,
 ) -> dict[str, Any]:
     """Run a VELORA task.
 
@@ -398,11 +417,11 @@ def run_task(
     """
 
     if use_coordinator:
-        return run_task_mode_a(repo_ref, verb, spec, home=home, base_branch=base_branch)
-    return run_task_legacy(repo_ref, verb, spec, home=home, runner=runner, base_branch=base_branch)
+        return run_task_mode_a(repo_ref, verb, spec, home=home, base_branch=base_branch, debug=debug)
+    return run_task_legacy(repo_ref, verb, spec, home=home, runner=runner, base_branch=base_branch, debug=debug)
 
 
-def resume_task(task_id: str, home: Path | None = None) -> dict[str, Any]:
+def resume_task(task_id: str, home: Path | None = None, *, debug: bool = False) -> dict[str, Any]:
     """Resume a previously started task.
 
     v0 scope: take an existing branch/commit and finish the remaining pipeline:
@@ -513,6 +532,7 @@ def run_task_legacy(
     home: Path | None = None,
     runner: str | None = None,
     base_branch: str | None = None,
+    debug: bool = False,
 ) -> dict[str, Any]:
     if verb not in VALID_VERBS:
         raise ValueError(f"Invalid verb: {verb}. Allowed: {', '.join(sorted(VALID_VERBS))}")
@@ -703,6 +723,7 @@ def run_task_mode_a(
     spec: RunSpec,
     home: Path | None = None,
     base_branch: str | None = None,
+    debug: bool = False,
 ) -> dict[str, Any]:
     """Mode A loop: coordinator → work_item → worker → evaluate → repeat."""
 
@@ -732,6 +753,20 @@ def run_task_mode_a(
     }
     upsert_task(record, home=base_home)
 
+    dbg_dir = task_dir if debug else None
+    _dbg(
+        dbg_dir,
+        "run_start",
+        {
+            "task_id": task_id,
+            "repo": repo_ref,
+            "verb": verb,
+            "base_branch_override": (base_branch or "").strip() or None,
+            "max_attempts": spec.max_attempts,
+            "max_tokens": os.environ.get("VELORA_MODE_A_MAX_TOKENS"),
+        },
+    )
+
     cfg = get_config()
 
     try:
@@ -746,6 +781,17 @@ def run_task_mode_a(
         record["failure_reason"] = detail
         upsert_task(record, home=base_home)
         return {"task_id": task_id, "status": record["status"], "pr_url": None, "summary": detail}
+
+    _dbg(
+        dbg_dir,
+        "preflight_ok",
+        {
+            "owner": owner,
+            "repo": repo,
+            "base_branch": base_branch,
+            "repo_path": str(repo_path),
+        },
+    )
 
     work_branch = f"velora/{task_id}"
 
@@ -834,15 +880,42 @@ def run_task_mode_a(
         iter_start = time.monotonic()
 
         try:
+            _dbg(
+                dbg_dir,
+                "coordinator_start",
+                {
+                    "iteration": attempt,
+                    "runner": coord_runner,
+                    "session": coord_session,
+                    "tokens_total": int(hist.get("tokens_used_estimate") or 0),
+                },
+            )
+            coord_t0 = time.monotonic()
             coord_run = run_coordinator_v1_with_cmd(
                 session_name=coord_session,
                 cwd=repo_path,
                 request=request,
                 runner=coord_runner,
             )
+            coord_dt = round(time.monotonic() - coord_t0, 2)
             coord_resp = coord_run.response
             _accumulate_acpx_usage(request, session_name=coord_session, result=coord_run.cmd)
             _sync_budget_to_record(record, request)
+            _dbg(
+                dbg_dir,
+                "coordinator_done",
+                {
+                    "iteration": attempt,
+                    "duration_s": coord_dt,
+                    "decision": coord_resp.decision,
+                    "selected_role": coord_resp.selected_specialist.role,
+                    "selected_runner": coord_resp.selected_specialist.runner,
+                    "work_item_id": (coord_resp.work_item.id if coord_resp.work_item else None),
+                    "work_item_kind": (coord_resp.work_item.kind if coord_resp.work_item else None),
+                    "model_id": getattr(getattr(coord_run.cmd, "usage", None), "model_id", None),
+                    "tokens_total": record.get("tokens_used_estimate"),
+                },
+            )
 
             # Trip immediately if the coordinator itself blew the token budget.
             hist = request.setdefault("history", {})
@@ -907,6 +980,20 @@ def run_task_mode_a(
             work_item=coord_resp.work_item,
         )
 
+        _dbg(
+            dbg_dir,
+            "worker_start",
+            {
+                "iteration": attempt,
+                "runner": worker_runner,
+                "session": worker_session,
+                "work_item_id": coord_resp.work_item.id,
+                "work_item_kind": coord_resp.work_item.kind,
+                "tokens_total": record.get("tokens_used_estimate"),
+            },
+        )
+        worker_t0 = time.monotonic()
+
         try:
             agent_result = (
                 run_codex(session_name=worker_session, cwd=repo_path, prompt=prompt)
@@ -921,6 +1008,20 @@ def run_task_mode_a(
                 task_dir=task_dir,
                 detail=f"Worker runner '{worker_runner}' failed on iteration {attempt}: {detail}",
             )
+
+        worker_dt = round(time.monotonic() - worker_t0, 2)
+        _dbg(
+            dbg_dir,
+            "worker_done",
+            {
+                "iteration": attempt,
+                "duration_s": worker_dt,
+                "rc": agent_result.returncode,
+                "model_id": getattr(getattr(agent_result, "usage", None), "model_id", None),
+                "stdout_chars": len(agent_result.stdout or ""),
+                "stderr_chars": len(agent_result.stderr or ""),
+            },
+        )
 
         _accumulate_acpx_usage(request, session_name=worker_session, result=agent_result)
         _sync_budget_to_record(record, request)
@@ -957,6 +1058,17 @@ def run_task_mode_a(
         record["summary"] = footer["summary"]
         record["updated_at"] = now_iso()
         upsert_task(record, home=base_home)
+        _dbg(
+            dbg_dir,
+            "worker_footer",
+            {
+                "iteration": attempt,
+                "branch": record.get("branch"),
+                "head_sha": record.get("head_sha"),
+                "summary": record.get("summary"),
+                "tokens_total": record.get("tokens_used_estimate"),
+            },
+        )
 
         # Update coordinator state snapshot.
         request.setdefault("state", {})
@@ -985,8 +1097,28 @@ def run_task_mode_a(
             record["pr_number"] = pr["number"]
             record["updated_at"] = now_iso()
             upsert_task(record, home=base_home)
+            _dbg(
+                dbg_dir,
+                "pr_created",
+                {
+                    "iteration": attempt,
+                    "pr_url": record.get("pr_url"),
+                    "pr_number": record.get("pr_number"),
+                    "base_branch": base_branch,
+                },
+            )
 
         ci_log = task_dir / f"ci-iter-{attempt}.log"
+        _dbg(
+            dbg_dir,
+            "ci_start",
+            {
+                "iteration": attempt,
+                "head_sha": footer["head_sha"],
+                "pr_url": record.get("pr_url"),
+            },
+        )
+        ci_t0 = time.monotonic()
         _append_text(ci_log, f"[{now_iso()}] polling CI for {footer['head_sha']}")
         try:
             ci_state, ci_detail = _poll_ci(gh, owner, repo, footer["head_sha"], ci_log)
@@ -998,7 +1130,18 @@ def run_task_mode_a(
                 task_dir=task_dir,
                 detail=f"CI polling failed on iteration {attempt}: {detail}",
             )
+        ci_dt = round(time.monotonic() - ci_t0, 2)
         _append_text(ci_log, f"[{now_iso()}] final {ci_state}: {ci_detail}")
+        _dbg(
+            dbg_dir,
+            "ci_done",
+            {
+                "iteration": attempt,
+                "duration_s": ci_dt,
+                "ci_state": ci_state,
+                "ci_detail": ci_detail,
+            },
+        )
 
         # Record history entry skeleton.
         hist = request.setdefault("history", {})
@@ -1056,10 +1199,33 @@ def run_task_mode_a(
 
         # CI success → review gate.
         diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
+        _dbg(
+            dbg_dir,
+            "review_start",
+            {
+                "iteration": attempt,
+                "head_sha": record.get("head_sha"),
+                "diff_chars": len(diff_text or ""),
+            },
+        )
+        review_t0 = time.monotonic()
         gemini = run_gemini_review(diff_text)
+        review_dt = round(time.monotonic() - review_t0, 2)
         review_text = gemini.stdout.strip()
         if gemini.returncode != 0:
             review_text = f"BLOCKER: Review tool failed: {gemini.stderr.strip()}"
+
+        _dbg(
+            dbg_dir,
+            "review_done",
+            {
+                "iteration": attempt,
+                "duration_s": review_dt,
+                "rc": gemini.returncode,
+                "has_blocker": bool(review_has_blocker(review_text)),
+                "review_first_line": (review_text.splitlines()[0][:200] if review_text else ""),
+            },
+        )
 
         review_attempt_path = task_dir / f"review-iter-{attempt}.txt"
         _write_text(review_attempt_path, review_text)
@@ -1141,6 +1307,16 @@ def run_task_mode_a(
         record["status"] = "ready"
         record["updated_at"] = now_iso()
         upsert_task(record, home=base_home)
+        _dbg(
+            dbg_dir,
+            "run_done",
+            {
+                "status": "ready",
+                "pr_url": record.get("pr_url"),
+                "tokens_total": record.get("tokens_used_estimate"),
+                "duration_s": round(time.monotonic() - loop_start, 2),
+            },
+        )
         return {
             "task_id": task_id,
             "status": record["status"],

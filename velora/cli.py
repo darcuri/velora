@@ -51,10 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument("--coordinator", action="store_true", help="Use Mode A coordinator loop")
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    run_p.add_argument("--debug", action="store_true", help="Write verbose debug logs into the task directory")
 
     resume_p = sub.add_parser("resume", help="Resume a VELORA task by task_id")
     resume_p.add_argument("task_id", help="Task id (from velora status)")
     resume_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    resume_p.add_argument("--debug", action="store_true", help="Write verbose debug logs into the task directory")
 
     coord_p = sub.add_parser("coord", help="Coordinator utilities (Mode A scaffolding)")
     coord_sub = coord_p.add_subparsers(dest="coord_cmd", required=True)
@@ -157,11 +159,12 @@ def main(argv: list[str] | None = None) -> int:
                 runner=getattr(args, "runner", None),
                 base_branch=getattr(args, "base_branch", None),
                 use_coordinator=bool(getattr(args, "coordinator", False)),
+                debug=bool(getattr(args, "debug", False)),
             )
             return _print_run_result(result, args.json)
 
         if args.cmd == "resume":
-            result = resume_task(str(args.task_id))
+            result = resume_task(str(args.task_id), debug=bool(getattr(args, "debug", False)))
             return _print_run_result(result, args.json)
 
         if args.cmd == "coord":
