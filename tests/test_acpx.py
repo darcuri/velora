@@ -2,7 +2,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from velora.acpx import parse_codex_footer, resolve_acpx_cmd, run_codex, run_gemini_review
+from velora.acpx import parse_codex_footer, resolve_acpx_cmd, review_has_blocker, run_codex, run_gemini_review
 
 
 class TestAcpxDiscovery(unittest.TestCase):
@@ -72,6 +72,36 @@ class TestAcpxDiscovery(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertIn("NIT", res.stdout)
         self.assertIn("looks fine", res.stdout)
+
+    def test_run_gemini_review_accepts_ok_single_line(self):
+        class DummyResp:
+            def __init__(self, payload: str):
+                self._payload = payload.encode("utf-8")
+
+            def read(self):
+                return self._payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        fake_payload = '{"candidates":[{"content":{"parts":[{"text":"OK: Looks good."}]}}]}'
+
+        with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
+            "velora.acpx.urllib.request.urlopen", return_value=DummyResp(fake_payload)
+        ):
+            res = run_gemini_review("diff")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("OK:", res.stdout)
+
+    def test_review_has_blocker_parses_lines(self):
+        self.assertTrue(review_has_blocker("BLOCKER: This will crash."))
+        self.assertTrue(review_has_blocker("- BLOCKER: This will crash."))
+        self.assertFalse(review_has_blocker("NIT: Style."))
+        self.assertFalse(review_has_blocker("OK: Looks good."))
 
 
 if __name__ == "__main__":

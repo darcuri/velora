@@ -325,13 +325,61 @@ def _gemini_generate_content(
         raise RuntimeError(f"Gemini API response missing expected text field: {payload}") from exc
 
 
+def _strip_bullet_prefix(line: str) -> str:
+    s = line.strip()
+    # Common markdown bullet prefixes.
+    while s and s[0] in "-*•":
+        s = s[1:].lstrip()
+    return s
+
+
+def _normalize_review_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in text.splitlines():
+        s = _strip_bullet_prefix(raw).strip()
+        if s:
+            lines.append(s)
+    return lines
+
+
+def review_has_blocker(review_text: str) -> bool:
+    for line in _normalize_review_lines(review_text):
+        if line.startswith("BLOCKER:"):
+            return True
+    return False
+
+
+def _review_text_valid(review_text: str) -> bool:
+    lines = _normalize_review_lines(review_text)
+    if not lines:
+        return False
+
+    # OK is allowed only as a single-line "all clear".
+    if len(lines) == 1 and lines[0].startswith("OK:"):
+        return lines[0].endswith(".")
+
+    if len(lines) > 5:
+        return False
+
+    for line in lines:
+        if not (line.startswith("BLOCKER:") or line.startswith("NIT:")):
+            return False
+        if not line.endswith("."):
+            return False
+
+    return True
+
+
 def run_gemini_review(diff_text: str) -> CmdResult:
-    # Keep the prompt strict: short, complete, and actionable bullets.
+    # Keep the prompt strict: short, complete, and actionable.
     prompt_prefix = (
-        "Review the code diff. Output at most 5 bullet points. "
-        "Each bullet MUST start with either 'BLOCKER:' or 'NIT:'. "
-        "Every bullet must be a complete sentence ending with a period. "
-        "Focus on correctness and regressions. Keep it concise.\n\n"
+        "Review the code diff for correctness/regressions. Output either: \n"
+        "- exactly one line starting with 'OK:' if you find no issues, OR\n"
+        "- 1–5 bullet lines, each starting with 'BLOCKER:' or 'NIT:'.\n"
+        "Use 'BLOCKER:' ONLY when the diff itself proves a serious issue (crash, test failure, incorrect behavior, data loss, or security flaw). "
+        "If you're not sure, use 'NIT:' instead.\n"
+        "Do not speculate beyond the diff.\n"
+        "Every line must be a complete sentence ending with a period.\n\n"
     )
 
     env = os.environ.copy()
@@ -342,7 +390,6 @@ def run_gemini_review(diff_text: str) -> CmdResult:
     fallback_model_2 = env.get("VELORA_GEMINI_FALLBACK_MODEL_2", "gemini-pro-latest")
     models = [m for m in [primary_model, fallback_model, fallback_model_2] if m]
 
-    min_chars = int(env.get("VELORA_GEMINI_MIN_CHARS", "120"))
     max_output_tokens = int(env.get("VELORA_GEMINI_MAX_OUTPUT_TOKENS", "1024"))
 
     max_diff_chars = int(env.get("VELORA_GEMINI_MAX_DIFF_CHARS", "120000"))
@@ -359,13 +406,11 @@ def run_gemini_review(diff_text: str) -> CmdResult:
                 prompt=prompt_prefix + diff_trimmed,
                 max_output_tokens=max_output_tokens,
             ).strip()
-            # Guard against the "half a sentence" failure mode.
-            if len(text) < min_chars:
-                last_err = f"Gemini review too short ({len(text)} chars) using model {model}"
+
+            if not _review_text_valid(text):
+                last_err = f"Gemini review did not match required format using model {model}: {text[:200]!r}"
                 continue
-            if "BLOCKER:" not in text and "NIT:" not in text:
-                last_err = f"Gemini review missing required labels using model {model}"
-                continue
+
             return CmdResult(returncode=0, stdout=text + "\n", stderr="")
         except Exception as exc:  # noqa: BLE001
             last_err = f"Gemini review failed using model {model}: {exc}"
