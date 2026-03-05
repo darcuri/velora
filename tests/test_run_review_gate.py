@@ -1,10 +1,12 @@
 from contextlib import ExitStack
+import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
 from velora.acpx import CmdResult
-from velora.run import _classify_review_text, run_task
+from velora.run import _classify_review_text, _run_review_with_retry, run_task
 from velora.spec import RunSpec
 
 
@@ -184,6 +186,34 @@ class TestRunReviewGate(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         self.assertEqual(mock_codex.call_count, 2)
         self.assertEqual(mock_review.call_count, 2)
+
+    def test_debug_forensics_written_for_malformed_review_attempts(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch(
+                "velora.run.run_gemini_review",
+                side_effect=[
+                    CmdResult(0, "This output is malformed", ""),
+                    CmdResult(0, "Still malformed output", ""),
+                ],
+            ):
+                result, review_text = _run_review_with_retry(
+                    "diff-body\n+ token=abc123",
+                    debug_task_dir=Path(td),
+                )
+
+            self.assertEqual(result, "malformed")
+            self.assertTrue(review_text.startswith("REVIEW_MALFORMED:"))
+
+            forensic_path = Path(td) / "review-forensics-try-1.json"
+            self.assertTrue(forensic_path.exists())
+
+            payload = json.loads(forensic_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["review_result"], "malformed")
+            self.assertIn("Review the code diff for correctness/regressions.", payload["prompt_prefix"])
+            self.assertEqual(payload["diff_chars"], len("diff-body\n+ token=abc123"))
+            self.assertEqual(len(payload["diff_fingerprint_sha256"]), 64)
+            self.assertIn("diff-body", payload["diff_preview"])
+            self.assertIn("token=<redacted>", payload["diff_preview"])
 
 
 if __name__ == "__main__":
