@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -9,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .acpx import parse_codex_footer, review_has_blocker, run_claude, run_codex, run_gemini_review
+from .acpx import parse_codex_footer, run_claude, run_codex, run_gemini_review
 from .config import get_config
 from .constants import VALID_VERBS
 from .coordinator import run_coordinator_v1_with_cmd
@@ -20,6 +21,12 @@ from .spec import RunSpec
 from .state import get_task, upsert_task
 from .util import build_task_id, ensure_dir, now_iso, repo_slug, velora_home
 from .worker_prompt import build_worker_prompt_v1
+
+_APPROVAL_TOKEN_RE = re.compile(r"^\s*ok(?:[.:])?(?:\s|$)", flags=re.IGNORECASE)
+_FINDING_LINE_RE = re.compile(
+    r"^(?:[-*+]\s+|\d+\.\s+)?(?:(?:\*\*(BLOCKER|NIT):\*\*)|(?:\*\*(BLOCKER|NIT)\*\*:)|((?:BLOCKER|NIT):))\s+\S",
+    flags=re.IGNORECASE,
+)
 
 
 def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
@@ -446,6 +453,63 @@ def _read_diff_for_review(repo_path: Path, base_ref: str, head_sha: str) -> str:
     return _run_checked(["git", "diff", f"origin/{base_ref}...{head_sha}"], cwd=repo_path)
 
 
+def _classify_review_text(review_text: str) -> str:
+    text = review_text.strip()
+    if not text:
+        return "malformed"
+
+    # Approval tokens are only valid at the beginning of the review output.
+    if _APPROVAL_TOKEN_RE.match(text):
+        return "approved"
+
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "malformed"
+
+    saw_blocker = False
+    saw_finding = False
+    for line in lines:
+        match = _FINDING_LINE_RE.match(line)
+        if match:
+            saw_finding = True
+            label = next((group for group in match.groups() if group), "")
+            if label.upper().startswith("BLOCKER"):
+                saw_blocker = True
+            continue
+
+        # Allow light prose before the first structured finding line.
+        if not saw_finding:
+            continue
+
+        # Allow indented continuation lines for finding details.
+        if line[:1].isspace():
+            continue
+
+        return "malformed"
+
+    if not saw_finding:
+        return "malformed"
+
+    return "blocker" if saw_blocker else "nits"
+
+
+def _run_review_with_retry(diff_text: str) -> tuple[str, str]:
+    review_text = ""
+    for review_try in range(2):
+        gemini = run_gemini_review(diff_text)
+        review_text = gemini.stdout.strip()
+        if gemini.returncode != 0:
+            return "tool-error", f"REVIEW_TOOL_ERROR: {gemini.stderr.strip()}"
+
+        review_result = _classify_review_text(review_text)
+        if review_result != "malformed" or review_try == 1:
+            if review_result == "malformed":
+                return "malformed", f"REVIEW_MALFORMED: {review_text}"
+            return review_result, review_text
+
+    return "malformed", f"REVIEW_MALFORMED: {review_text}"
+
+
 def _format_preflight_error(exc: Exception) -> str:
     msg = str(exc).strip() or exc.__class__.__name__
 
@@ -582,10 +646,7 @@ def resume_task(task_id: str, home: Path | None = None, *, debug: bool = False) 
 
     # Review gate.
     diff_text = _read_diff_for_review(repo_path, base_branch, head_sha)
-    gemini = run_gemini_review(diff_text)
-    review_text = gemini.stdout.strip()
-    if gemini.returncode != 0:
-        review_text = f"BLOCKER: Review tool failed: {gemini.stderr.strip()}"
+    review_result, review_text = _run_review_with_retry(diff_text)
 
     review_path = task_dir / "review-resume.txt"
     _write_text(review_path, review_text)
@@ -593,7 +654,7 @@ def resume_task(task_id: str, home: Path | None = None, *, debug: bool = False) 
     pr_number = int(task["pr_number"])
     gh.post_issue_comment(owner, repo, pr_number, review_text)
 
-    if gemini.returncode != 0 or review_has_blocker(review_text):
+    if review_result in {"tool-error", "malformed", "blocker"}:
         task["status"] = "not-ready"
     else:
         task["status"] = "ready"
@@ -609,6 +670,7 @@ def resume_task(task_id: str, home: Path | None = None, *, debug: bool = False) 
         "ci_state": ci_state,
         "ci_detail": ci_detail,
         "review": review_text,
+        "review_result": review_result,
     }
 
 
@@ -740,10 +802,7 @@ def run_task_legacy(
             continue
 
         diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
-        gemini = run_gemini_review(diff_text)
-        review_text = gemini.stdout.strip()
-        if gemini.returncode != 0:
-            review_text = f"BLOCKER: Review tool failed: {gemini.stderr.strip()}"
+        review_result, review_text = _run_review_with_retry(diff_text)
 
         review_attempt_path = task_dir / f"review-attempt-{attempt}.txt"
         _write_text(review_attempt_path, review_text)
@@ -752,7 +811,7 @@ def run_task_legacy(
             raise RuntimeError("PR number missing; cannot post review comment")
         gh.post_issue_comment(owner, repo, int(record["pr_number"]), review_text)
 
-        if gemini.returncode != 0:
+        if review_result in {"tool-error", "malformed"}:
             record["status"] = "not-ready"
             record["updated_at"] = now_iso()
             upsert_task(record, home=base_home)
@@ -764,9 +823,10 @@ def run_task_legacy(
                 "ci_state": ci_state,
                 "ci_detail": ci_detail,
                 "review": review_text,
+                "review_result": review_result,
             }
 
-        if review_has_blocker(review_text):
+        if review_result == "blocker":
             if attempt == max_attempts:
                 record["status"] = "not-ready"
                 record["updated_at"] = now_iso()
@@ -779,6 +839,7 @@ def run_task_legacy(
                     "ci_state": ci_state,
                     "ci_detail": ci_detail,
                     "review": review_text,
+                    "review_result": review_result,
                 }
 
             fix_context = f"Attempt {attempt} review blockers to address:\n{review_text}"
@@ -795,6 +856,7 @@ def run_task_legacy(
             "ci_state": ci_state,
             "ci_detail": ci_detail,
             "review": review_text,
+            "review_result": review_result,
         }
 
     record["status"] = "failed"
@@ -1342,11 +1404,8 @@ def run_task_mode_a(
             },
         )
         review_t0 = time.monotonic()
-        gemini = run_gemini_review(diff_text)
+        review_result, review_text = _run_review_with_retry(diff_text)
         review_dt = round(time.monotonic() - review_t0, 2)
-        review_text = gemini.stdout.strip()
-        if gemini.returncode != 0:
-            review_text = f"BLOCKER: Review tool failed: {gemini.stderr.strip()}"
 
         _dbg(
             dbg_dir,
@@ -1354,8 +1413,8 @@ def run_task_mode_a(
             {
                 "iteration": attempt,
                 "duration_s": review_dt,
-                "rc": gemini.returncode,
-                "has_blocker": bool(review_has_blocker(review_text)),
+                "review_result": review_result,
+                "has_blocker": review_result == "blocker",
                 "review_first_line": (review_text.splitlines()[0][:200] if review_text else ""),
             },
         )
@@ -1367,8 +1426,13 @@ def run_task_mode_a(
             raise RuntimeError("PR number missing; cannot post review comment")
         gh.post_issue_comment(owner, repo, int(record["pr_number"]), review_text)
 
-        if gemini.returncode != 0 or review_has_blocker(review_text):
-            detail = "review-tool-failed" if gemini.returncode != 0 else "review-blocker"
+        if review_result in {"tool-error", "malformed", "blocker"}:
+            if review_result == "tool-error":
+                detail = "review-tool-error"
+            elif review_result == "malformed":
+                detail = "review-malformed"
+            else:
+                detail = "review-blocker"
             failure_sig = f"review:{detail}"
             no_prog = int(hist.get("no_progress_streak") or 0)
             no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
