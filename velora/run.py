@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import re
 import shutil
 import subprocess
@@ -10,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .acpx import parse_codex_footer, run_claude, run_codex, run_gemini_review
+from .acpx import GEMINI_REVIEW_PROMPT_PREFIX, parse_codex_footer, run_claude, run_codex, run_gemini_review
 from .config import get_config
 from .constants import VALID_VERBS
 from .coordinator import run_coordinator_v1_with_cmd
@@ -27,6 +28,8 @@ _FINDING_LINE_RE = re.compile(
     r"^(?:[-*+]\s+|\d+\.\s+)?(?:(?:\*\*(BLOCKER|NIT):\*\*)|(?:\*\*(BLOCKER|NIT)\*\*:)|((?:BLOCKER|NIT):))\s+\S",
     flags=re.IGNORECASE,
 )
+_REVIEW_DEBUG_MAX_DIFF_PREVIEW_CHARS = 1500
+_REVIEW_DEBUG_MAX_REVIEW_PREVIEW_CHARS = 400
 
 
 def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
@@ -393,6 +396,40 @@ def _dbg(task_dir: Path | None, event: str, data: dict[str, Any] | None = None) 
         pass
 
 
+def _truncate_for_debug(text: str, max_chars: int) -> str:
+    cleaned = re.sub(r"[^\x09\x0A\x0D\x20-\x7E]", "?", text or "")
+    cleaned = re.sub(r"(?i)\b(token|api[_-]?key|secret|password)\b\s*[:=]\s*\S+", r"\1=<redacted>", cleaned)
+    cleaned = re.sub(r"(?i)\bauthorization:\s*\S+", "authorization: <redacted>", cleaned)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars] + "\n[truncated]"
+
+
+def _write_review_forensics(
+    task_dir: Path | None,
+    *,
+    review_try: int,
+    review_result: str,
+    review_text: str,
+    diff_text: str,
+) -> None:
+    if task_dir is None:
+        return
+
+    payload = {
+        "artifact_version": 1,
+        "review_try": review_try + 1,
+        "review_result": review_result,
+        "prompt_prefix": GEMINI_REVIEW_PROMPT_PREFIX.strip(),
+        "diff_chars": len(diff_text or ""),
+        "diff_fingerprint_sha256": hashlib.sha256((diff_text or "").encode("utf-8")).hexdigest(),
+        "diff_preview": _truncate_for_debug(diff_text, _REVIEW_DEBUG_MAX_DIFF_PREVIEW_CHARS),
+        "review_preview": _truncate_for_debug(review_text, _REVIEW_DEBUG_MAX_REVIEW_PREVIEW_CHARS),
+        "ts": now_iso(),
+    }
+    _write_text(task_dir / f"review-forensics-try-{review_try + 1}.json", json.dumps(payload, sort_keys=True))
+
+
 def _cleanup_repo_detritus(repo_path: Path) -> None:
     """Best-effort cleanup of common untracked junk.
 
@@ -493,19 +530,33 @@ def _classify_review_text(review_text: str) -> str:
     return "blocker" if saw_blocker else "nits"
 
 
-def _run_review_with_retry(diff_text: str) -> tuple[str, str]:
+def _run_review_with_retry(diff_text: str, *, debug_task_dir: Path | None = None) -> tuple[str, str]:
     review_text = ""
     for review_try in range(2):
         gemini = run_gemini_review(diff_text)
         review_text = gemini.stdout.strip()
         if gemini.returncode != 0:
+            _write_review_forensics(
+                debug_task_dir,
+                review_try=review_try,
+                review_result="tool-error",
+                review_text=gemini.stderr.strip(),
+                diff_text=diff_text,
+            )
             return "tool-error", f"REVIEW_TOOL_ERROR: {gemini.stderr.strip()}"
 
         review_result = _classify_review_text(review_text)
-        if review_result != "malformed" or review_try == 1:
-            if review_result == "malformed":
-                return "malformed", f"REVIEW_MALFORMED: {review_text}"
+        if review_result != "malformed":
             return review_result, review_text
+        _write_review_forensics(
+            debug_task_dir,
+            review_try=review_try,
+            review_result="malformed",
+            review_text=review_text,
+            diff_text=diff_text,
+        )
+        if review_try == 1:
+            return "malformed", f"REVIEW_MALFORMED: {review_text}"
 
     return "malformed", f"REVIEW_MALFORMED: {review_text}"
 
@@ -646,7 +697,7 @@ def resume_task(task_id: str, home: Path | None = None, *, debug: bool = False) 
 
     # Review gate.
     diff_text = _read_diff_for_review(repo_path, base_branch, head_sha)
-    review_result, review_text = _run_review_with_retry(diff_text)
+    review_result, review_text = _run_review_with_retry(diff_text, debug_task_dir=task_dir if debug else None)
 
     review_path = task_dir / "review-resume.txt"
     _write_text(review_path, review_text)
@@ -802,7 +853,7 @@ def run_task_legacy(
             continue
 
         diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
-        review_result, review_text = _run_review_with_retry(diff_text)
+        review_result, review_text = _run_review_with_retry(diff_text, debug_task_dir=task_dir if debug else None)
 
         review_attempt_path = task_dir / f"review-attempt-{attempt}.txt"
         _write_text(review_attempt_path, review_text)
@@ -1404,7 +1455,7 @@ def run_task_mode_a(
             },
         )
         review_t0 = time.monotonic()
-        review_result, review_text = _run_review_with_retry(diff_text)
+        review_result, review_text = _run_review_with_retry(diff_text, debug_task_dir=dbg_dir)
         review_dt = round(time.monotonic() - review_t0, 2)
 
         _dbg(

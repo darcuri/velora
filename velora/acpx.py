@@ -466,18 +466,19 @@ def _review_text_valid(review_text: str) -> bool:
     return True
 
 
+GEMINI_REVIEW_PROMPT_PREFIX = (
+    "Review the code diff for correctness/regressions. Output either: \n"
+    "- exactly one line starting with 'OK:' if you find no issues, OR\n"
+    "- 1–5 bullet lines, each starting with 'BLOCKER:' or 'NIT:'.\n"
+    "Use 'BLOCKER:' ONLY when the diff itself proves a serious issue (crash, test failure, incorrect behavior, data loss, or security flaw). "
+    "If you're not sure, use 'NIT:' instead.\n"
+    "Do not speculate beyond the diff.\n"
+    "Every line must be a complete sentence ending with a period.\n\n"
+)
+
+
 def run_gemini_review(diff_text: str) -> CmdResult:
     # Keep the prompt strict: short, complete, and actionable.
-    prompt_prefix = (
-        "Review the code diff for correctness/regressions. Output either: \n"
-        "- exactly one line starting with 'OK:' if you find no issues, OR\n"
-        "- 1–5 bullet lines, each starting with 'BLOCKER:' or 'NIT:'.\n"
-        "Use 'BLOCKER:' ONLY when the diff itself proves a serious issue (crash, test failure, incorrect behavior, data loss, or security flaw). "
-        "If you're not sure, use 'NIT:' instead.\n"
-        "Do not speculate beyond the diff.\n"
-        "Every line must be a complete sentence ending with a period.\n\n"
-    )
-
     env = os.environ.copy()
     api_key = get_vault_key("GEMINI_API_KEY", env=env)
 
@@ -494,23 +495,35 @@ def run_gemini_review(diff_text: str) -> CmdResult:
         diff_trimmed = diff_trimmed[:max_diff_chars] + "\n\n[diff truncated]\n"
 
     last_err = ""
+    malformed_text = ""
+    malformed_model = ""
     for model in models:
         try:
             text = _gemini_generate_content(
                 api_key=api_key,
                 model=model,
-                prompt=prompt_prefix + diff_trimmed,
+                prompt=GEMINI_REVIEW_PROMPT_PREFIX + diff_trimmed,
                 max_output_tokens=max_output_tokens,
             ).strip()
 
             if not _review_text_valid(text):
                 last_err = f"Gemini review did not match required format using model {model}: {text[:200]!r}"
+                if text:
+                    malformed_text = text
+                    malformed_model = model
                 continue
 
             return CmdResult(returncode=0, stdout=text + "\n", stderr="")
         except Exception as exc:  # noqa: BLE001
             last_err = f"Gemini review failed using model {model}: {exc}"
             continue
+
+    if malformed_text:
+        return CmdResult(
+            returncode=0,
+            stdout=malformed_text + "\n",
+            stderr=f"Gemini review malformed format using model {malformed_model}",
+        )
 
     return CmdResult(returncode=1, stdout="", stderr=last_err or "Gemini review failed")
 

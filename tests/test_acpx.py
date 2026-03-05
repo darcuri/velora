@@ -104,6 +104,31 @@ class TestAcpxDiscovery(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertIn("OK:", res.stdout)
 
+    def test_run_gemini_review_returns_raw_text_for_malformed_format(self):
+        class DummyResp:
+            def __init__(self, payload: str):
+                self._payload = payload.encode("utf-8")
+
+            def read(self):
+                return self._payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        fake_payload = '{"candidates":[{"content":{"parts":[{"text":"Looks good overall but missing required prefix"}]}}]}'
+
+        with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
+            "velora.acpx.urllib.request.urlopen", return_value=DummyResp(fake_payload)
+        ):
+            res = run_gemini_review("diff")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Looks good overall", res.stdout)
+        self.assertIn("malformed format", res.stderr)
+
     def test_review_has_blocker_parses_lines(self):
         self.assertTrue(review_has_blocker("BLOCKER: This will crash."))
         self.assertTrue(review_has_blocker("- BLOCKER: This will crash."))
