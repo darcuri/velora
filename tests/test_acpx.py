@@ -129,6 +129,28 @@ class TestAcpxDiscovery(unittest.TestCase):
         self.assertIn("Looks good overall", res.stdout)
         self.assertIn("malformed format", res.stderr)
 
+    def test_run_gemini_review_prompt_is_strictly_non_explanatory(self):
+        seen: dict[str, str] = {}
+
+        def fake_generate_content(*, api_key, model, prompt, max_output_tokens):
+            seen["prompt"] = prompt
+            return "OK: Looks good."
+
+        with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
+            "velora.acpx._gemini_generate_content", side_effect=fake_generate_content
+        ):
+            res = run_gemini_review("diff with orbital math")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("strict code-review classifier, not a tutor or explainer", seen["prompt"])
+        self.assertIn("Do not explain math, formulas, or algorithms from the diff.", seen["prompt"])
+        self.assertIn("If you are tempted to be more helpful than that, stop and emit the required format instead.", seen["prompt"])
+        self.assertIn(
+            "Even if the diff contains mathematical notation or scientific code, do not translate it into prose or symbolic notation.",
+            seen["prompt"],
+        )
+        self.assertTrue(seen["prompt"].endswith("diff with orbital math"))
+
     def test_review_has_blocker_parses_lines(self):
         self.assertTrue(review_has_blocker("BLOCKER: This will crash."))
         self.assertTrue(review_has_blocker("- BLOCKER: This will crash."))

@@ -467,13 +467,18 @@ def _review_text_valid(review_text: str) -> bool:
 
 
 GEMINI_REVIEW_PROMPT_PREFIX = (
-    "Review the code diff for correctness/regressions. Output either: \n"
+    "Review the code diff for correctness/regressions. You are a strict code-review classifier, not a tutor or explainer. Output either: \n"
     "- exactly one line starting with 'OK:' if you find no issues, OR\n"
     "- 1–5 bullet lines, each starting with 'BLOCKER:' or 'NIT:'.\n"
     "Use 'BLOCKER:' ONLY when the diff itself proves a serious issue (crash, test failure, incorrect behavior, data loss, or security flaw). "
     "If you're not sure, use 'NIT:' instead.\n"
     "Do not speculate beyond the diff.\n"
-    "Every line must be a complete sentence ending with a period.\n\n"
+    "Do not summarize, restate, derive, or elaborate on the code.\n"
+    "Do not explain math, formulas, or algorithms from the diff.\n"
+    "Do not quote or paraphrase the diff unless needed for a specific BLOCKER or NIT.\n"
+    "If you are tempted to be more helpful than that, stop and emit the required format instead.\n"
+    "Even if the diff contains mathematical notation or scientific code, do not translate it into prose or symbolic notation.\n"
+    "Every line must be a complete sentence ending with a period. Any other output is invalid.\n\n"
 )
 
 
