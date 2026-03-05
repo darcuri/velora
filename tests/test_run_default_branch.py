@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -94,6 +95,69 @@ class TestRunUsesDefaultBranch(unittest.TestCase):
         mock_checkout.assert_called_once()
         self.assertEqual(mock_gh.create_pull_request.call_args.kwargs["base"], "release")
         self.assertEqual(mock_diff.call_args.args[1], "release")
+
+    def test_mode_a_outage_classification_avoids_second_delegation(self):
+        mock_gh = MagicMock()
+        mock_gh.get_default_branch.return_value = "develop"
+        mock_gh.create_pull_request.return_value = {"html_url": "https://example/pr/1", "number": 1}
+        mock_gh.get_check_runs.return_value = {"check_runs": [{"status": "queued", "conclusion": None}]}
+        coord = SimpleNamespace(
+            decision="execute_work_item",
+            reason="do it",
+            selected_specialist=SimpleNamespace(role="implementer", runner="codex"),
+            work_item=SimpleNamespace(id="WI-0001", kind="implement"),
+        )
+        coord_run = SimpleNamespace(response=coord, cmd=SimpleNamespace(usage=None))
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.GitHubClient.from_env", return_value=mock_gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=[coord_run, coord_run]) as mock_coord,
+            patch("velora.run.build_worker_prompt_v1", return_value="prompt"),
+            patch("velora.run.run_codex", return_value=CmdResult(0, "BRANCH: velora/task123\nHEAD_SHA: abc123\nSUMMARY: shipped\n", "")),
+            patch("velora.run._poll_ci", return_value=("failure", "stuck-no-progress")),
+            patch("velora.run.time.sleep", return_value=None),
+        ):
+            result = run_task("octocat/velora", "feature", RunSpec(task="task text", max_attempts=3), use_coordinator=True)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("CI outage suspected", result["summary"])
+        self.assertEqual(mock_coord.call_count, 1)
+
+    def test_mode_a_code_failure_still_retries_with_delegation(self):
+        mock_gh = MagicMock()
+        mock_gh.get_default_branch.return_value = "develop"
+        mock_gh.create_pull_request.return_value = {"html_url": "https://example/pr/1", "number": 1}
+        mock_gh.get_check_runs.return_value = {"check_runs": [{"status": "completed", "conclusion": "failure", "output": {"summary": "tests failed"}}]}
+        coord = SimpleNamespace(
+            decision="execute_work_item",
+            reason="do it",
+            selected_specialist=SimpleNamespace(role="implementer", runner="codex"),
+            work_item=SimpleNamespace(id="WI-0001", kind="implement"),
+        )
+        coord_run = SimpleNamespace(response=coord, cmd=SimpleNamespace(usage=None))
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.GitHubClient.from_env", return_value=mock_gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=[coord_run, coord_run]) as mock_coord,
+            patch("velora.run.build_worker_prompt_v1", return_value="prompt"),
+            patch("velora.run.run_codex", return_value=CmdResult(0, "BRANCH: velora/task123\nHEAD_SHA: abc123\nSUMMARY: shipped\n", "")),
+            patch("velora.run._poll_ci", return_value=("failure", "check-runs=failure")),
+        ):
+            run_task("octocat/velora", "feature", RunSpec(task="task text", max_attempts=2), use_coordinator=True)
+        self.assertEqual(mock_coord.call_count, 2)
 
 
 if __name__ == "__main__":

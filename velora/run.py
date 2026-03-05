@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -234,6 +235,92 @@ def _is_oscillating_failure_signatures(sigs: list[str]) -> bool:
         return False
     a, b, c, d = sigs[-4:]
     return a == c and b == d and a != b
+
+
+def _parse_iso8601(ts: object) -> datetime | None:
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _classify_ci_failure(
+    ci_state: str,
+    ci_detail: str,
+    checks_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    checks = checks_payload.get("check_runs", []) if isinstance(checks_payload, dict) else []
+    runs = checks if isinstance(checks, list) else []
+    infra_conclusions = {"cancelled", "timed_out", "neutral", "stale", "startup_failure", "action_required"}
+    reasons: set[str] = set()
+    total = len(runs)
+    started = 0
+    queued = 0
+    real_fail = 0
+    infra_fail = 0
+    output_evidence = 0
+    nonzero_runtime = 0
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        st = str(run.get("status") or "").lower()
+        if st in {"queued", "requested", "pending", "waiting"}:
+            queued += 1
+        if run.get("started_at"):
+            started += 1
+        c = str(run.get("conclusion") or "").lower()
+        if c == "failure":
+            real_fail += 1
+        elif c in infra_conclusions:
+            infra_fail += 1
+        out = run.get("output")
+        if isinstance(out, dict) and (str(out.get("summary") or "").strip() or str(out.get("title") or "").strip()):
+            output_evidence += 1
+        a = _parse_iso8601(run.get("started_at"))
+        b = _parse_iso8601(run.get("completed_at"))
+        if a and b and (b - a).total_seconds() >= 5:
+            nonzero_runtime += 1
+    if total > 0 and started == 0:
+        reasons.add("queued_never_started")
+    if ci_detail == "stuck-no-progress":
+        reasons.add("poll_stuck_no_progress")
+    if real_fail > 0:
+        reasons.add("explicit_failure_conclusion")
+    if output_evidence > 0:
+        reasons.add("failure_output_present")
+    if infra_fail > 0 and real_fail == 0:
+        reasons.add("infra_like_conclusions")
+
+    classification = "unknown"
+    confidence = "low"
+    if real_fail > 0 or output_evidence > 0:
+        classification, confidence = "code_failure", "high"
+    elif ("queued_never_started" in reasons and "poll_stuck_no_progress" in reasons) or (
+        infra_fail > 0 and real_fail == 0 and nonzero_runtime == 0 and output_evidence == 0
+    ):
+        classification, confidence = "infra_outage", "high"
+    elif infra_fail > 0 and real_fail == 0:
+        classification, confidence = "infra_outage", "medium"
+    return {
+        "classification": classification,
+        "confidence": confidence,
+        "reason_codes": sorted(reasons),
+        "evidence": {
+            "check_runs_total": total,
+            "started_runs": started,
+            "queued_runs": queued,
+            "real_failure_runs": real_fail,
+            "infra_like_runs": infra_fail,
+            "output_evidence_runs": output_evidence,
+            "runtime_ge_5s_runs": nonzero_runtime,
+            "ci_state": ci_state,
+        },
+    }
 
 
 def _build_codex_prompt(
@@ -1148,6 +1235,52 @@ def run_task_mode_a(
         work_items = hist.setdefault("work_items_executed", [])
 
         if ci_state != "success":
+            ci_checks: dict[str, Any] = {}
+            ci_class = _classify_ci_failure(ci_state, ci_detail, None)
+            infra_retries = 0
+            while True:
+                if str(record.get("head_sha") or "").strip():
+                    try:
+                        payload = gh.get_check_runs(owner, repo, str(record.get("head_sha")))
+                        if isinstance(payload, dict):
+                            ci_checks = payload
+                    except Exception as exc:  # noqa: BLE001
+                        _dbg(dbg_dir, "ci_check_runs_error", {"iteration": attempt, "detail": str(exc)})
+                ci_class = _classify_ci_failure(ci_state, ci_detail, ci_checks)
+                _dbg(
+                    dbg_dir,
+                    "ci_classification",
+                    {"iteration": attempt, "ci_detail": ci_detail, **ci_class},
+                )
+                if ci_state == "success" or ci_class["classification"] != "infra_outage" or infra_retries >= 2:
+                    break
+                infra_retries += 1
+                backoff = 30 * infra_retries
+                _append_text(ci_log, f"[{now_iso()}] infra-outage suspected; backoff {backoff}s before retry {infra_retries}/2")
+                time.sleep(backoff)
+                ci_state, ci_detail = _poll_ci(
+                    gh,
+                    owner,
+                    repo,
+                    str(record["head_sha"]),
+                    ci_log,
+                    poll_seconds=45,
+                    stuck_warn_seconds=20 * 60,
+                    stuck_fail_seconds=45 * 60,
+                )
+                _append_text(ci_log, f"[{now_iso()}] infra-retry result {ci_state}: {ci_detail}")
+
+            if ci_state != "success" and ci_class["classification"] == "infra_outage":
+                return _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=(
+                        "CI outage suspected after retries; no code/workflow FIRE attempted "
+                        f"(reasons={','.join(ci_class['reason_codes']) or 'none'})"
+                    ),
+                )
+
             failure_sig = f"ci:{ci_detail}"
             no_prog = int(hist.get("no_progress_streak") or 0)
             no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
