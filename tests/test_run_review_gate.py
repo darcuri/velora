@@ -15,6 +15,7 @@ def _codex_footer(branch: str, sha: str, summary: str = "shipped") -> str:
 class TestRunReviewGate(unittest.TestCase):
     def _base_patches(self, mock_gh: MagicMock):
         return (
+            patch("velora.run.validate_repo_allowed", return_value=("darcuri", "velora")),
             patch("velora.run.GitHubClient.from_env", return_value=mock_gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
             patch("velora.run.build_task_id", return_value="task123"),
