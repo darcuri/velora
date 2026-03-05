@@ -31,6 +31,18 @@ _FINDING_LINE_RE = re.compile(
 _REVIEW_DEBUG_MAX_DIFF_PREVIEW_CHARS = 1500
 _REVIEW_DEBUG_MAX_REVIEW_PREVIEW_CHARS = 400
 
+_INTERNAL_FAULT_ENABLE_ENV = "VELORA_INTERNAL_DANGEROUS_FAULT_INJECTION_ENABLE"
+_INTERNAL_FAULT_CHECKPOINT_ENV = "VELORA_INTERNAL_DANGEROUS_FAULT_INJECTION_CHECKPOINT"
+_INTERNAL_FAULT_ENABLE_VALUE = "I_UNDERSTAND_THIS_WILL_CRASH_VELORA"
+
+CHECKPOINT_AFTER_PR_CREATED = "after_pr_created"
+CHECKPOINT_AFTER_CI_SUCCESS_BEFORE_REVIEW = "after_ci_success_before_review"
+CHECKPOINT_AFTER_REVIEW_RESOLUTION = "after_review_resolution"
+
+
+class InternalFaultInjectionTriggered(RuntimeError):
+    pass
+
 
 def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
     proc = subprocess.run(
@@ -43,6 +55,44 @@ def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{proc.stderr.strip()}")
     return proc.stdout
+
+
+def _configured_fault_checkpoints() -> set[str]:
+    raw = os.environ.get(_INTERNAL_FAULT_CHECKPOINT_ENV, "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _maybe_inject_internal_fault(*, checkpoint: str, task_id: str) -> None:
+    enabled = os.environ.get(_INTERNAL_FAULT_ENABLE_ENV, "").strip()
+    if enabled != _INTERNAL_FAULT_ENABLE_VALUE:
+        return
+
+    checkpoints = _configured_fault_checkpoints()
+    if checkpoint not in checkpoints:
+        return
+
+    raise InternalFaultInjectionTriggered(
+        f"Internal fault injection triggered at checkpoint={checkpoint} for task_id={task_id}. "
+        f"This is test-only and intentionally interrupts the run."
+    )
+
+
+def _persist_record_checkpoint(
+    record: dict[str, Any],
+    *,
+    home: Path,
+    checkpoint: str,
+    updates: dict[str, Any] | None = None,
+) -> None:
+    if updates:
+        record.update(updates)
+
+    ts = now_iso()
+    record["persisted_checkpoint"] = checkpoint
+    record["persisted_checkpoint_at"] = ts
+    record["updated_at"] = ts
+    upsert_task(record, home=home)
+    _maybe_inject_internal_fault(checkpoint=checkpoint, task_id=str(record.get("task_id") or ""))
 
 
 def _usd_equiv_rate_per_1m_tokens() -> float:
@@ -674,6 +724,7 @@ def resume_task(task_id: str, home: Path | None = None, *, debug: bool = False) 
         )
         task["pr_url"] = pr["html_url"]
         task["pr_number"] = pr["number"]
+        _persist_record_checkpoint(task, home=base_home, checkpoint=CHECKPOINT_AFTER_PR_CREATED)
 
     # Poll CI.
     ci_log = task_dir / "ci-resume.log"
@@ -695,6 +746,13 @@ def resume_task(task_id: str, home: Path | None = None, *, debug: bool = False) 
             "ci_detail": ci_detail,
         }
 
+    _persist_record_checkpoint(
+        task,
+        home=base_home,
+        checkpoint=CHECKPOINT_AFTER_CI_SUCCESS_BEFORE_REVIEW,
+        updates={"ci_state": ci_state, "ci_detail": ci_detail},
+    )
+
     # Review gate.
     diff_text = _read_diff_for_review(repo_path, base_branch, head_sha)
     review_result, review_text = _run_review_with_retry(diff_text, debug_task_dir=task_dir if debug else None)
@@ -710,8 +768,12 @@ def resume_task(task_id: str, home: Path | None = None, *, debug: bool = False) 
     else:
         task["status"] = "ready"
 
-    task["updated_at"] = now_iso()
-    upsert_task(task, home=base_home)
+    _persist_record_checkpoint(
+        task,
+        home=base_home,
+        checkpoint=CHECKPOINT_AFTER_REVIEW_RESOLUTION,
+        updates={"review_result": review_result},
+    )
 
     return {
         "task_id": task_id,
@@ -827,8 +889,7 @@ def run_task_legacy(
             )
             record["pr_url"] = pr["html_url"]
             record["pr_number"] = pr["number"]
-            record["updated_at"] = now_iso()
-            upsert_task(record, home=base_home)
+            _persist_record_checkpoint(record, home=base_home, checkpoint=CHECKPOINT_AFTER_PR_CREATED)
 
         ci_log = task_dir / f"ci-attempt-{attempt}.log"
         _append_text(ci_log, f"[{now_iso()}] polling CI for {footer['head_sha']}")
@@ -852,6 +913,13 @@ def run_task_legacy(
             fix_context = f"Attempt {attempt} CI failure detail: {ci_detail}"
             continue
 
+        _persist_record_checkpoint(
+            record,
+            home=base_home,
+            checkpoint=CHECKPOINT_AFTER_CI_SUCCESS_BEFORE_REVIEW,
+            updates={"ci_state": ci_state, "ci_detail": ci_detail},
+        )
+
         diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
         review_result, review_text = _run_review_with_retry(diff_text, debug_task_dir=task_dir if debug else None)
 
@@ -864,8 +932,12 @@ def run_task_legacy(
 
         if review_result in {"tool-error", "malformed"}:
             record["status"] = "not-ready"
-            record["updated_at"] = now_iso()
-            upsert_task(record, home=base_home)
+            _persist_record_checkpoint(
+                record,
+                home=base_home,
+                checkpoint=CHECKPOINT_AFTER_REVIEW_RESOLUTION,
+                updates={"review_result": review_result},
+            )
             return {
                 "task_id": task_id,
                 "status": record["status"],
@@ -880,8 +952,12 @@ def run_task_legacy(
         if review_result == "blocker":
             if attempt == max_attempts:
                 record["status"] = "not-ready"
-                record["updated_at"] = now_iso()
-                upsert_task(record, home=base_home)
+                _persist_record_checkpoint(
+                    record,
+                    home=base_home,
+                    checkpoint=CHECKPOINT_AFTER_REVIEW_RESOLUTION,
+                    updates={"review_result": review_result},
+                )
                 return {
                     "task_id": task_id,
                     "status": record["status"],
@@ -897,8 +973,12 @@ def run_task_legacy(
             continue
 
         record["status"] = "ready"
-        record["updated_at"] = now_iso()
-        upsert_task(record, home=base_home)
+        _persist_record_checkpoint(
+            record,
+            home=base_home,
+            checkpoint=CHECKPOINT_AFTER_REVIEW_RESOLUTION,
+            updates={"review_result": review_result},
+        )
         return {
             "task_id": task_id,
             "status": record["status"],
@@ -1295,8 +1375,7 @@ def run_task_mode_a(
 
             record["pr_url"] = pr["html_url"]
             record["pr_number"] = pr["number"]
-            record["updated_at"] = now_iso()
-            upsert_task(record, home=base_home)
+            _persist_record_checkpoint(record, home=base_home, checkpoint=CHECKPOINT_AFTER_PR_CREATED)
             _dbg(
                 dbg_dir,
                 "pr_created",
@@ -1444,6 +1523,13 @@ def run_task_mode_a(
             continue
 
         # CI success → review gate.
+        _persist_record_checkpoint(
+            record,
+            home=base_home,
+            checkpoint=CHECKPOINT_AFTER_CI_SUCCESS_BEFORE_REVIEW,
+            updates={"ci_state": ci_state, "ci_detail": ci_detail},
+        )
+
         diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
         _dbg(
             dbg_dir,
@@ -1553,8 +1639,12 @@ def run_task_mode_a(
         )
 
         record["status"] = "ready"
-        record["updated_at"] = now_iso()
-        upsert_task(record, home=base_home)
+        _persist_record_checkpoint(
+            record,
+            home=base_home,
+            checkpoint=CHECKPOINT_AFTER_REVIEW_RESOLUTION,
+            updates={"review_result": review_result},
+        )
         _dbg(
             dbg_dir,
             "run_done",

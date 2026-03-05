@@ -50,3 +50,13 @@ Velora uses ACPX to run Codex for implementation. Ensure you have:
 - Docs-only changes (`docs/**`, `README.md`) run the lightweight `docs` workflow.
 - Code changes run the `test` workflow.
 - Mixed changes run both.
+
+## Internal fault injection
+
+This repo includes a test-only crash hook for resume-path dogfooding. It is intentionally dangerous and must not be treated as a user feature.
+
+- Primary gate: `VELORA_INTERNAL_DANGEROUS_FAULT_INJECTION_ENABLE=I_UNDERSTAND_THIS_WILL_CRASH_VELORA`
+- Checkpoint selector: `VELORA_INTERNAL_DANGEROUS_FAULT_INJECTION_CHECKPOINT=<checkpoint>[,<checkpoint>...]`
+- Current internal checkpoints include `after_pr_created`, `after_ci_success_before_review`, and `after_review_resolution`.
+
+The hook persists task state before raising, so it is suitable only for local testing of interruption and `velora resume` recovery. Do not set these env vars in normal usage, shared shells, CI, or documentation aimed at end users.
