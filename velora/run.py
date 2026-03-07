@@ -325,6 +325,88 @@ def _parse_worker_work_result(output: str, *, expected_work_item_id: str) -> Wor
     return result
 
 
+def _work_result_artifact(work_result: WorkResult) -> dict[str, Any]:
+    return {
+        "protocol_version": work_result.protocol_version,
+        "work_item_id": work_result.work_item_id,
+        "status": work_result.status,
+        "summary": work_result.summary,
+        "branch": work_result.branch,
+        "head_sha": work_result.head_sha,
+        "files_touched": list(work_result.files_touched),
+        "tests_run": [
+            {"command": t.command, "status": t.status, "details": t.details}
+            for t in work_result.tests_run
+        ],
+        "blockers": list(work_result.blockers),
+        "follow_up": list(work_result.follow_up),
+        "evidence": list(work_result.evidence),
+    }
+
+
+def _set_evaluation_state(
+    request: dict[str, Any],
+    *,
+    status: str,
+    outcome: str,
+    worker_result: WorkResult | None,
+    ci_state: str | None = None,
+    ci_detail: str | None = None,
+    review_result: str | None = None,
+    failing_checks: list[dict[str, Any]] | None = None,
+    logs_excerpt: str = "",
+) -> None:
+    request["evaluation"] = {
+        "status": status,
+        "outcome": outcome,
+        "worker_result_status": (worker_result.status if worker_result is not None else None),
+        "ci_state": ci_state,
+        "ci_detail": ci_detail or "",
+        "review_result": review_result,
+        "failing_checks": failing_checks or [],
+        "logs_excerpt": logs_excerpt,
+    }
+
+
+def _append_iteration_history_entry(
+    request: dict[str, Any],
+    *,
+    iteration: int,
+    work_item: Any,
+    selected_specialist: Any,
+    worker_result: WorkResult,
+    outcome: str,
+    ci: dict[str, Any] | None = None,
+    review: dict[str, Any] | None = None,
+) -> None:
+    hist = request.setdefault("history", {})
+    work_items = hist.setdefault("work_items_executed", [])
+    acceptance = getattr(work_item, "acceptance", None)
+    gates = getattr(acceptance, "gates", []) if acceptance is not None else []
+    work_items.append(
+        {
+            "iteration": iteration,
+            "work_item": {
+                "id": work_item.id,
+                "kind": work_item.kind,
+                "rationale": getattr(work_item, "rationale", ""),
+                "acceptance_gates": list(gates),
+            },
+            "selected_specialist": {
+                "role": selected_specialist.role,
+                "runner": selected_specialist.runner,
+                "model": getattr(selected_specialist, "model", None),
+            },
+            "artifacts": {
+                "worker_result": _work_result_artifact(worker_result),
+                "ci": ci,
+                "review": review,
+            },
+            "outcome": outcome,
+        }
+    )
+
+
 def _is_oscillating_failure_signatures(sigs: list[str]) -> bool:
     """Detect a simple ABAB oscillation in the last 4 failure signatures."""
 
@@ -1137,9 +1219,17 @@ def run_task_mode_a(
             "last_commit": "",
             "diff_summary": "",
             "notes": [f"created_at={now_iso()}", f"verb={verb}"],
+            "latest_worker_result": None,
+            "latest_ci": None,
+            "latest_review": None,
         },
         "evaluation": {
             "status": "none",
+            "outcome": "none",
+            "worker_result_status": None,
+            "ci_state": None,
+            "ci_detail": "",
+            "review_result": None,
             "failing_checks": [],
             "logs_excerpt": "",
         },
@@ -1408,14 +1498,9 @@ def run_task_mode_a(
         # Update coordinator state snapshot.
         request.setdefault("state", {})
         request["state"]["last_commit"] = work_result.head_sha
-        request["state"]["notes"] = list(request["state"].get("notes") or [])
-        request["state"]["notes"].append(f"work_result.status={work_result.status}")
-        request["state"]["notes"].append(f"work_result.summary={work_result.summary}")
-        for item in work_result.evidence:
-            request["state"]["notes"].append(f"evidence={item}")
-        del request["state"]["notes"][:-20]
+        request["state"]["diff_summary"] = work_result.summary
+        request["state"]["latest_worker_result"] = _work_result_artifact(work_result)
         hist = request.setdefault("history", {})
-        work_items = hist.setdefault("work_items_executed", [])
 
         if work_result.status != "completed":
             failure_sig = f"worker:{work_result.status}:{'|'.join(work_result.blockers)}"
@@ -1448,9 +1533,12 @@ def run_task_mode_a(
                     ),
                 )
 
-            request["evaluation"] = {
-                "status": "fail",
-                "failing_checks": [
+            _set_evaluation_state(
+                request,
+                status="fail",
+                outcome=f"worker_{work_result.status}",
+                worker_result=work_result,
+                failing_checks=[
                     {
                         "name": "worker",
                         "kind": "worker",
@@ -1458,24 +1546,15 @@ def run_task_mode_a(
                         "summary": "; ".join(work_result.blockers),
                     }
                 ],
-                "logs_excerpt": "; ".join(work_result.blockers),
-            }
-            work_items.append(
-                {
-                    "id": coord_resp.work_item.id,
-                    "kind": coord_resp.work_item.kind,
-                    "result": "fail",
-                    "patch_suggestion": {
-                        "progress": "none" if no_prog > 1 else "some",
-                        "evidence": [
-                            f"worker_status={work_result.status}",
-                            *work_result.blockers,
-                            *work_result.follow_up,
-                            *work_result.evidence,
-                        ],
-                        "next_guess": "unblock worker-reported issue",
-                    },
-                }
+                logs_excerpt="; ".join(work_result.blockers),
+            )
+            _append_iteration_history_entry(
+                request,
+                iteration=attempt,
+                work_item=coord_resp.work_item,
+                selected_specialist=coord_resp.selected_specialist,
+                worker_result=work_result,
+                outcome=f"worker_{work_result.status}",
             )
             continue
 
@@ -1630,33 +1709,37 @@ def run_task_mode_a(
                     ),
                 )
 
-            request["evaluation"] = {
-                "status": "fail",
-                "failing_checks": [{"name": "ci", "kind": "ci", "url": record.get("pr_url"), "summary": ci_detail}],
-                "logs_excerpt": ci_detail,
+            ci_artifact = {
+                "state": ci_state,
+                "detail": ci_detail,
+                "classification": ci_class,
             }
-            work_items.append(
-                {
-                    "id": coord_resp.work_item.id,
-                    "kind": coord_resp.work_item.kind,
-                    "result": "fail",
-                    "patch_suggestion": {
-                        "progress": "none" if no_prog > 1 else "some",
-                        "evidence": [
-                            f"worker_status={work_result.status}",
-                            f"ci_state={ci_state}",
-                            f"ci_detail={ci_detail}",
-                            *work_result.blockers,
-                            *work_result.follow_up,
-                            *work_result.evidence,
-                        ],
-                        "next_guess": "repair failing CI checks",
-                    },
-                }
+            request.setdefault("state", {})
+            request["state"]["latest_ci"] = ci_artifact
+            _set_evaluation_state(
+                request,
+                status="fail",
+                outcome="ci_failure",
+                worker_result=work_result,
+                ci_state=ci_state,
+                ci_detail=ci_detail,
+                failing_checks=[{"name": "ci", "kind": "ci", "url": record.get("pr_url"), "summary": ci_detail}],
+                logs_excerpt=ci_detail,
+            )
+            _append_iteration_history_entry(
+                request,
+                iteration=attempt,
+                work_item=coord_resp.work_item,
+                selected_specialist=coord_resp.selected_specialist,
+                worker_result=work_result,
+                outcome="ci_failure",
+                ci=ci_artifact,
             )
             continue
 
         # CI success → review gate.
+        request.setdefault("state", {})
+        request["state"]["latest_ci"] = {"state": ci_state, "detail": ci_detail, "classification": None}
         _persist_record_checkpoint(
             record,
             home=base_home,
@@ -1734,42 +1817,59 @@ def run_task_mode_a(
                     ),
                 )
 
-            request["evaluation"] = {
-                "status": "fail",
-                "failing_checks": [{"name": "review", "kind": "review", "url": record.get("pr_url"), "summary": review_text[:2000]}],
-                "logs_excerpt": review_text[:2000],
-            }
-            work_items.append(
-                {
-                    "id": coord_resp.work_item.id,
-                    "kind": coord_resp.work_item.kind,
-                    "result": "fail",
-                    "patch_suggestion": {
-                        "progress": "none" if no_prog > 1 else "some",
-                        "evidence": [detail, f"worker_status={work_result.status}", *work_result.evidence],
-                        "next_guess": "address review blockers",
-                    },
-                }
+            review_artifact = {"result": review_result, "summary": review_text[:2000]}
+            request.setdefault("state", {})
+            request["state"]["latest_review"] = review_artifact
+            _set_evaluation_state(
+                request,
+                status="fail",
+                outcome=detail,
+                worker_result=work_result,
+                ci_state=ci_state,
+                ci_detail=ci_detail,
+                review_result=review_result,
+                failing_checks=[{"name": "review", "kind": "review", "url": record.get("pr_url"), "summary": review_text[:2000]}],
+                logs_excerpt=review_text[:2000],
+            )
+            _append_iteration_history_entry(
+                request,
+                iteration=attempt,
+                work_item=coord_resp.work_item,
+                selected_specialist=coord_resp.selected_specialist,
+                worker_result=work_result,
+                outcome=detail,
+                ci={"state": ci_state, "detail": ci_detail, "classification": None},
+                review=review_artifact,
             )
             continue
 
         # Success.
-        request["evaluation"] = {"status": "success", "failing_checks": [], "logs_excerpt": ""}
+        request.setdefault("state", {})
+        request["state"]["latest_review"] = {"result": review_result, "summary": review_text[:2000]}
+        _set_evaluation_state(
+            request,
+            status="success",
+            outcome="accepted",
+            worker_result=work_result,
+            ci_state=ci_state,
+            ci_detail=ci_detail,
+            review_result=review_result,
+            failing_checks=[],
+            logs_excerpt="",
+        )
         hist["no_progress_streak"] = 0
         hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
         hist.pop("failure_signatures", None)
         last_failure_sig = None
-        work_items.append(
-            {
-                "id": coord_resp.work_item.id,
-                "kind": coord_resp.work_item.kind,
-                "result": "pass",
-                "patch_suggestion": {
-                    "progress": "clear",
-                    "evidence": ["ci_success", "review_clear"],
-                    "next_guess": "",
-                },
-            }
+        _append_iteration_history_entry(
+            request,
+            iteration=attempt,
+            work_item=coord_resp.work_item,
+            selected_specialist=coord_resp.selected_specialist,
+            worker_result=work_result,
+            outcome="accepted",
+            ci={"state": ci_state, "detail": ci_detail, "classification": None},
+            review={"result": review_result, "summary": review_text[:2000]},
         )
 
         record["status"] = "ready"
