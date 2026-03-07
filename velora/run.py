@@ -16,7 +16,7 @@ from .config import get_config
 from .constants import VALID_VERBS
 from .coordinator import run_coordinator_v1_with_cmd
 from .github import GitHubClient
-from .orchestrator import coordinator_session_name
+from .orchestrator import coordinator_session_name, worker_session_name
 from .repo import ensure_repo_checkout, validate_repo_allowed
 from .spec import RunSpec
 from .state import get_task, upsert_task
@@ -1246,9 +1246,8 @@ def run_task_mode_a(
             # Protocol should prevent this.
             raise RuntimeError(f"Unsupported worker runner: {worker_runner}")
 
-        # One stable worker session per repo/runner.
-        session_prefix = cfg.codex_session_prefix if worker_runner == "codex" else cfg.claude_session_prefix
-        worker_session = f"{session_prefix}{repo_slug(owner, repo)}"
+        # One stable worker session per run/runner.
+        worker_session = worker_session_name(owner, repo, task_id, worker_runner)
 
         prompt = build_worker_prompt_v1(
             repo_ref=repo_ref,
