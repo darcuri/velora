@@ -35,6 +35,8 @@ class TestWorkerPrompt(unittest.TestCase):
             run_id="run-1",
             iteration=1,
             work_branch="velora/run-1",
+            work_item_path="/tmp/repo/.velora/exchange/runs/run-1/WI-0001/work-item.json",
+            result_path="/tmp/repo/.velora/exchange/runs/run-1/WI-0001/result.json",
             work_item=resp.work_item,
         )
         self.assertIn("Checkout branch velora/run-1", prompt)
@@ -44,7 +46,12 @@ class TestWorkerPrompt(unittest.TestCase):
         self.assertIn("Do not run git push.", prompt)
         self.assertIn("Velora task truth lives in orchestrator-owned task artifacts", prompt)
         self.assertIn("Do not claim tests passed unless you actually ran them.", prompt)
-        self.assertIn("Return exactly one JSON object, and nothing else", prompt)
+        self.assertIn("Read the local assignment snapshot from: /tmp/repo/.velora/exchange/runs/run-1/WI-0001/work-item.json", prompt)
+        self.assertIn("Write exactly one final outcome file, and only one:", prompt)
+        self.assertIn("result.json path: /tmp/repo/.velora/exchange/runs/run-1/WI-0001/result.json", prompt)
+        self.assertIn("handoff.json path: /tmp/repo/.velora/exchange/runs/run-1/WI-0001/handoff.json", prompt)
+        self.assertIn("block.json path: /tmp/repo/.velora/exchange/runs/run-1/WI-0001/block.json", prompt)
+        self.assertIn("Use handoff.json for non-terminal success", prompt)
         self.assertIn('"work_item_id": "<string>"', prompt)
         self.assertIn("Unknown keys are forbidden", prompt)
 

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import time
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from .acpx import GEMINI_REVIEW_PROMPT_PREFIX, parse_codex_footer, run_claude, r
 from .config import get_config
 from .constants import VALID_VERBS
 from .coordinator import run_coordinator_v1_with_cmd
+from .exchange import append_event, work_item_exchange_paths, write_json
 from .github import GitHubClient
 from .orchestrator import coordinator_session_name, worker_session_name
 from .protocol import ProtocolError, WorkResult, validate_work_result
@@ -380,6 +382,52 @@ def _parse_worker_work_result(
     return result
 
 
+def _load_worker_work_result_from_file(
+    path: Path,
+    *,
+    expected_work_item_id: str,
+    expected_branch: str | None = None,
+) -> WorkResult:
+    if not path.exists():
+        raise ProtocolError(f"Worker result file missing: {path}")
+    return _parse_worker_work_result(
+        path.read_text(encoding="utf-8"),
+        expected_work_item_id=expected_work_item_id,
+        expected_branch=expected_branch,
+    )
+
+
+def _load_worker_outcome(
+    exchange_paths: dict[str, Path],
+    *,
+    expected_work_item_id: str,
+    expected_branch: str,
+) -> tuple[str, WorkResult]:
+    kinds = [kind for kind in ("result", "handoff", "block") if exchange_paths[kind].exists()]
+    if len(kinds) != 1:
+        present = ", ".join(kinds) if kinds else "none"
+        raise ProtocolError(
+            "Worker must write exactly one outcome file among result.json, handoff.json, block.json "
+            f"(present: {present})"
+        )
+
+    kind = kinds[0]
+    result = _load_worker_work_result_from_file(
+        exchange_paths[kind],
+        expected_work_item_id=expected_work_item_id,
+        expected_branch=(expected_branch if kind == "result" else None),
+    )
+
+    if kind == "result" and result.status != "completed":
+        raise ProtocolError("result.json requires status=completed")
+    if kind == "handoff" and result.status != "completed":
+        raise ProtocolError("handoff.json requires status=completed")
+    if kind == "block" and result.status == "completed":
+        raise ProtocolError("block.json requires status=blocked or status=failed")
+
+    return kind, result
+
+
 def _work_result_artifact(work_result: WorkResult) -> dict[str, Any]:
     return {
         "protocol_version": work_result.protocol_version,
@@ -397,6 +445,18 @@ def _work_result_artifact(work_result: WorkResult) -> dict[str, Any]:
         "follow_up": list(work_result.follow_up),
         "evidence": list(work_result.evidence),
     }
+
+
+def _json_compatible(value: Any) -> Any:
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return {str(k): _json_compatible(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(v) for v in value]
+    if hasattr(value, "__dict__"):
+        return {str(k): _json_compatible(v) for k, v in vars(value).items()}
+    return value
 
 
 def _set_evaluation_state(
@@ -601,6 +661,13 @@ def _write_text(path: Path, text: str) -> None:
         fh.write(text)
         if not text.endswith("\n"):
             fh.write("\n")
+
+
+def _write_worker_raw_output(path: Path, *, iteration: int, runner: str, rc: int, stdout: str, stderr: str) -> None:
+    _write_text(
+        path,
+        f"---- iteration {iteration} runner={runner} rc={rc} ----\n{stdout}\n{stderr}",
+    )
 
 
 def _dbg(task_dir: Path | None, event: str, data: dict[str, Any] | None = None) -> None:
@@ -1275,6 +1342,7 @@ def run_task_mode_a(
             "diff_summary": "",
             "notes": [f"created_at={now_iso()}", f"verb={verb}"],
             "latest_worker_result": None,
+            "latest_handoff": None,
             "latest_ci": None,
             "latest_review": None,
         },
@@ -1436,6 +1504,33 @@ def run_task_mode_a(
         # One stable worker session per run/runner.
         worker_session = worker_session_name(owner, repo, task_id, worker_runner)
 
+        exchange_paths = work_item_exchange_paths(repo_path, task_id, coord_resp.work_item.id)
+        for key in ("result", "handoff", "block", "error"):
+            if exchange_paths[key].exists():
+                exchange_paths[key].unlink()
+        write_json(exchange_paths["work_item"], _json_compatible(coord_resp.work_item))
+        write_json(
+            exchange_paths["status"],
+            {
+                "run_id": task_id,
+                "work_item_id": coord_resp.work_item.id,
+                "iteration": attempt,
+                "runner": worker_runner,
+                "status": "running",
+                "updated_at": now_iso(),
+            },
+        )
+        append_event(
+            exchange_paths["events"],
+            "work_item_dispatched",
+            {
+                "run_id": task_id,
+                "work_item_id": coord_resp.work_item.id,
+                "iteration": attempt,
+                "runner": worker_runner,
+            },
+        )
+
         prompt = build_worker_prompt_v1(
             repo_ref=repo_ref,
             verb=verb,
@@ -1443,6 +1538,8 @@ def run_task_mode_a(
             run_id=task_id,
             iteration=attempt,
             work_branch=work_branch,
+            work_item_path=str(exchange_paths["work_item"]),
+            result_path=str(exchange_paths["result"]),
             work_item=coord_resp.work_item,
         )
 
@@ -1507,11 +1604,32 @@ def run_task_mode_a(
                 detail=f"Token breaker tripped after worker: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
             )
 
-        _append_text(
-            agent_output_path,
-            f"---- iteration {attempt} runner={worker_runner} rc={agent_result.returncode} ----\n{agent_result.stdout}\n{agent_result.stderr}",
-        )
         if agent_result.returncode != 0:
+            _write_worker_raw_output(
+                exchange_paths["raw_output"],
+                iteration=attempt,
+                runner=worker_runner,
+                rc=agent_result.returncode,
+                stdout=agent_result.stdout,
+                stderr=agent_result.stderr,
+            )
+            _write_text(exchange_paths["error"], (agent_result.stderr or agent_result.stdout).strip())
+            write_json(
+                exchange_paths["status"],
+                {
+                    "run_id": task_id,
+                    "work_item_id": coord_resp.work_item.id,
+                    "iteration": attempt,
+                    "runner": worker_runner,
+                    "status": "failed",
+                    "updated_at": now_iso(),
+                },
+            )
+            append_event(
+                exchange_paths["events"],
+                "worker_nonzero_exit",
+                {"iteration": attempt, "runner": worker_runner, "rc": agent_result.returncode},
+            )
             return _fail_task(
                 record,
                 home=base_home,
@@ -1525,18 +1643,75 @@ def run_task_mode_a(
         _cleanup_repo_detritus(repo_path)
 
         try:
-            work_result = _parse_worker_work_result(
-                agent_result.stdout,
+            outcome_kind, work_result = _load_worker_outcome(
+                exchange_paths,
                 expected_work_item_id=coord_resp.work_item.id,
                 expected_branch=work_branch,
             )
         except ProtocolError as exc:
+            _write_worker_raw_output(
+                exchange_paths["raw_output"],
+                iteration=attempt,
+                runner=worker_runner,
+                rc=agent_result.returncode,
+                stdout=agent_result.stdout,
+                stderr=agent_result.stderr,
+            )
+            _write_text(exchange_paths["error"], str(exc))
+            write_json(
+                exchange_paths["status"],
+                {
+                    "run_id": task_id,
+                    "work_item_id": coord_resp.work_item.id,
+                    "iteration": attempt,
+                    "runner": worker_runner,
+                    "status": "failed",
+                    "updated_at": now_iso(),
+                },
+            )
+            append_event(
+                exchange_paths["events"],
+                "worker_protocol_failure",
+                {"iteration": attempt, "runner": worker_runner, "detail": str(exc)},
+            )
             return _fail_task(
                 record,
                 home=base_home,
                 task_dir=task_dir,
                 detail=f"Worker protocol failure on iteration {attempt}: {exc}",
             )
+
+        if debug:
+            _write_worker_raw_output(
+                exchange_paths["raw_output"],
+                iteration=attempt,
+                runner=worker_runner,
+                rc=agent_result.returncode,
+                stdout=agent_result.stdout,
+                stderr=agent_result.stderr,
+            )
+        write_json(
+            exchange_paths["status"],
+            {
+                "run_id": task_id,
+                "work_item_id": coord_resp.work_item.id,
+                "iteration": attempt,
+                "runner": worker_runner,
+                "status": ("handoff" if outcome_kind == "handoff" else work_result.status),
+                "updated_at": now_iso(),
+            },
+        )
+        append_event(
+            exchange_paths["events"],
+            "worker_outcome_loaded",
+            {
+                "iteration": attempt,
+                "runner": worker_runner,
+                "work_item_id": coord_resp.work_item.id,
+                "outcome_kind": outcome_kind,
+                "result_status": work_result.status,
+            },
+        )
 
         record["branch"] = work_result.branch
         record["head_sha"] = work_result.head_sha
@@ -1571,6 +1746,25 @@ def run_task_mode_a(
         request["state"]["diff_summary"] = work_result.summary
         request["state"]["latest_worker_result"] = _work_result_artifact(work_result)
         hist = request.setdefault("history", {})
+
+        if outcome_kind == "handoff":
+            request["state"]["latest_handoff"] = _work_result_artifact(work_result)
+            notes = request["state"].setdefault("notes", [])
+            if isinstance(notes, list):
+                notes.append(f"handoff[{coord_resp.work_item.id}]={work_result.summary}")
+                del notes[:-12]
+            hist["no_progress_streak"] = 0
+            last_failure_sig = None
+            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
+            _append_iteration_history_entry(
+                request,
+                iteration=attempt,
+                work_item=coord_resp.work_item,
+                selected_specialist=coord_resp.selected_specialist,
+                worker_result=work_result,
+                outcome="worker_handoff",
+            )
+            continue
 
         if work_result.status != "completed":
             failure_sig = f"worker:{work_result.status}:{'|'.join(work_result.blockers)}"

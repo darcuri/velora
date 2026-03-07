@@ -19,6 +19,17 @@ def _mode_a_work_result_json() -> str:
     )
 
 
+def _run_codex_writing_result(payload: str, *, repo_path: str = "/tmp/repo"):
+    result_path = Path(repo_path) / ".velora" / "exchange" / "runs" / "task123" / "WI-0001" / "result.json"
+
+    def _runner(*args, **kwargs):
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(payload, encoding="utf-8")
+        return CmdResult(0, "worker chatter", "")
+
+    return _runner
+
+
 class TestRunUsesDefaultBranch(unittest.TestCase):
     def setUp(self):
         get_config.cache_clear()
@@ -129,7 +140,7 @@ class TestRunUsesDefaultBranch(unittest.TestCase):
             patch("velora.run._append_text", return_value=None),
             patch("velora.run.run_coordinator_v1_with_cmd", side_effect=[coord_run, coord_run]) as mock_coord,
             patch("velora.run.build_worker_prompt_v1", return_value="prompt"),
-            patch("velora.run.run_codex", return_value=CmdResult(0, _mode_a_work_result_json(), "")),
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_mode_a_work_result_json())),
             patch("velora.run._poll_ci", return_value=("failure", "stuck-no-progress")),
             patch("velora.run.time.sleep", return_value=None),
         ):
@@ -162,7 +173,7 @@ class TestRunUsesDefaultBranch(unittest.TestCase):
             patch("velora.run._append_text", return_value=None),
             patch("velora.run.run_coordinator_v1_with_cmd", side_effect=[coord_run, coord_run]) as mock_coord,
             patch("velora.run.build_worker_prompt_v1", return_value="prompt"),
-            patch("velora.run.run_codex", return_value=CmdResult(0, _mode_a_work_result_json(), "")),
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_mode_a_work_result_json())),
             patch("velora.run._poll_ci", return_value=("failure", "check-runs=failure")),
         ):
             run_task("octocat/velora", "feature", RunSpec(task="task text", max_attempts=2), use_coordinator=True)

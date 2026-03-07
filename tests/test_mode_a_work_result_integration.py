@@ -63,6 +63,17 @@ def _work_result_json(*, status: str = "completed", branch: str = "velora/task12
     )
 
 
+def _run_codex_writing_result(payload: str, *, repo_path: str = "/tmp/repo", filename: str = "result.json"):
+    result_path = Path(repo_path) / ".velora" / "exchange" / "runs" / "task123" / "WI-0001" / filename
+
+    def _runner(*args, **kwargs):
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(payload, encoding="utf-8")
+        return CmdResult(0, "worker chatter", "")
+
+    return _runner
+
+
 class TestModeAWorkResultIntegration(unittest.TestCase):
     def setUp(self):
         get_config.cache_clear()
@@ -108,7 +119,7 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
             patch("velora.run.run_coordinator_v1_with_cmd", side_effect=coord_runs),
-            patch("velora.run.run_codex", return_value=CmdResult(0, _work_result_json(), "")),
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json())),
             patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
             patch("velora.run._read_diff_for_review", return_value="diff"),
             patch("velora.run.run_gemini_review", return_value=CmdResult(0, "OK", "")),
@@ -160,7 +171,7 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
             patch("velora.run.run_coordinator_v1_with_cmd", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
-            patch("velora.run.run_codex", return_value=CmdResult(0, _work_result_json(status="blocked"), "")),
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json(status="blocked"), filename="block.json")),
             patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
@@ -186,7 +197,7 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
             patch("velora.run.run_coordinator_v1_with_cmd", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
-            patch("velora.run.run_codex", return_value=CmdResult(0, _work_result_json(branch="velora/not-task123"), "")),
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json(branch="velora/not-task123"))),
             patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
@@ -198,6 +209,41 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("WorkResult.branch mismatch", result["summary"])
         poll_ci.assert_not_called()
+        gh.create_pull_request.assert_not_called()
+
+    def test_mode_a_handoff_loops_back_to_coordinator_without_pr(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+        captured_requests: list[dict[str, Any]] = []
+
+        def _coord_side_effect(*args, **kwargs):
+            captured_requests.append(json.loads(json.dumps(kwargs["request"])))
+            if len(captured_requests) == 1:
+                return SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))
+            return SimpleNamespace(response=_stop_response("handoff received"), cmd=CmdResult(0, "", ""))
+
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=_coord_side_effect),
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json(), filename="handoff.json")),
+            patch("velora.run._cleanup_repo_detritus", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=2))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(captured_requests), 2)
+        second = captured_requests[1]
+        self.assertEqual(second["state"]["latest_handoff"]["status"], "completed")
+        self.assertEqual(second["history"]["work_items_executed"][0]["outcome"], "worker_handoff")
         gh.create_pull_request.assert_not_called()
 
     def test_mode_a_second_iteration_request_includes_worker_result_artifact_history(self):
@@ -220,7 +266,7 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
             patch("velora.run.run_coordinator_v1_with_cmd", side_effect=_coord_side_effect),
-            patch("velora.run.run_codex", return_value=CmdResult(0, _work_result_json(status="blocked"), "")),
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json(status="blocked"), filename="block.json")),
             patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
@@ -263,7 +309,7 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
             patch("velora.run.run_coordinator_v1_with_cmd", side_effect=_coord_side_effect),
-            patch("velora.run.run_codex", return_value=CmdResult(0, _work_result_json(), "")),
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json())),
             patch("velora.run._poll_ci", return_value=("success", "ok")),
             patch("velora.run._read_diff_for_review", return_value="diff"),
             patch("velora.run.run_gemini_review", return_value=CmdResult(0, "- BLOCKER: tests failing", "")),
@@ -308,7 +354,7 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
             patch("velora.run.run_coordinator_v1_with_cmd", side_effect=_coord_side_effect),
-            patch("velora.run.run_codex", return_value=CmdResult(0, _work_result_json(), "")),
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json())),
             patch("velora.run._poll_ci", return_value=("failure", "tests failed")),
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),

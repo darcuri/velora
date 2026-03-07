@@ -30,6 +30,28 @@ def _completed_work_result_json(
     )
 
 
+def _run_codex_writing_result(payload: str, *, task_id: str = "task123", repo_path: str = "/tmp/repo"):
+    result_path = Path(repo_path) / ".velora" / "exchange" / "runs" / task_id / "WI-0001" / "result.json"
+
+    def _runner(*args, **kwargs):
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(payload, encoding="utf-8")
+        return CmdResult(0, "worker chatter", "")
+
+    return _runner
+
+
+def _run_codex_writing_result_for_task_map(payload_by_task_id: dict[str, str], *, repo_path: str = "/tmp/repo"):
+    def _runner(*args, **kwargs):
+        session_name = kwargs.get("session_name", "")
+        for task_id, payload in payload_by_task_id.items():
+            if task_id in session_name:
+                return _run_codex_writing_result(payload, task_id=task_id, repo_path=repo_path)(*args, **kwargs)
+        raise AssertionError(f"unexpected session_name: {session_name}")
+
+    return _runner
+
+
 def _execute_response():
     payload = {
         "protocol_version": 1,
@@ -123,7 +145,7 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
             patch("velora.run.run_coordinator_v1_with_cmd", side_effect=coord_runs) as run_coord,
-            patch("velora.run.run_codex", return_value=CmdResult(0, _completed_work_result_json(), "")),
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_completed_work_result_json())),
             patch("velora.run._poll_ci", return_value=("failure", "tests failed")),
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
@@ -168,7 +190,7 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
             patch("velora.run.run_coordinator_v1_with_cmd", side_effect=coord_runs),
-            patch("velora.run.run_codex", return_value=CmdResult(0, _completed_work_result_json(), "")) as run_worker,
+            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_completed_work_result_json())) as run_worker,
             patch("velora.run._poll_ci", return_value=("failure", "tests failed")),
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
@@ -212,10 +234,12 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
             patch("velora.run.run_coordinator_v1_with_cmd", side_effect=coord_runs),
             patch(
                 "velora.run.run_codex",
-                side_effect=[
-                    CmdResult(0, _completed_work_result_json(branch="velora/task111"), ""),
-                    CmdResult(0, _completed_work_result_json(branch="velora/task222"), ""),
-                ],
+                side_effect=_run_codex_writing_result_for_task_map(
+                    {
+                        "task111": _completed_work_result_json(branch="velora/task111"),
+                        "task222": _completed_work_result_json(branch="velora/task222"),
+                    }
+                ),
             ) as run_worker,
             patch("velora.run._poll_ci", return_value=("failure", "tests failed")),
             patch("velora.run._cleanup_repo_detritus", return_value=None),
