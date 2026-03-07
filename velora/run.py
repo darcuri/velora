@@ -356,7 +356,12 @@ def _extract_json_object_from_text(output: str) -> str:
     raise ProtocolError("Worker output must be a JSON object (or a single fenced ```json block)")
 
 
-def _parse_worker_work_result(output: str, *, expected_work_item_id: str) -> WorkResult:
+def _parse_worker_work_result(
+    output: str,
+    *,
+    expected_work_item_id: str,
+    expected_branch: str | None = None,
+) -> WorkResult:
     payload_raw = _extract_json_object_from_text(output)
     try:
         payload = json.loads(payload_raw)
@@ -367,6 +372,10 @@ def _parse_worker_work_result(output: str, *, expected_work_item_id: str) -> Wor
     if result.work_item_id != expected_work_item_id:
         raise ProtocolError(
             f"WorkResult.work_item_id mismatch: expected {expected_work_item_id}, got {result.work_item_id}"
+        )
+    if expected_branch is not None and result.status == "completed" and result.branch != expected_branch:
+        raise ProtocolError(
+            f"WorkResult.branch mismatch: expected {expected_branch}, got {result.branch}"
         )
     return result
 
@@ -1516,7 +1525,11 @@ def run_task_mode_a(
         _cleanup_repo_detritus(repo_path)
 
         try:
-            work_result = _parse_worker_work_result(agent_result.stdout, expected_work_item_id=coord_resp.work_item.id)
+            work_result = _parse_worker_work_result(
+                agent_result.stdout,
+                expected_work_item_id=coord_resp.work_item.id,
+                expected_branch=work_branch,
+            )
         except ProtocolError as exc:
             return _fail_task(
                 record,

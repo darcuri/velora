@@ -71,12 +71,23 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
         get_config.cache_clear()
 
     def test_parse_worker_work_result_validates_and_binds_work_item_id(self):
-        result = _parse_worker_work_result(_work_result_json(), expected_work_item_id="WI-0001")
+        result = _parse_worker_work_result(
+            _work_result_json(),
+            expected_work_item_id="WI-0001",
+            expected_branch="velora/task123",
+        )
         self.assertEqual(result.summary, "worker summary")
         self.assertEqual(result.branch, "velora/task123")
 
         with self.assertRaises(ProtocolError):
             _parse_worker_work_result(_work_result_json(), expected_work_item_id="WI-9999")
+
+        with self.assertRaises(ProtocolError):
+            _parse_worker_work_result(
+                _work_result_json(branch="velora/wrong-branch"),
+                expected_work_item_id="WI-0001",
+                expected_branch="velora/task123",
+            )
 
     def test_mode_a_uses_work_result_fields_for_pr_and_ci(self):
         gh = MagicMock()
@@ -159,6 +170,33 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
 
         self.assertEqual(result["status"], "failed")
+        poll_ci.assert_not_called()
+        gh.create_pull_request.assert_not_called()
+
+    def test_mode_a_rejects_completed_result_on_unassigned_branch(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.run_coordinator_v1_with_cmd", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
+            patch("velora.run.run_codex", return_value=CmdResult(0, _work_result_json(branch="velora/not-task123"), "")),
+            patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
+            patch("velora.run._cleanup_repo_detritus", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("WorkResult.branch mismatch", result["summary"])
         poll_ci.assert_not_called()
         gh.create_pull_request.assert_not_called()
 
