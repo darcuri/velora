@@ -25,6 +25,8 @@ _DECISIONS = {"execute_work_item", "finalize_success", "stop_failure"}
 _SPECIALIST_ROLES = {"implementer", "docs", "refactor", "investigator"}
 _WORK_ITEM_KINDS = {"implement", "repair", "refactor", "docs", "test_only", "investigate"}
 _ACCEPTANCE_GATES = {"tests", "lint", "security", "ci", "docs"}
+_WORK_RESULT_STATUS = {"completed", "blocked", "failed"}
+_WORK_RESULT_TEST_STATUS = {"pass", "fail", "not_run"}
 _ALLOWED_RUNNERS = {"codex", "claude"}  # Gemini is review-only; never a code-writing WorkItem runner.
 _ALLOWED_MAX_DIFF_LINES = {50, 100, 200, 400}
 
@@ -284,6 +286,113 @@ class CoordinatorResponse:
         )
 
 
+@dataclass(frozen=True)
+class WorkResultTestRun:
+    command: str
+    status: str
+    details: str
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "WorkResult.tests_run[]") -> WorkResultTestRun:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(obj, ctx=ctx, allowed_keys={"command", "status", "details"})
+
+        command = _expect_str(obj.get("command"), ctx=f"{ctx}.command", non_empty=False)
+        status = _expect_enum(obj.get("status"), ctx=f"{ctx}.status", allowed=_WORK_RESULT_TEST_STATUS)
+        details = _expect_str(obj.get("details"), ctx=f"{ctx}.details", non_empty=False)
+        return WorkResultTestRun(command=command, status=status, details=details)
+
+
+@dataclass(frozen=True)
+class WorkResult:
+    protocol_version: int
+    work_item_id: str
+    status: str
+    summary: str
+    branch: str
+    head_sha: str
+    files_touched: list[str]
+    tests_run: list[WorkResultTestRun]
+    blockers: list[str]
+    follow_up: list[str]
+    evidence: list[str]
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "WorkResult") -> WorkResult:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(
+            obj,
+            ctx=ctx,
+            allowed_keys={
+                "protocol_version",
+                "work_item_id",
+                "status",
+                "summary",
+                "branch",
+                "head_sha",
+                "files_touched",
+                "tests_run",
+                "blockers",
+                "follow_up",
+                "evidence",
+            },
+        )
+
+        protocol_version = _expect_int(obj.get("protocol_version"), ctx=f"{ctx}.protocol_version")
+        if protocol_version != 1:
+            raise ProtocolError(f"{ctx}.protocol_version must be 1")
+
+        work_item_id = _expect_str(obj.get("work_item_id"), ctx=f"{ctx}.work_item_id")
+        status = _expect_enum(obj.get("status"), ctx=f"{ctx}.status", allowed=_WORK_RESULT_STATUS)
+        summary = _expect_str(obj.get("summary"), ctx=f"{ctx}.summary")
+        branch = _expect_str(obj.get("branch"), ctx=f"{ctx}.branch", non_empty=False)
+        head_sha = _expect_str(obj.get("head_sha"), ctx=f"{ctx}.head_sha", non_empty=False)
+
+        files_touched_raw = _expect_list(obj.get("files_touched"), ctx=f"{ctx}.files_touched")
+        files_touched = [_expect_str(x, ctx=f"{ctx}.files_touched[]") for x in files_touched_raw]
+
+        tests_run_raw = _expect_list(obj.get("tests_run"), ctx=f"{ctx}.tests_run")
+        tests_run = [WorkResultTestRun.from_dict(x, ctx=f"{ctx}.tests_run[]") for x in tests_run_raw]
+
+        blockers_raw = _expect_list(obj.get("blockers"), ctx=f"{ctx}.blockers")
+        blockers = [_expect_str(x, ctx=f"{ctx}.blockers[]") for x in blockers_raw]
+
+        follow_up_raw = _expect_list(obj.get("follow_up"), ctx=f"{ctx}.follow_up")
+        follow_up = [_expect_str(x, ctx=f"{ctx}.follow_up[]") for x in follow_up_raw]
+
+        evidence_raw = _expect_list(obj.get("evidence"), ctx=f"{ctx}.evidence")
+        evidence = [_expect_str(x, ctx=f"{ctx}.evidence[]") for x in evidence_raw]
+
+        if status == "completed":
+            if not branch:
+                raise ProtocolError(f"{ctx}.branch must be non-empty when status=completed")
+            if not head_sha:
+                raise ProtocolError(f"{ctx}.head_sha must be non-empty when status=completed")
+            if blockers:
+                raise ProtocolError(f"{ctx}.blockers must be empty when status=completed")
+        else:
+            if not blockers:
+                raise ProtocolError(f"{ctx}.blockers must be non-empty when status={status}")
+            if branch:
+                raise ProtocolError(f"{ctx}.branch must be empty when status={status}")
+            if head_sha:
+                raise ProtocolError(f"{ctx}.head_sha must be empty when status={status}")
+
+        return WorkResult(
+            protocol_version=protocol_version,
+            work_item_id=work_item_id,
+            status=status,
+            summary=summary,
+            branch=branch,
+            head_sha=head_sha,
+            files_touched=files_touched,
+            tests_run=tests_run,
+            blockers=blockers,
+            follow_up=follow_up,
+            evidence=evidence,
+        )
+
+
 def validate_coordinator_response(payload: object) -> CoordinatorResponse:
     """Validate and parse a coordinator response.
 
@@ -292,6 +401,12 @@ def validate_coordinator_response(payload: object) -> CoordinatorResponse:
     """
 
     return CoordinatorResponse.from_dict(payload)
+
+
+def validate_work_result(payload: object) -> WorkResult:
+    """Validate and parse a worker work-result payload."""
+
+    return WorkResult.from_dict(payload)
 
 
 def enforce_specialist_matrix(resp: CoordinatorResponse, matrix: object) -> None:

@@ -1115,7 +1115,7 @@ def run_task_mode_a(
         },
     }
 
-    coord_session = coordinator_session_name(owner, repo)
+    coord_session = coordinator_session_name(owner, repo, task_id)
     coord_runner = os.environ.get("VELORA_COORDINATOR_RUNNER", "claude").strip().lower() or "claude"
 
     max_attempts = spec.max_attempts if spec.max_attempts is not None else cfg.max_attempts
