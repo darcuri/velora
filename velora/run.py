@@ -106,37 +106,65 @@ def _usd_equiv_rate_per_1m_tokens() -> float:
         return 0.0
 
 
-def _accumulate_acpx_usage(request: dict[str, Any], *, session_name: str, result: Any) -> None:
+def _ensure_hist_dict(hist: dict[str, Any], key: str) -> dict[str, Any]:
+    val = hist.setdefault(key, {})
+    if isinstance(val, dict):
+        return val
+    val = {}
+    hist[key] = val
+    return val
+
+
+def _accumulate_acpx_usage(
+    request: dict[str, Any],
+    *,
+    session_name: str,
+    result: Any,
+    actor: str,
+    branch: str | None = None,
+) -> int:
     """Accumulate best-effort token usage from an acpx CmdResult into Mode A history.
 
     This uses acpx's `usage_update.used` counter, which reflects context usage.
-    It's good enough for a budget breaker, but not guaranteed to equal billed tokens.
+    It is useful for budget break/visibility, but it is not guaranteed billed-token truth.
+    We only charge explicit deltas after a per-session baseline is established.
     """
 
     usage = getattr(result, "usage", None)
     if usage is None:
-        return
+        return 0
 
     used = getattr(usage, "used", None)
     if not isinstance(used, int):
-        return
+        return 0
 
     hist = request.setdefault("history", {})
-    sess_usage = hist.setdefault("session_usage", {})
-    if not isinstance(sess_usage, dict):
-        sess_usage = {}
-        hist["session_usage"] = sess_usage
+    sess_usage = _ensure_hist_dict(hist, "session_usage")
+    sess_baselines = _ensure_hist_dict(hist, "session_usage_baselines")
+    sess_deltas = _ensure_hist_dict(hist, "session_usage_deltas")
 
+    baseline = sess_baselines.get(session_name)
+    has_baseline = isinstance(baseline, int)
     prev = sess_usage.get(session_name)
-    prev_used = int(prev) if isinstance(prev, int) else 0
+    prev_used = int(prev) if isinstance(prev, int) else int(baseline) if has_baseline else None
 
-    delta = used - prev_used
-    # If the session was reset/compacted, used may go backwards. Treat that as
-    # a fresh baseline (delta=used).
+    # First observation for a session is baseline only; don't attribute unknown
+    # prior cumulative usage to this run.
+    if prev_used is None:
+        sess_baselines[session_name] = used
+        sess_usage[session_name] = used
+        delta = 0
+    else:
+        delta = used - prev_used
+
+    # If the session was reset/compacted and used goes backwards, re-baseline.
+    # Treat this as unknown attribution instead of inventing a charge.
     if delta < 0:
-        delta = used
+        sess_baselines[session_name] = used
+        delta = 0
 
     sess_usage[session_name] = used
+    sess_deltas[session_name] = int(sess_deltas.get(session_name) or 0) + int(delta)
 
     hist["tokens_used_estimate"] = int(hist.get("tokens_used_estimate") or 0) + int(delta)
 
@@ -145,12 +173,22 @@ def _accumulate_acpx_usage(request: dict[str, Any], *, session_name: str, result
     hist["usd_equiv_per_1m_tokens"] = rate
     hist["cost_usd_estimate"] = float(hist.get("cost_usd_estimate") or 0.0) + (float(delta) / 1_000_000.0) * rate
 
+    if actor == "coordinator":
+        hist["coordinator_tokens_used_estimate"] = int(hist.get("coordinator_tokens_used_estimate") or 0) + int(delta)
+    elif actor == "worker":
+        hist["worker_tokens_used_estimate"] = int(hist.get("worker_tokens_used_estimate") or 0) + int(delta)
+        if isinstance(branch, str) and branch.strip():
+            by_branch = _ensure_hist_dict(hist, "worker_tokens_by_branch_estimate")
+            b = branch.strip()
+            by_branch[b] = int(by_branch.get(b) or 0) + int(delta)
+
     model_id = getattr(usage, "model_id", None)
     if isinstance(model_id, str) and model_id.strip():
         models = hist.setdefault("models_seen", [])
         if isinstance(models, list) and model_id not in models:
             models.append(model_id)
             del models[:-10]
+    return int(delta)
 
 
 def _sync_budget_to_record(record: dict[str, Any], request: dict[str, Any]) -> None:
@@ -158,7 +196,15 @@ def _sync_budget_to_record(record: dict[str, Any], request: dict[str, Any]) -> N
     if not isinstance(hist, dict):
         return
 
-    for key in ("tokens_used_estimate", "cost_usd_estimate", "usd_equiv_per_1m_tokens", "models_seen"):
+    for key in (
+        "tokens_used_estimate",
+        "cost_usd_estimate",
+        "usd_equiv_per_1m_tokens",
+        "models_seen",
+        "coordinator_tokens_used_estimate",
+        "worker_tokens_used_estimate",
+        "worker_tokens_by_branch_estimate",
+    ):
         if key in hist:
             record[key] = hist.get(key)
 
@@ -1239,6 +1285,11 @@ def run_task_mode_a(
             "tokens_used_estimate": 0,
             "cost_usd_estimate": 0.0,
             "session_usage": {},
+            "session_usage_baselines": {},
+            "session_usage_deltas": {},
+            "coordinator_tokens_used_estimate": 0,
+            "worker_tokens_used_estimate": 0,
+            "worker_tokens_by_branch_estimate": {},
         },
     }
 
@@ -1306,7 +1357,7 @@ def run_task_mode_a(
             )
             coord_dt = round(time.monotonic() - coord_t0, 2)
             coord_resp = coord_run.response
-            _accumulate_acpx_usage(request, session_name=coord_session, result=coord_run.cmd)
+            _accumulate_acpx_usage(request, session_name=coord_session, result=coord_run.cmd, actor="coordinator")
             _sync_budget_to_record(record, request)
             _dbg(
                 dbg_dir,
@@ -1429,7 +1480,13 @@ def run_task_mode_a(
             },
         )
 
-        _accumulate_acpx_usage(request, session_name=worker_session, result=agent_result)
+        _accumulate_acpx_usage(
+            request,
+            session_name=worker_session,
+            result=agent_result,
+            actor="worker",
+            branch=work_branch,
+        )
         _sync_budget_to_record(record, request)
         hist = request.setdefault("history", {})
         tokens_used = int(hist.get("tokens_used_estimate") or 0)

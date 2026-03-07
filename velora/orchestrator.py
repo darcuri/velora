@@ -125,6 +125,11 @@ def build_initial_coordinator_request(
             "tokens_used_estimate": 0,
             "cost_usd_estimate": 0.0,
             "session_usage": {},
+            "session_usage_baselines": {},
+            "session_usage_deltas": {},
+            "coordinator_tokens_used_estimate": 0,
+            "worker_tokens_used_estimate": 0,
+            "worker_tokens_by_branch_estimate": {},
         },
     }
 
