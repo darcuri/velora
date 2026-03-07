@@ -10,6 +10,9 @@ from .github import GitHubClient
 from .util import ensure_dir, repo_slug, velora_home
 
 
+_LOCAL_EXCLUDE_ENTRY = "/.velora/"
+
+
 def _allowed_owners() -> set[str]:
     return set(get_config().allowed_owners)
 
@@ -57,12 +60,26 @@ def _resolve_origin_head_branch(checkout: Path) -> str | None:
     return None
 
 
+def _ensure_local_exclude(checkout: Path) -> None:
+    info_dir = ensure_dir(checkout / ".git" / "info")
+    exclude_path = info_dir / "exclude"
+    existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+    lines = {line.strip() for line in existing.splitlines() if line.strip()}
+    if _LOCAL_EXCLUDE_ENTRY in lines:
+        return
+    with exclude_path.open("a", encoding="utf-8") as fh:
+        if existing and not existing.endswith("\n"):
+            fh.write("\n")
+        fh.write(f"{_LOCAL_EXCLUDE_ENTRY}\n")
+
+
 def ensure_repo_checkout(owner: str, repo: str, home: Path | None = None, *, base_branch: str | None = None) -> Path:
     base = ensure_dir((home or velora_home()) / "repos")
     checkout = base / repo_slug(owner, repo)
     full_name = f"{owner}/{repo}"
     if not checkout.exists():
         _run_checked(["gh", "repo", "clone", full_name, str(checkout)])
+        _ensure_local_exclude(checkout)
         # If the caller requested a non-default base branch, ensure we are on it.
         bb = (base_branch or "").strip()
         if bb:
@@ -78,6 +95,7 @@ def ensure_repo_checkout(owner: str, repo: str, home: Path | None = None, *, bas
 
     bb = (base_branch or "").strip() or _resolve_origin_head_branch(checkout) or "main"
     _run_checked(["git", "checkout", "-B", bb, f"origin/{bb}"], cwd=checkout)
+    _ensure_local_exclude(checkout)
 
     return checkout
 

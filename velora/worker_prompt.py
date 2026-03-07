@@ -20,6 +20,8 @@ def build_worker_prompt_v1(
     run_id: str,
     iteration: int,
     work_branch: str,
+    work_item_path: str,
+    result_path: str,
     work_item: WorkItem,
 ) -> str:
     lines: list[str] = []
@@ -34,6 +36,7 @@ def build_worker_prompt_v1(
     lines.append("Requirements:")
     lines.append(f"- Checkout branch {work_branch} (create it if it does not exist)")
     lines.append("- Implement exactly this WorkItem (bounded scope; do not roam)")
+    lines.append(f"- Read the local assignment snapshot from: {work_item_path}")
     if work_item.acceptance.gates:
         lines.append(f"- Ensure gates pass: {', '.join(work_item.acceptance.gates)}")
     lines.append(f"- Keep diff <= ~{work_item.limits.max_diff_lines} lines")
@@ -90,12 +93,21 @@ def build_worker_prompt_v1(
         lines.append(f"  {k}: {work_item.commit.footer[k]}")
     lines.append("")
     lines.append("Final output requirements (strict protocol):")
-    lines.append("- Return exactly one JSON object, and nothing else (no markdown, no prose)")
+    lines.append("- Write exactly one final outcome file, and only one:")
+    lines.append(f"  - result.json path: {result_path}")
+    lines.append(f"  - handoff.json path: {result_path.replace('/result.json', '/handoff.json')}")
+    lines.append(f"  - block.json path: {result_path.replace('/result.json', '/block.json')}")
+    lines.append("- Use result.json for terminal implementation success that is ready for the normal PR/CI/review path")
+    lines.append("- Use handoff.json for non-terminal success (for example: investigation/recon) that should loop back to the coordinator")
+    lines.append("- Use block.json for blocked outcomes with useful structured blockers")
+    lines.append("- The coordinator will trust these files, not raw stdout/stderr")
+    lines.append("- Keep stdout minimal; any chatter is debug-only and ignored")
+    lines.append("- The chosen file must contain exactly one JSON object (no markdown, no prose)")
     lines.append("- JSON must match WorkResult protocol v1 with all required fields")
     lines.append(f"- work_item_id must be exactly: {work_item.id}")
     lines.append("- status must be one of: completed, blocked, failed")
-    lines.append("- If status=completed: branch/head_sha non-empty; blockers empty")
-    lines.append("- If status=blocked or failed: branch/head_sha empty; blockers non-empty")
+    lines.append("- For result.json with status=completed: branch/head_sha non-empty; blockers empty")
+    lines.append("- For handoff.json or block.json: branch/head_sha may be empty")
     lines.append("- Unknown keys are forbidden")
     lines.append("- Always include arrays for files_touched, tests_run, blockers, follow_up, evidence")
     lines.append("")
