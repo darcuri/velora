@@ -210,7 +210,13 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
             patch("velora.run.run_coordinator_v1_with_cmd", side_effect=coord_runs),
-            patch("velora.run.run_codex", return_value=CmdResult(0, _completed_work_result_json(branch="velora/task"), "")) as run_worker,
+            patch(
+                "velora.run.run_codex",
+                side_effect=[
+                    CmdResult(0, _completed_work_result_json(branch="velora/task111"), ""),
+                    CmdResult(0, _completed_work_result_json(branch="velora/task222"), ""),
+                ],
+            ) as run_worker,
             patch("velora.run._poll_ci", return_value=("failure", "tests failed")),
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
