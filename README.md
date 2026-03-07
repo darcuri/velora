@@ -62,3 +62,5 @@ velora run octocat/hello-world feature --unsafe-task "Add SPEED unit conversions
 ## Docs
 
 See [`docs/`](./docs/) (start at [`docs/README.md`](./docs/README.md)).
+
+For the coordinator/worker non-negotiables, see [`docs/mode-a-safety-rails.md`](./docs/mode-a-safety-rails.md).

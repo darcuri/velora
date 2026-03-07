@@ -8,6 +8,7 @@ prompt that can be executed by Codex/Claude.
 We keep this deterministic and boring.
 """
 
+from .policy import TESTING_DOCTRINE, WORKER_HARD_BLOCKS, WORKFLOW_CANON
 from .protocol import WorkItem
 
 
@@ -66,6 +67,21 @@ def build_worker_prompt_v1(
         for item in work_item.acceptance.must_not:
             lines.append(f"- {item}")
         lines.append("")
+
+    lines.append("Worker hard blocks (must NOT):")
+    for item in WORKER_HARD_BLOCKS:
+        lines.append(f"- {item}")
+    lines.append("")
+
+    lines.append("Workflow canon:")
+    for item in WORKFLOW_CANON:
+        lines.append(f"- {item}")
+    lines.append("")
+
+    lines.append("Testing doctrine:")
+    for item in TESTING_DOCTRINE:
+        lines.append(f"- {item}")
+    lines.append("")
 
     lines.append("Commit requirements:")
     lines.append(f"- Commit message subject: {work_item.commit.message}")

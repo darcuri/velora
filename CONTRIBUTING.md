@@ -45,6 +45,15 @@ Velora uses ACPX to run Codex for implementation. Ensure you have:
 - **No secret leaks.** Be careful with logs/exceptions.
 - **Keep it boring.** Avoid unnecessary complexity; build only what reduces toil.
 
+## Mode A safety rails
+
+The coordinator/worker loop has explicit non-negotiables. See [`docs/mode-a-safety-rails.md`](./docs/mode-a-safety-rails.md).
+
+Short version:
+- workers do bounded implementation only
+- orchestrator owns PR creation, CI/review, and task-state transitions
+- task truth lives in Velora-owned task artifacts, not worker chat output
+
 ## CI behavior
 
 - Docs-only changes (`docs/**`, `README.md`) run the lightweight `docs` workflow.
