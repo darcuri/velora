@@ -5,7 +5,7 @@ from velora.worker_prompt import build_worker_prompt_v1
 
 
 class TestWorkerPrompt(unittest.TestCase):
-    def test_build_prompt_includes_branch_and_footer(self) -> None:
+    def test_build_prompt_includes_work_result_contract(self) -> None:
         resp = validate_coordinator_response(
             {
                 "protocol_version": 1,
@@ -40,7 +40,9 @@ class TestWorkerPrompt(unittest.TestCase):
         self.assertIn("Checkout branch velora/run-1", prompt)
         self.assertIn("VELORA_RUN_ID: run-1", prompt)
         self.assertIn("WORK_ITEM_ID: WI-0001", prompt)
-        self.assertIn("BRANCH:", prompt)
+        self.assertIn("Return exactly one JSON object, and nothing else", prompt)
+        self.assertIn('"work_item_id": "<string>"', prompt)
+        self.assertIn("Unknown keys are forbidden", prompt)
 
 
 if __name__ == "__main__":

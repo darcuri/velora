@@ -17,6 +17,7 @@ from .constants import VALID_VERBS
 from .coordinator import run_coordinator_v1_with_cmd
 from .github import GitHubClient
 from .orchestrator import coordinator_session_name, worker_session_name
+from .protocol import ProtocolError, WorkResult, validate_work_result
 from .repo import ensure_repo_checkout, validate_repo_allowed
 from .spec import RunSpec
 from .state import get_task, upsert_task
@@ -286,6 +287,42 @@ def _mode_a_status_for_terminal_decision(decision: str) -> str:
     if decision == "stop_failure":
         return "failed"
     raise ValueError(f"Unsupported terminal decision: {decision}")
+
+
+def _extract_json_object_from_text(output: str) -> str:
+    """Extract a JSON object payload from worker output.
+
+    Primary contract: output must be a single JSON object.
+    Compatibility bridge: allow a single fenced ```json block for debugging/recovery.
+    """
+
+    text = (output or "").strip()
+    if not text:
+        raise ProtocolError("Worker output is empty; expected WorkResult JSON object")
+
+    if text.startswith("{") and text.endswith("}"):
+        return text
+
+    fence_match = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+
+    raise ProtocolError("Worker output must be a JSON object (or a single fenced ```json block)")
+
+
+def _parse_worker_work_result(output: str, *, expected_work_item_id: str) -> WorkResult:
+    payload_raw = _extract_json_object_from_text(output)
+    try:
+        payload = json.loads(payload_raw)
+    except json.JSONDecodeError as exc:
+        raise ProtocolError(f"Worker output is not valid JSON: {exc}") from exc
+
+    result = validate_work_result(payload)
+    if result.work_item_id != expected_work_item_id:
+        raise ProtocolError(
+            f"WorkResult.work_item_id mismatch: expected {expected_work_item_id}, got {result.work_item_id}"
+        )
+    return result
 
 
 def _is_oscillating_failure_signatures(sigs: list[str]) -> bool:
@@ -1331,27 +1368,116 @@ def run_task_mode_a(
 
         _cleanup_repo_detritus(repo_path)
 
-        footer = parse_codex_footer(agent_result.stdout)
-        record["branch"] = footer["branch"]
-        record["head_sha"] = footer["head_sha"]
-        record["summary"] = footer["summary"]
+        try:
+            work_result = _parse_worker_work_result(agent_result.stdout, expected_work_item_id=coord_resp.work_item.id)
+        except ProtocolError as exc:
+            return _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Worker protocol failure on iteration {attempt}: {exc}",
+            )
+
+        record["branch"] = work_result.branch
+        record["head_sha"] = work_result.head_sha
+        record["summary"] = work_result.summary
+        record["worker_status"] = work_result.status
+        record["tests_run"] = [
+            {"command": t.command, "status": t.status, "details": t.details} for t in work_result.tests_run
+        ]
+        record["files_touched"] = list(work_result.files_touched)
+        record["evidence"] = list(work_result.evidence)
+        record["blockers"] = list(work_result.blockers)
+        record["follow_up"] = list(work_result.follow_up)
         record["updated_at"] = now_iso()
         upsert_task(record, home=base_home)
         _dbg(
             dbg_dir,
-            "worker_footer",
+            "worker_work_result",
             {
                 "iteration": attempt,
                 "branch": record.get("branch"),
                 "head_sha": record.get("head_sha"),
                 "summary": record.get("summary"),
+                "work_result_status": work_result.status,
+                "tests_run_count": len(work_result.tests_run),
                 "tokens_total": record.get("tokens_used_estimate"),
             },
         )
 
         # Update coordinator state snapshot.
         request.setdefault("state", {})
-        request["state"]["last_commit"] = footer["head_sha"]
+        request["state"]["last_commit"] = work_result.head_sha
+        request["state"]["notes"] = list(request["state"].get("notes") or [])
+        request["state"]["notes"].append(f"work_result.status={work_result.status}")
+        request["state"]["notes"].append(f"work_result.summary={work_result.summary}")
+        for item in work_result.evidence:
+            request["state"]["notes"].append(f"evidence={item}")
+        del request["state"]["notes"][:-20]
+        hist = request.setdefault("history", {})
+        work_items = hist.setdefault("work_items_executed", [])
+
+        if work_result.status != "completed":
+            failure_sig = f"worker:{work_result.status}:{'|'.join(work_result.blockers)}"
+            no_prog = int(hist.get("no_progress_streak") or 0)
+            no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
+            last_failure_sig = failure_sig
+            hist["no_progress_streak"] = no_prog
+            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
+
+            sigs = hist.setdefault("failure_signatures", [])
+            sigs.append(failure_sig)
+            del sigs[:-6]
+
+            if _is_oscillating_failure_signatures(sigs):
+                return _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+                )
+
+            if no_prog >= no_progress_max:
+                return _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=(
+                        f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
+                        f"(failure_sig={failure_sig})"
+                    ),
+                )
+
+            request["evaluation"] = {
+                "status": "fail",
+                "failing_checks": [
+                    {
+                        "name": "worker",
+                        "kind": "worker",
+                        "url": record.get("pr_url"),
+                        "summary": "; ".join(work_result.blockers),
+                    }
+                ],
+                "logs_excerpt": "; ".join(work_result.blockers),
+            }
+            work_items.append(
+                {
+                    "id": coord_resp.work_item.id,
+                    "kind": coord_resp.work_item.kind,
+                    "result": "fail",
+                    "patch_suggestion": {
+                        "progress": "none" if no_prog > 1 else "some",
+                        "evidence": [
+                            f"worker_status={work_result.status}",
+                            *work_result.blockers,
+                            *work_result.follow_up,
+                            *work_result.evidence,
+                        ],
+                        "next_guess": "unblock worker-reported issue",
+                    },
+                }
+            )
+            continue
 
         if attempt == 1:
             try:
@@ -1359,8 +1485,13 @@ def run_task_mode_a(
                     owner=owner,
                     repo=repo,
                     title=_task_title(verb, task_text, spec.title),
-                    body=_build_pr_body(repo_path=repo_path, task_id=task_id, summary=footer["summary"], extra_body=spec.body),
-                    head=footer["branch"],
+                    body=_build_pr_body(
+                        repo_path=repo_path,
+                        task_id=task_id,
+                        summary=work_result.summary,
+                        extra_body=spec.body,
+                    ),
+                    head=work_result.branch,
                     base=base_branch,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1392,14 +1523,14 @@ def run_task_mode_a(
             "ci_start",
             {
                 "iteration": attempt,
-                "head_sha": footer["head_sha"],
+                "head_sha": work_result.head_sha,
                 "pr_url": record.get("pr_url"),
             },
         )
         ci_t0 = time.monotonic()
-        _append_text(ci_log, f"[{now_iso()}] polling CI for {footer['head_sha']}")
+        _append_text(ci_log, f"[{now_iso()}] polling CI for {work_result.head_sha}")
         try:
-            ci_state, ci_detail = _poll_ci(gh, owner, repo, footer["head_sha"], ci_log)
+            ci_state, ci_detail = _poll_ci(gh, owner, repo, work_result.head_sha, ci_log)
         except Exception as exc:  # noqa: BLE001
             detail = _format_preflight_error(exc)
             return _fail_task(
@@ -1422,9 +1553,6 @@ def run_task_mode_a(
         )
 
         # Record history entry skeleton.
-        hist = request.setdefault("history", {})
-        work_items = hist.setdefault("work_items_executed", [])
-
         if ci_state != "success":
             ci_checks: dict[str, Any] = {}
             ci_class = _classify_ci_failure(ci_state, ci_detail, None)
@@ -1514,7 +1642,14 @@ def run_task_mode_a(
                     "result": "fail",
                     "patch_suggestion": {
                         "progress": "none" if no_prog > 1 else "some",
-                        "evidence": [f"ci_state={ci_state}", f"ci_detail={ci_detail}"],
+                        "evidence": [
+                            f"worker_status={work_result.status}",
+                            f"ci_state={ci_state}",
+                            f"ci_detail={ci_detail}",
+                            *work_result.blockers,
+                            *work_result.follow_up,
+                            *work_result.evidence,
+                        ],
                         "next_guess": "repair failing CI checks",
                     },
                 }
@@ -1611,7 +1746,7 @@ def run_task_mode_a(
                     "result": "fail",
                     "patch_suggestion": {
                         "progress": "none" if no_prog > 1 else "some",
-                        "evidence": [detail],
+                        "evidence": [detail, f"worker_status={work_result.status}", *work_result.evidence],
                         "next_guess": "address review blockers",
                     },
                 }
