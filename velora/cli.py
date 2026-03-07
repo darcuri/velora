@@ -179,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.coord_cmd == "run":
-                session = coordinator_session_name(request["repo"]["owner"], request["repo"]["name"])
+                session = coordinator_session_name(request["repo"]["owner"], request["repo"]["name"], request["run_id"])
                 coord_runner = os.environ.get("VELORA_COORDINATOR_RUNNER", "claude")
                 resp = run_coordinator_v1(session_name=session, cwd=repo_path, request=request, runner=str(coord_runner))
                 payload = asdict(resp)

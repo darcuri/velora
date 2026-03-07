@@ -19,9 +19,9 @@ from .spec import RunSpec
 from .util import build_task_id, now_iso, repo_slug, velora_home
 
 
-def coordinator_session_name(owner: str, repo: str) -> str:
+def coordinator_session_name(owner: str, repo: str, run_id: str) -> str:
     cfg = get_config()
-    return f"{cfg.claude_session_prefix}{repo_slug(owner, repo)}-coord"
+    return f"{cfg.claude_session_prefix}{repo_slug(owner, repo)}-{run_id}-coord"
 
 
 def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
