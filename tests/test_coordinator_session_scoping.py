@@ -88,8 +88,11 @@ def _stop_response():
 class TestCoordinatorSessionScoping(unittest.TestCase):
     def setUp(self):
         get_config.cache_clear()
+        self.publish_branch = patch("velora.run._publish_branch", return_value=None)
+        self.publish_branch.start()
 
     def tearDown(self):
+        self.publish_branch.stop()
         get_config.cache_clear()
 
     def test_coordinator_session_name_uses_run_id(self):

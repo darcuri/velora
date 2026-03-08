@@ -60,6 +60,23 @@ def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
     return proc.stdout
 
 
+def _publish_branch(*, repo_path: Path, branch: str, expected_head_sha: str) -> None:
+    branch_name = branch.strip()
+    if not branch_name:
+        raise RuntimeError("Cannot publish empty branch name")
+    head_sha = expected_head_sha.strip()
+    if not head_sha:
+        raise RuntimeError(f"Cannot publish branch {branch_name} without a head SHA")
+
+    local_head_sha = _run_checked(["git", "rev-parse", branch_name], cwd=repo_path).strip()
+    if local_head_sha != head_sha:
+        raise RuntimeError(
+            f"Refusing to publish {branch_name}: local branch head {local_head_sha} != expected {head_sha}"
+        )
+
+    _run_checked(["git", "push", "--set-upstream", "origin", branch_name], cwd=repo_path)
+
+
 def _configured_fault_checkpoints() -> set[str]:
     raw = os.environ.get(_INTERNAL_FAULT_CHECKPOINT_ENV, "")
     return {item.strip() for item in raw.split(",") if item.strip()}
@@ -1821,6 +1838,17 @@ def run_task_mode_a(
                 outcome=f"worker_{work_result.status}",
             )
             continue
+
+        try:
+            _publish_branch(repo_path=repo_path, branch=work_result.branch, expected_head_sha=work_result.head_sha)
+        except Exception as exc:  # noqa: BLE001
+            detail = _format_preflight_error(exc)
+            return _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Failed to publish branch on iteration {attempt}: {detail}",
+            )
 
         if attempt == 1:
             try:

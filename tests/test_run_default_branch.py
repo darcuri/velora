@@ -33,8 +33,11 @@ def _run_codex_writing_result(payload: str, *, repo_path: str = "/tmp/repo"):
 class TestRunUsesDefaultBranch(unittest.TestCase):
     def setUp(self):
         get_config.cache_clear()
+        self.publish_branch = patch("velora.run._publish_branch", return_value=None)
+        self.publish_branch.start()
 
     def tearDown(self):
+        self.publish_branch.stop()
         get_config.cache_clear()
 
     def test_default_branch_used_for_pr_and_diff(self):

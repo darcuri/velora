@@ -77,8 +77,11 @@ def _run_codex_writing_result(payload: str, *, repo_path: str = "/tmp/repo", fil
 class TestModeAWorkResultIntegration(unittest.TestCase):
     def setUp(self):
         get_config.cache_clear()
+        self.publish_branch = patch("velora.run._publish_branch", return_value=None)
+        self.mock_publish_branch = self.publish_branch.start()
 
     def tearDown(self):
+        self.publish_branch.stop()
         get_config.cache_clear()
 
     def test_parse_worker_work_result_validates_and_binds_work_item_id(self):
@@ -131,6 +134,11 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
 
         self.assertEqual(result["status"], "ready")
+        self.mock_publish_branch.assert_called_once_with(
+            repo_path=Path("/tmp/repo"),
+            branch="velora/task123",
+            expected_head_sha="abc123",
+        )
         self.assertEqual(gh.create_pull_request.call_args.kwargs["head"], "velora/task123")
         self.assertEqual(poll_ci.call_args.args[3], "abc123")
 
