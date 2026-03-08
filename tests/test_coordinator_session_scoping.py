@@ -90,8 +90,11 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
         get_config.cache_clear()
         self.publish_branch = patch("velora.run._publish_branch", return_value=None)
         self.publish_branch.start()
+        self.close_session = patch("velora.run.close_acpx_session", return_value=CmdResult(0, "", ""))
+        self.close_session.start()
 
     def tearDown(self):
+        self.close_session.stop()
         self.publish_branch.stop()
         get_config.cache_clear()
 

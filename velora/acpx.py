@@ -117,6 +117,21 @@ def run_cmd(
     return CmdResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
+def close_acpx_session(agent: str, session_name: str, cwd: Path) -> CmdResult:
+    env = os.environ.copy()
+    acpx_cmd = resolve_acpx_cmd(env=env)
+    cmd = [
+        acpx_cmd,
+        "--cwd",
+        str(cwd),
+        agent,
+        "sessions",
+        "close",
+        session_name,
+    ]
+    return run_cmd(cmd, env=env)
+
+
 def _parse_acpx_json_prompt_output(raw_stdout: str) -> tuple[str, AcpUsage]:
     """Parse acpx --format json --json-strict output into plain text + usage.
 

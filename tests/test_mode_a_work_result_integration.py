@@ -4,10 +4,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from velora.acpx import CmdResult
 from velora.config import get_config
+from velora.orchestrator import coordinator_session_name, worker_session_name
 from velora.protocol import ProtocolError, validate_coordinator_response
 from velora.run import _parse_worker_work_result, run_task_mode_a
 from velora.spec import RunSpec
@@ -79,8 +80,11 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
         get_config.cache_clear()
         self.publish_branch = patch("velora.run._publish_branch", return_value=None)
         self.mock_publish_branch = self.publish_branch.start()
+        self.close_session = patch("velora.run.close_acpx_session", return_value=CmdResult(0, "", ""))
+        self.mock_close_session = self.close_session.start()
 
     def tearDown(self):
+        self.close_session.stop()
         self.publish_branch.stop()
         get_config.cache_clear()
 
@@ -139,6 +143,21 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             branch="velora/task123",
             expected_head_sha="abc123",
         )
+        self.mock_close_session.assert_has_calls(
+            [
+                call(
+                    agent="claude",
+                    session_name=coordinator_session_name("octocat", "velora", "task123"),
+                    cwd=Path("/tmp/repo"),
+                ),
+                call(
+                    agent="codex",
+                    session_name=worker_session_name("octocat", "velora", "task123", "codex"),
+                    cwd=Path("/tmp/repo"),
+                ),
+            ],
+            any_order=True,
+        )
         self.assertEqual(gh.create_pull_request.call_args.kwargs["head"], "velora/task123")
         self.assertEqual(poll_ci.call_args.args[3], "abc123")
 
@@ -165,6 +184,21 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
 
         self.assertEqual(result["status"], "failed")
         self.assertIn("Worker protocol failure", result["summary"])
+        self.mock_close_session.assert_has_calls(
+            [
+                call(
+                    agent="claude",
+                    session_name=coordinator_session_name("octocat", "velora", "task123"),
+                    cwd=Path("/tmp/repo"),
+                ),
+                call(
+                    agent="codex",
+                    session_name=worker_session_name("octocat", "velora", "task123", "codex"),
+                    cwd=Path("/tmp/repo"),
+                ),
+            ],
+            any_order=True,
+        )
 
     def test_mode_a_worker_blocked_result_skips_ci_polling(self):
         gh = MagicMock()

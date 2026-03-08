@@ -12,7 +12,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .acpx import GEMINI_REVIEW_PROMPT_PREFIX, parse_codex_footer, run_claude, run_codex, run_gemini_review
+from .acpx import (
+    GEMINI_REVIEW_PROMPT_PREFIX,
+    close_acpx_session,
+    parse_codex_footer,
+    run_claude,
+    run_codex,
+    run_gemini_review,
+)
 from .config import get_config
 from .constants import VALID_VERBS
 from .coordinator import run_coordinator_v1_with_cmd
@@ -75,6 +82,40 @@ def _publish_branch(*, repo_path: Path, branch: str, expected_head_sha: str) -> 
         )
 
     _run_checked(["git", "push", "--set-upstream", "origin", branch_name], cwd=repo_path)
+
+
+def _close_mode_a_sessions(*, repo_path: Path | None, sessions: list[tuple[str, str]], dbg_dir: Path | None = None) -> None:
+    if repo_path is None:
+        return
+
+    seen: set[tuple[str, str]] = set()
+    for runner, session_name in sessions:
+        key = (runner.strip().lower(), session_name.strip())
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        try:
+            res = close_acpx_session(agent=key[0], session_name=key[1], cwd=repo_path)
+            _dbg(
+                dbg_dir,
+                "session_close",
+                {
+                    "runner": key[0],
+                    "session": key[1],
+                    "returncode": res.returncode,
+                    "stderr": (res.stderr or "").strip() or None,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            _dbg(
+                dbg_dir,
+                "session_close_failed",
+                {
+                    "runner": key[0],
+                    "session": key[1],
+                    "error": str(exc),
+                },
+            )
 
 
 def _configured_fault_checkpoints() -> set[str]:
@@ -1292,6 +1333,13 @@ def run_task_mode_a(
     upsert_task(record, home=base_home)
 
     dbg_dir = task_dir if debug else None
+    repo_path: Path | None = None
+    sessions_to_close: list[tuple[str, str]] = []
+
+    def _return_mode_a(result: dict[str, Any]) -> dict[str, Any]:
+        _close_mode_a_sessions(repo_path=repo_path, sessions=sessions_to_close, dbg_dir=dbg_dir)
+        return result
+
     _dbg(
         dbg_dir,
         "run_start",
@@ -1389,6 +1437,7 @@ def run_task_mode_a(
 
     coord_session = coordinator_session_name(owner, repo, task_id)
     coord_runner = os.environ.get("VELORA_COORDINATOR_RUNNER", "claude").strip().lower() or "claude"
+    sessions_to_close.append((coord_runner, coord_session))
 
     max_attempts = spec.max_attempts if spec.max_attempts is not None else cfg.max_attempts
     max_attempts = max(1, min(int(max_attempts), 10))
@@ -1413,20 +1462,24 @@ def run_task_mode_a(
         hist["elapsed_seconds"] = round(elapsed, 2)
 
         if max_wall_seconds and elapsed > max_wall_seconds:
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Wall-clock breaker tripped: elapsed={elapsed:.1f}s > max_wall_seconds={max_wall_seconds}",
+            return _return_mode_a(
+                _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Wall-clock breaker tripped: elapsed={elapsed:.1f}s > max_wall_seconds={max_wall_seconds}",
+                )
             )
 
         tokens_used = int(hist.get("tokens_used_estimate") or 0)
         if max_tokens and tokens_used > max_tokens:
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Token breaker tripped: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
+            return _return_mode_a(
+                _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Token breaker tripped: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
+                )
             )
 
         iter_start = time.monotonic()
@@ -1473,19 +1526,23 @@ def run_task_mode_a(
             hist = request.setdefault("history", {})
             tokens_used = int(hist.get("tokens_used_estimate") or 0)
             if max_tokens and tokens_used > max_tokens:
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=f"Token breaker tripped after coordinator: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
+                return _return_mode_a(
+                    _fail_task(
+                        record,
+                        home=base_home,
+                        task_dir=task_dir,
+                        detail=f"Token breaker tripped after coordinator: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
+                    )
                 )
         except Exception as exc:  # noqa: BLE001
             detail = _format_preflight_error(exc)
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Coordinator failed on iteration {attempt}: {detail}",
+            return _return_mode_a(
+                _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Coordinator failed on iteration {attempt}: {detail}",
+                )
             )
 
         _append_text(coord_output_path, f"---- iteration {attempt} decision={coord_resp.decision} ----\n{coord_resp.reason}")
@@ -1503,12 +1560,14 @@ def run_task_mode_a(
 
             record["updated_at"] = now_iso()
             upsert_task(record, home=base_home)
-            return {
-                "task_id": task_id,
-                "status": record["status"],
-                "pr_url": record["pr_url"],
-                "summary": coord_resp.reason,
-            }
+            return _return_mode_a(
+                {
+                    "task_id": task_id,
+                    "status": record["status"],
+                    "pr_url": record["pr_url"],
+                    "summary": coord_resp.reason,
+                }
+            )
 
         if coord_resp.work_item is None:
             raise RuntimeError("CoordinatorResponse missing work_item")
@@ -1520,6 +1579,7 @@ def run_task_mode_a(
 
         # One stable worker session per run/runner.
         worker_session = worker_session_name(owner, repo, task_id, worker_runner)
+        sessions_to_close.append((worker_runner, worker_session))
 
         exchange_paths = work_item_exchange_paths(repo_path, task_id, coord_resp.work_item.id)
         for key in ("result", "handoff", "block", "error"):
@@ -1582,11 +1642,13 @@ def run_task_mode_a(
             )
         except Exception as exc:  # noqa: BLE001
             detail = _format_preflight_error(exc)
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Worker runner '{worker_runner}' failed on iteration {attempt}: {detail}",
+            return _return_mode_a(
+                _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Worker runner '{worker_runner}' failed on iteration {attempt}: {detail}",
+                )
             )
 
         worker_dt = round(time.monotonic() - worker_t0, 2)
@@ -1614,11 +1676,13 @@ def run_task_mode_a(
         hist = request.setdefault("history", {})
         tokens_used = int(hist.get("tokens_used_estimate") or 0)
         if max_tokens and tokens_used > max_tokens:
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Token breaker tripped after worker: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
+            return _return_mode_a(
+                _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Token breaker tripped after worker: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
+                )
             )
 
         if agent_result.returncode != 0:
@@ -1647,14 +1711,16 @@ def run_task_mode_a(
                 "worker_nonzero_exit",
                 {"iteration": attempt, "runner": worker_runner, "rc": agent_result.returncode},
             )
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=(
-                    f"acpx {worker_runner} returned non-zero on iteration {attempt}: "
-                    f"{(agent_result.stderr or agent_result.stdout).strip()}"
-                ),
+            return _return_mode_a(
+                _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=(
+                        f"acpx {worker_runner} returned non-zero on iteration {attempt}: "
+                        f"{(agent_result.stderr or agent_result.stdout).strip()}"
+                    ),
+                )
             )
 
         _cleanup_repo_detritus(repo_path)
@@ -1691,11 +1757,13 @@ def run_task_mode_a(
                 "worker_protocol_failure",
                 {"iteration": attempt, "runner": worker_runner, "detail": str(exc)},
             )
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Worker protocol failure on iteration {attempt}: {exc}",
+            return _return_mode_a(
+                _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Worker protocol failure on iteration {attempt}: {exc}",
+                )
             )
 
         if debug:
@@ -1796,22 +1864,26 @@ def run_task_mode_a(
             del sigs[:-6]
 
             if _is_oscillating_failure_signatures(sigs):
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+                return _return_mode_a(
+                    _fail_task(
+                        record,
+                        home=base_home,
+                        task_dir=task_dir,
+                        detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+                    )
                 )
 
             if no_prog >= no_progress_max:
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=(
-                        f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
-                        f"(failure_sig={failure_sig})"
-                    ),
+                return _return_mode_a(
+                    _fail_task(
+                        record,
+                        home=base_home,
+                        task_dir=task_dir,
+                        detail=(
+                            f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
+                            f"(failure_sig={failure_sig})"
+                        ),
+                    )
                 )
 
             _set_evaluation_state(
@@ -1843,11 +1915,13 @@ def run_task_mode_a(
             _publish_branch(repo_path=repo_path, branch=work_result.branch, expected_head_sha=work_result.head_sha)
         except Exception as exc:  # noqa: BLE001
             detail = _format_preflight_error(exc)
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Failed to publish branch on iteration {attempt}: {detail}",
+            return _return_mode_a(
+                _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"Failed to publish branch on iteration {attempt}: {detail}",
+                )
             )
 
         if attempt == 1:
@@ -1867,11 +1941,13 @@ def run_task_mode_a(
                 )
             except Exception as exc:  # noqa: BLE001
                 detail = _format_preflight_error(exc)
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=f"Failed to create PR on iteration {attempt}: {detail}",
+                return _return_mode_a(
+                    _fail_task(
+                        record,
+                        home=base_home,
+                        task_dir=task_dir,
+                        detail=f"Failed to create PR on iteration {attempt}: {detail}",
+                    )
                 )
 
             record["pr_url"] = pr["html_url"]
@@ -1904,11 +1980,13 @@ def run_task_mode_a(
             ci_state, ci_detail = _poll_ci(gh, owner, repo, work_result.head_sha, ci_log)
         except Exception as exc:  # noqa: BLE001
             detail = _format_preflight_error(exc)
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"CI polling failed on iteration {attempt}: {detail}",
+            return _return_mode_a(
+                _fail_task(
+                    record,
+                    home=base_home,
+                    task_dir=task_dir,
+                    detail=f"CI polling failed on iteration {attempt}: {detail}",
+                )
             )
         ci_dt = round(time.monotonic() - ci_t0, 2)
         _append_text(ci_log, f"[{now_iso()}] final {ci_state}: {ci_detail}")
@@ -1961,14 +2039,16 @@ def run_task_mode_a(
                 _append_text(ci_log, f"[{now_iso()}] infra-retry result {ci_state}: {ci_detail}")
 
             if ci_state != "success" and ci_class["classification"] == "infra_outage":
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=(
-                        "CI outage suspected after retries; no code/workflow FIRE attempted "
-                        f"(reasons={','.join(ci_class['reason_codes']) or 'none'})"
-                    ),
+                return _return_mode_a(
+                    _fail_task(
+                        record,
+                        home=base_home,
+                        task_dir=task_dir,
+                        detail=(
+                            "CI outage suspected after retries; no code/workflow FIRE attempted "
+                            f"(reasons={','.join(ci_class['reason_codes']) or 'none'})"
+                        ),
+                    )
                 )
 
             failure_sig = f"ci:{ci_detail}"
@@ -1983,22 +2063,26 @@ def run_task_mode_a(
             del sigs[:-6]
 
             if _is_oscillating_failure_signatures(sigs):
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+                return _return_mode_a(
+                    _fail_task(
+                        record,
+                        home=base_home,
+                        task_dir=task_dir,
+                        detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+                    )
                 )
 
             if no_prog >= no_progress_max:
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=(
-                        f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
-                        f"(failure_sig={failure_sig})"
-                    ),
+                return _return_mode_a(
+                    _fail_task(
+                        record,
+                        home=base_home,
+                        task_dir=task_dir,
+                        detail=(
+                            f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
+                            f"(failure_sig={failure_sig})"
+                        ),
+                    )
                 )
 
             ci_artifact = {
@@ -2091,22 +2175,26 @@ def run_task_mode_a(
             del sigs[:-6]
 
             if _is_oscillating_failure_signatures(sigs):
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+                return _return_mode_a(
+                    _fail_task(
+                        record,
+                        home=base_home,
+                        task_dir=task_dir,
+                        detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+                    )
                 )
 
             if no_prog >= no_progress_max:
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=(
-                        f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
-                        f"(failure_sig={failure_sig})"
-                    ),
+                return _return_mode_a(
+                    _fail_task(
+                        record,
+                        home=base_home,
+                        task_dir=task_dir,
+                        detail=(
+                            f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
+                            f"(failure_sig={failure_sig})"
+                        ),
+                    )
                 )
 
             review_artifact = {"result": review_result, "summary": review_text[:2000]}
@@ -2181,18 +2269,20 @@ def run_task_mode_a(
                 "duration_s": round(time.monotonic() - loop_start, 2),
             },
         )
-        return {
-            "task_id": task_id,
-            "status": record["status"],
-            "pr_url": record["pr_url"],
-            "summary": record["summary"],
-            "ci_state": ci_state,
-            "ci_detail": ci_detail,
-            "review": review_text,
-        }
+        return _return_mode_a(
+            {
+                "task_id": task_id,
+                "status": record["status"],
+                "pr_url": record["pr_url"],
+                "summary": record["summary"],
+                "ci_state": ci_state,
+                "ci_detail": ci_detail,
+                "review": review_text,
+            }
+        )
 
     record["status"] = "failed"
     record["updated_at"] = now_iso()
     record["failure_reason"] = f"Mode A loop exhausted after {max_attempts} iterations"
     upsert_task(record, home=base_home)
-    return {"task_id": task_id, "status": record["status"], "pr_url": record["pr_url"], "summary": record["failure_reason"]}
+    return _return_mode_a({"task_id": task_id, "status": record["status"], "pr_url": record["pr_url"], "summary": record["failure_reason"]})
