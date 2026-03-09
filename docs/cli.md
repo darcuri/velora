@@ -58,6 +58,10 @@ velora run octocat/hello-world feature --spec spec.json --coordinator
 # Override runner for the worker (default: config/env)
 velora run octocat/hello-world feature --spec spec.json --runner codex
 
+# Local pilot default: direct coordinator + direct worker
+VELORA_COORDINATOR_BACKEND=direct-claude VELORA_WORKER_BACKEND=direct-codex \
+  velora run octocat/hello-world feature --spec spec.json --coordinator
+
 # Target a non-default base branch (also resets the local checkout to origin/<base>)
 velora run octocat/hello-world feature --spec spec.json --coordinator --base-branch release/1.2
 
@@ -88,8 +92,14 @@ Mode A policy defaults:
 - `VELORA_COORDINATOR_RUNNER` (default: `claude`; also supports `codex`)
 
 - `VELORA_RUNNER` (default: `codex`; also supports `claude`)
+- `VELORA_COORDINATOR_BACKEND` (`acp-claude` | `acp-codex` | `direct-claude`)
+- `VELORA_WORKER_BACKEND` (`acp-claude` | `acp-codex` | `direct-claude` | `direct-codex`)
 - `VELORA_CODEX_SESSION_PREFIX` (default: `velora-codex-`)
 - `VELORA_CLAUDE_SESSION_PREFIX` (default: `velora-claude-`)
+
+Local pilot default:
+- `VELORA_COORDINATOR_BACKEND=direct-claude`
+- `VELORA_WORKER_BACKEND=direct-codex`
 
 Vault integration:
 - `VELORA_VAULT_ADDR` (or `VAULT_ADDR`)
@@ -97,7 +107,7 @@ Vault integration:
 - `VELORA_VAULT_SECRET_ID_FILE`
 - `VELORA_VAULT_API_KEYS_PATH`
 
-ACPX:
+ACP-backed fallback only:
 - `VELORA_ACPX_CMD`
 - `VELORA_ACPX_FALLBACK`
 

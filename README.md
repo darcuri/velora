@@ -4,7 +4,7 @@
   <img src="assets/velora-icon.png" alt="Velora" width="220" />
 </p>
 
-VELORA (VEry LOng Running Agent): a Python CLI orchestrator that runs coding agents (via ACPX), creates PRs, gates on CI, and applies FIRE (Fix-and-Retry).
+VELORA (VEry LOng Running Agent): a Python CLI orchestrator that runs coding agents via direct backends or ACP-backed fallback, creates PRs, gates on CI, and applies FIRE (Fix-and-Retry).
 
 Status: bootstrapping.
 
@@ -45,6 +45,17 @@ velora run octocat/hello-world feature --spec spec.json --coordinator --base-bra
 # Extra-verbose troubleshooting logs (writes task_dir/debug.jsonl)
 velora run octocat/hello-world feature --spec spec.json --coordinator --debug
 ```
+
+### Local pilot default: direct/direct
+
+For local dogfooding, prefer direct coordinator/worker invocation and keep ACP-backed execution as fallback:
+
+```bash
+export VELORA_COORDINATOR_BACKEND=direct-claude
+export VELORA_WORKER_BACKEND=direct-codex
+```
+
+These env vars select the transport backend. `--runner` / `VELORA_RUNNER` still choose the worker runner when ACP-backed execution is in play.
 
 Token budget (Mode A):
 

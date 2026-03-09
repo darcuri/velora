@@ -4,7 +4,7 @@ from __future__ import annotations
 
 This module is intentionally small:
 - Render a strict coordinator prompt from a CoordinatorRequest JSON object.
-- Execute the coordinator via ACPX (Claude or Codex).
+- Execute the coordinator via the selected backend (direct or ACP-backed).
 - Parse strict JSON output.
 - Validate it against protocol v1.
 

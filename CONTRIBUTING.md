@@ -35,9 +35,18 @@ velora run owner/repo feature --spec spec.json
 
 ### Agent requirements (for `velora run`)
 
-Velora uses ACPX to run Codex for implementation. Ensure you have:
+Velora can execute via direct backends or ACP-backed fallback.
+
+Local pilot default:
+- `VELORA_COORDINATOR_BACKEND=direct-claude`
+- `VELORA_WORKER_BACKEND=direct-codex`
+
+Fallback-only requirements (for ACP-backed execution):
 - ACPX installed/available, or set `VELORA_ACPX_CMD`
-- OpenAI key available as `OPENAI_API_KEY` (or Vault integration configured)
+
+Auth requirements:
+- OpenAI key available as `OPENAI_API_KEY` (or Vault integration configured) for Codex-backed paths
+- `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` available for Claude-backed paths
 
 ## Project principles
 

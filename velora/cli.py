@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument(
         "--runner",
         choices=("codex", "claude"),
-        help="Which ACPX coding agent to use (default: config/env).",
+        help="Which coding agent runner to use (default: config/env).",
     )
     run_p.add_argument(
         "--base-branch",
