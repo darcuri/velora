@@ -1577,8 +1577,8 @@ def run_task_mode_a(
                 detail=f"Invalid worker backend selection on iteration {attempt}: {detail}",
             )
 
-        # One stable worker session per run/runner.
-        worker_session = worker_session_name(owner, repo, task_id, worker_runner)
+        # ACP workers should be stateless across iterations, so session names are iteration-scoped.
+        worker_session = worker_session_name(owner, repo, task_id, worker_runner, iteration=attempt)
 
         exchange_paths = work_item_exchange_paths(repo_path, task_id, coord_resp.work_item.id)
         for key in ("result", "handoff", "block", "error"):
