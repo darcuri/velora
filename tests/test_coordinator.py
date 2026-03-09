@@ -51,6 +51,25 @@ class TestCoordinator(unittest.TestCase):
         self.assertNotIn("latest_worker_result", compact_prompt)
         self.assertLess(len(compact_prompt), len(full_prompt))
 
+    def test_render_includes_no_progress_self_audit_only_when_streak_positive(self) -> None:
+        with_audit = render_coordinator_prompt_v1(
+            {
+                "protocol_version": 1,
+                "history": {"no_progress_streak": 2},
+            }
+        )
+        without_audit = render_coordinator_prompt_v1(
+            {
+                "protocol_version": 1,
+                "history": {"no_progress_streak": 0},
+            }
+        )
+
+        self.assertIn("### No-progress self-audit", with_audit)
+        self.assertIn("no_progress_streak=2", with_audit)
+        self.assertIn("what you are changing in the reason field", with_audit)
+        self.assertNotIn("### No-progress self-audit", without_audit)
+
     def test_run_coordinator_rejects_non_json_output(self) -> None:
         with patch("velora.coordinator.run_claude") as mocked:
             mocked.return_value = type(

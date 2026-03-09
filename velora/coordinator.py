@@ -32,7 +32,7 @@ COORDINATOR_PROMPT_TEMPLATE_V1 = """You are Velora Coordinator, the control-plan
 ### Input
 You will be given a single JSON object called CoordinatorRequest.
 Treat it as the authoritative state of the run. Do not assume additional context.
-{specialist_matrix_section}{brief_section}{replay_section}
+{specialist_matrix_section}{brief_section}{replay_section}{self_audit_section}
 CoordinatorRequest:
 {request_json}
 
@@ -150,11 +150,24 @@ def render_coordinator_prompt_v1(
             "If anything here conflicts with CoordinatorRequest, trust CoordinatorRequest.\n\n"
             f"{replay_text}\n\n"
         )
+
+    history = request.get("history") if isinstance(request, dict) else None
+    no_progress_streak = int(history.get("no_progress_streak") or 0) if isinstance(history, dict) else 0
+    self_audit_section = ""
+    if no_progress_streak > 0:
+        self_audit_section = (
+            "\n### No-progress self-audit\n"
+            f"The run currently has no_progress_streak={no_progress_streak}.\n"
+            "Before choosing the next step, re-read the objective and decide whether the current approach is still aligned.\n"
+            "If a fundamentally different strategy is needed, take it and say what you are changing in the reason field.\n"
+            "Do not merely patch symptoms from the previous failed attempt.\n\n"
+        )
     return COORDINATOR_PROMPT_TEMPLATE_V1.format(
         request_json=request_json,
         specialist_matrix_section=specialist_matrix_section,
         brief_section=brief_section,
         replay_section=replay_section,
+        self_audit_section=self_audit_section,
     )
 
 
