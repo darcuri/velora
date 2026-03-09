@@ -1455,13 +1455,38 @@ def run_task_mode_a(
                 },
             )
             coord_t0 = time.monotonic()
-            coord_run = run_coordinator(
-                session_name=coord_session,
-                cwd=repo_path,
-                request=request,
-                runner=coord_runner,
-                backend=coord_backend,
-            )
+            coord_run = None
+            for coord_try in range(2):
+                try:
+                    coord_run = run_coordinator(
+                        session_name=coord_session,
+                        cwd=repo_path,
+                        request=request,
+                        runner=coord_runner,
+                        backend=coord_backend,
+                    )
+                    break
+                except ProtocolError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    detail = _format_preflight_error(exc)
+                    if coord_try >= 1:
+                        raise RuntimeError(
+                            f"Coordinator retry exhausted after {coord_try + 1} attempts: {detail}"
+                        ) from exc
+                    _dbg(
+                        dbg_dir,
+                        "coordinator_retry",
+                        {
+                            "iteration": attempt,
+                            "retry": coord_try + 1,
+                            "delay_s": 1,
+                            "detail": detail,
+                        },
+                    )
+                    time.sleep(1)
+            if coord_run is None:
+                raise RuntimeError("Coordinator retry loop exited without a result")
             coord_dt = round(time.monotonic() - coord_t0, 2)
             coord_resp = coord_run.response
             _accumulate_acpx_usage(request, session_name=coord_session, result=coord_run.cmd, actor="coordinator")
