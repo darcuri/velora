@@ -147,8 +147,8 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=coord_runs) as run_coord,
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_completed_work_result_json())),
+            patch("velora.run.run_coordinator", side_effect=coord_runs) as run_coord,
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_completed_work_result_json())),
             patch("velora.run._poll_ci", return_value=("failure", "tests failed")),
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
@@ -192,8 +192,8 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=coord_runs),
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_completed_work_result_json())) as run_worker,
+            patch("velora.run.run_coordinator", side_effect=coord_runs),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_completed_work_result_json())) as run_worker,
             patch("velora.run._poll_ci", return_value=("failure", "tests failed")),
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
@@ -234,9 +234,9 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=coord_runs),
+            patch("velora.run.run_coordinator", side_effect=coord_runs),
             patch(
-                "velora.run.run_codex",
+                "velora.run.run_worker",
                 side_effect=_run_codex_writing_result_for_task_map(
                     {
                         "task111": _completed_work_result_json(branch="velora/task111"),

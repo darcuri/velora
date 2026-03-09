@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import asdict
 
-from .coordinator import run_coordinator_v1
+from .runners import run_coordinator
 from .orchestrator import build_initial_coordinator_request, coordinator_session_name
 from .constants import VERBS
 from .run import resume_task, run_task
@@ -181,8 +181,15 @@ def main(argv: list[str] | None = None) -> int:
             if args.coord_cmd == "run":
                 session = coordinator_session_name(request["repo"]["owner"], request["repo"]["name"], request["run_id"])
                 coord_runner = os.environ.get("VELORA_COORDINATOR_RUNNER", "claude")
-                resp = run_coordinator_v1(session_name=session, cwd=repo_path, request=request, runner=str(coord_runner))
-                payload = asdict(resp)
+                coord_backend = os.environ.get("VELORA_COORDINATOR_BACKEND", "") or None
+                coord_run = run_coordinator(
+                    session_name=session,
+                    cwd=repo_path,
+                    request=request,
+                    runner=str(coord_runner),
+                    backend=(str(coord_backend).strip().lower() or None),
+                )
+                payload = asdict(coord_run.response)
                 if args.json:
                     print(json.dumps(payload, sort_keys=True))
                 else:

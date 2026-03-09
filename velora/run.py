@@ -12,10 +12,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .acpx import GEMINI_REVIEW_PROMPT_PREFIX, parse_codex_footer, run_claude, run_codex, run_gemini_review
+from .acpx import GEMINI_REVIEW_PROMPT_PREFIX, parse_codex_footer, run_codex, run_gemini_review
 from .config import get_config
 from .constants import VALID_VERBS
-from .coordinator import run_coordinator_v1_with_cmd
+from .runners import normalize_worker_backend, run_coordinator, run_worker
+from .run_memory import append_run_replay_event, seed_run_replay, sync_run_replay
 from .exchange import append_event, work_item_exchange_paths, write_json
 from .github import GitHubClient
 from .orchestrator import coordinator_session_name, worker_session_name
@@ -1389,9 +1390,18 @@ def run_task_mode_a(
 
     coord_session = coordinator_session_name(owner, repo, task_id)
     coord_runner = os.environ.get("VELORA_COORDINATOR_RUNNER", "claude").strip().lower() or "claude"
+    coord_backend = os.environ.get("VELORA_COORDINATOR_BACKEND", "").strip().lower() or None
+    worker_backend = os.environ.get("VELORA_WORKER_BACKEND", "").strip().lower() or None
 
     max_attempts = spec.max_attempts if spec.max_attempts is not None else cfg.max_attempts
     max_attempts = max(1, min(int(max_attempts), 10))
+
+    seed_run_replay(
+        repo_path,
+        request=request,
+        max_attempts=max_attempts,
+        verb=verb,
+    )
 
     policy = request.get("policy") if isinstance(request, dict) else {}
     if not isinstance(policy, dict):
@@ -1438,16 +1448,18 @@ def run_task_mode_a(
                 {
                     "iteration": attempt,
                     "runner": coord_runner,
+                    "backend": coord_backend,
                     "session": coord_session,
                     "tokens_total": int(hist.get("tokens_used_estimate") or 0),
                 },
             )
             coord_t0 = time.monotonic()
-            coord_run = run_coordinator_v1_with_cmd(
+            coord_run = run_coordinator(
                 session_name=coord_session,
                 cwd=repo_path,
                 request=request,
                 runner=coord_runner,
+                backend=coord_backend,
             )
             coord_dt = round(time.monotonic() - coord_t0, 2)
             coord_resp = coord_run.response
@@ -1459,6 +1471,7 @@ def run_task_mode_a(
                 {
                     "iteration": attempt,
                     "duration_s": coord_dt,
+                    "backend": coord_backend,
                     "decision": coord_resp.decision,
                     "selected_role": coord_resp.selected_specialist.role,
                     "selected_runner": coord_resp.selected_specialist.runner,
@@ -1490,6 +1503,27 @@ def run_task_mode_a(
 
         _append_text(coord_output_path, f"---- iteration {attempt} decision={coord_resp.decision} ----\n{coord_resp.reason}")
 
+        request.setdefault("state", {})
+        request["state"]["latest_coordinator_decision"] = {
+            "decision": coord_resp.decision,
+            "reason": coord_resp.reason,
+            "selected_specialist": _json_compatible(coord_resp.selected_specialist),
+            "work_item": (_json_compatible(coord_resp.work_item) if coord_resp.work_item is not None else None),
+        }
+        append_run_replay_event(
+            repo_path,
+            task_id,
+            iteration=attempt,
+            event="coordinator_decision",
+            data={
+                "decision": coord_resp.decision,
+                "reason": coord_resp.reason,
+                "selected_specialist": _json_compatible(coord_resp.selected_specialist),
+                "work_item": (_json_compatible(coord_resp.work_item) if coord_resp.work_item is not None else None),
+            },
+        )
+        sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
+
         if coord_resp.decision != "execute_work_item":
             # In Mode A, finalize/stop must be explicit and we should surface it.
             record["status"] = _mode_a_status_for_terminal_decision(coord_resp.decision)
@@ -1500,6 +1534,20 @@ def run_task_mode_a(
 
             hist = request.setdefault("history", {})
             hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
+
+            request.setdefault("state", {})
+            request["state"]["run_terminal"] = {
+                "decision": coord_resp.decision,
+                "reason": coord_resp.reason,
+            }
+            append_run_replay_event(
+                repo_path,
+                task_id,
+                iteration=attempt,
+                event="run_terminal",
+                data={"decision": coord_resp.decision, "reason": coord_resp.reason},
+            )
+            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
 
             record["updated_at"] = now_iso()
             upsert_task(record, home=base_home)
@@ -1517,6 +1565,16 @@ def run_task_mode_a(
         if worker_runner not in {"codex", "claude"}:
             # Protocol should prevent this.
             raise RuntimeError(f"Unsupported worker runner: {worker_runner}")
+        try:
+            worker_backend_key = normalize_worker_backend(backend=worker_backend, runner=worker_runner)
+        except Exception as exc:  # noqa: BLE001
+            detail = _format_preflight_error(exc)
+            return _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Invalid worker backend selection on iteration {attempt}: {detail}",
+            )
 
         # One stable worker session per run/runner.
         worker_session = worker_session_name(owner, repo, task_id, worker_runner)
@@ -1533,6 +1591,7 @@ def run_task_mode_a(
                 "work_item_id": coord_resp.work_item.id,
                 "iteration": attempt,
                 "runner": worker_runner,
+                "backend": worker_backend_key,
                 "status": "running",
                 "updated_at": now_iso(),
             },
@@ -1545,6 +1604,7 @@ def run_task_mode_a(
                 "work_item_id": coord_resp.work_item.id,
                 "iteration": attempt,
                 "runner": worker_runner,
+                "backend": worker_backend_key,
             },
         )
 
@@ -1566,6 +1626,7 @@ def run_task_mode_a(
             {
                 "iteration": attempt,
                 "runner": worker_runner,
+                "backend": worker_backend_key,
                 "session": worker_session,
                 "work_item_id": coord_resp.work_item.id,
                 "work_item_kind": coord_resp.work_item.kind,
@@ -1575,10 +1636,12 @@ def run_task_mode_a(
         worker_t0 = time.monotonic()
 
         try:
-            agent_result = (
-                run_codex(session_name=worker_session, cwd=repo_path, prompt=prompt)
-                if worker_runner == "codex"
-                else run_claude(session_name=worker_session, cwd=repo_path, prompt=prompt)
+            agent_result = run_worker(
+                session_name=worker_session,
+                cwd=repo_path,
+                prompt=prompt,
+                runner=worker_runner,
+                backend=worker_backend_key,
             )
         except Exception as exc:  # noqa: BLE001
             detail = _format_preflight_error(exc)
@@ -1586,7 +1649,7 @@ def run_task_mode_a(
                 record,
                 home=base_home,
                 task_dir=task_dir,
-                detail=f"Worker runner '{worker_runner}' failed on iteration {attempt}: {detail}",
+                detail=f"Worker backend '{worker_backend_key}' failed on iteration {attempt}: {detail}",
             )
 
         worker_dt = round(time.monotonic() - worker_t0, 2)
@@ -1595,6 +1658,7 @@ def run_task_mode_a(
             "worker_done",
             {
                 "iteration": attempt,
+                "backend": worker_backend_key,
                 "duration_s": worker_dt,
                 "rc": agent_result.returncode,
                 "model_id": getattr(getattr(agent_result, "usage", None), "model_id", None),
@@ -1652,7 +1716,7 @@ def run_task_mode_a(
                 home=base_home,
                 task_dir=task_dir,
                 detail=(
-                    f"acpx {worker_runner} returned non-zero on iteration {attempt}: "
+                    f"worker backend {worker_backend_key} returned non-zero on iteration {attempt}: "
                     f"{(agent_result.stderr or agent_result.stdout).strip()}"
                 ),
             )
@@ -1762,6 +1826,20 @@ def run_task_mode_a(
         request["state"]["last_commit"] = work_result.head_sha
         request["state"]["diff_summary"] = work_result.summary
         request["state"]["latest_worker_result"] = _work_result_artifact(work_result)
+        append_run_replay_event(
+            repo_path,
+            task_id,
+            iteration=attempt,
+            event=("worker_handoff" if outcome_kind == "handoff" else f"worker_{work_result.status}"),
+            data={
+                "work_item_id": work_result.work_item_id,
+                "status": work_result.status,
+                "summary": work_result.summary,
+                "head_sha": work_result.head_sha,
+                "branch": work_result.branch,
+            },
+        )
+        sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
         hist = request.setdefault("history", {})
 
         if outcome_kind == "handoff":
@@ -1770,6 +1848,7 @@ def run_task_mode_a(
             if isinstance(notes, list):
                 notes.append(f"handoff[{coord_resp.work_item.id}]={work_result.summary}")
                 del notes[:-12]
+            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
             hist["no_progress_streak"] = 0
             last_failure_sig = None
             hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
@@ -1781,6 +1860,7 @@ def run_task_mode_a(
                 worker_result=work_result,
                 outcome="worker_handoff",
             )
+            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
             continue
 
         if work_result.status != "completed":
@@ -1837,6 +1917,7 @@ def run_task_mode_a(
                 worker_result=work_result,
                 outcome=f"worker_{work_result.status}",
             )
+            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
             continue
 
         try:
@@ -2008,6 +2089,13 @@ def run_task_mode_a(
             }
             request.setdefault("state", {})
             request["state"]["latest_ci"] = ci_artifact
+            append_run_replay_event(
+                repo_path,
+                task_id,
+                iteration=attempt,
+                event="ci_result",
+                data={"state": ci_state, "detail": ci_detail, "classification": ci_class},
+            )
             _set_evaluation_state(
                 request,
                 status="fail",
@@ -2018,6 +2106,7 @@ def run_task_mode_a(
                 failing_checks=[{"name": "ci", "kind": "ci", "url": record.get("pr_url"), "summary": ci_detail}],
                 logs_excerpt=ci_detail,
             )
+            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
             _append_iteration_history_entry(
                 request,
                 iteration=attempt,
@@ -2032,6 +2121,14 @@ def run_task_mode_a(
         # CI success → review gate.
         request.setdefault("state", {})
         request["state"]["latest_ci"] = {"state": ci_state, "detail": ci_detail, "classification": None}
+        append_run_replay_event(
+            repo_path,
+            task_id,
+            iteration=attempt,
+            event="ci_result",
+            data={"state": ci_state, "detail": ci_detail, "classification": None},
+        )
+        sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
         _persist_record_checkpoint(
             record,
             home=base_home,
@@ -2112,6 +2209,13 @@ def run_task_mode_a(
             review_artifact = {"result": review_result, "summary": review_text[:2000]}
             request.setdefault("state", {})
             request["state"]["latest_review"] = review_artifact
+            append_run_replay_event(
+                repo_path,
+                task_id,
+                iteration=attempt,
+                event="review_result",
+                data=review_artifact,
+            )
             _set_evaluation_state(
                 request,
                 status="fail",
@@ -2123,6 +2227,7 @@ def run_task_mode_a(
                 failing_checks=[{"name": "review", "kind": "review", "url": record.get("pr_url"), "summary": review_text[:2000]}],
                 logs_excerpt=review_text[:2000],
             )
+            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
             _append_iteration_history_entry(
                 request,
                 iteration=attempt,
@@ -2138,6 +2243,13 @@ def run_task_mode_a(
         # Success.
         request.setdefault("state", {})
         request["state"]["latest_review"] = {"result": review_result, "summary": review_text[:2000]}
+        append_run_replay_event(
+            repo_path,
+            task_id,
+            iteration=attempt,
+            event="review_result",
+            data={"result": review_result, "summary": review_text[:2000]},
+        )
         _set_evaluation_state(
             request,
             status="success",
@@ -2149,6 +2261,7 @@ def run_task_mode_a(
             failing_checks=[],
             logs_excerpt="",
         )
+        sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
         hist["no_progress_streak"] = 0
         hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
         hist.pop("failure_signatures", None)
@@ -2163,6 +2276,7 @@ def run_task_mode_a(
             ci={"state": ci_state, "detail": ci_detail, "classification": None},
             review={"result": review_result, "summary": review_text[:2000]},
         )
+        sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
 
         record["status"] = "ready"
         _persist_record_checkpoint(

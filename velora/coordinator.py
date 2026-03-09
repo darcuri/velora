@@ -32,7 +32,7 @@ COORDINATOR_PROMPT_TEMPLATE_V1 = """You are Velora Coordinator, the control-plan
 ### Input
 You will be given a single JSON object called CoordinatorRequest.
 Treat it as the authoritative state of the run. Do not assume additional context.
-
+{specialist_matrix_section}{replay_section}
 CoordinatorRequest:
 {request_json}
 
@@ -81,6 +81,10 @@ Rules:
 - work_item is REQUIRED only when decision=execute_work_item; it must be omitted otherwise
 - reason MUST be a string
 - Unknown keys are forbidden
+- `work_item.limits.max_diff_lines` MUST be EXACTLY one of: 50, 100, 200, 400
+- NEVER invent intermediate `max_diff_lines` values like 75, 150, 250, or 300
+- `work_item.limits.max_commits` MUST be exactly 1
+- Before you answer, silently verify that every enum/limit value exactly matches the allowed schema; do not output the verification step
 """
 
 
@@ -90,9 +94,45 @@ class CoordinatorRunResult:
     cmd: CmdResult
 
 
-def render_coordinator_prompt_v1(request: dict[str, Any]) -> str:
+def _render_specialist_matrix_section(request: dict[str, Any]) -> str:
+    policy = request.get("policy") if isinstance(request, dict) else None
+    matrix = policy.get("specialist_matrix") if isinstance(policy, dict) else None
+    if not isinstance(matrix, dict) or not matrix:
+        return ""
+
+    lines = [
+        "\n### Allowed specialist matrix for this run",
+        "These role/runner pairings are authoritative. You MUST stay within them.",
+        "Choosing any other runner for a role is a hard failure.",
+        "",
+    ]
+    for role in sorted(matrix):
+        runners = matrix.get(role)
+        if isinstance(runners, list) and runners:
+            allowed = ", ".join(str(x) for x in runners)
+            lines.append(f"- {role}: {allowed}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_coordinator_prompt_v1(request: dict[str, Any], *, replay_memory: str | None = None) -> str:
     request_json = json.dumps(request, indent=2, sort_keys=True)
-    return COORDINATOR_PROMPT_TEMPLATE_V1.format(request_json=request_json)
+    specialist_matrix_section = _render_specialist_matrix_section(request)
+    replay_text = (replay_memory or "").strip()
+    replay_section = ""
+    if replay_text:
+        replay_section = (
+            "\n### Replay context\n"
+            "The following replay summary is provided only to help continuity between coordinator turns.\n"
+            "It may omit details and is not authoritative.\n"
+            "If anything here conflicts with CoordinatorRequest, trust CoordinatorRequest.\n\n"
+            f"{replay_text}\n\n"
+        )
+    return COORDINATOR_PROMPT_TEMPLATE_V1.format(
+        request_json=request_json,
+        specialist_matrix_section=specialist_matrix_section,
+        replay_section=replay_section,
+    )
 
 
 def _parse_strict_json_object(text: str) -> dict[str, Any]:
@@ -125,6 +165,24 @@ def _parse_strict_json_object(text: str) -> dict[str, Any]:
     return payload
 
 
+def validate_coordinator_cmd_result(*, result: CmdResult, request: dict[str, Any]) -> CoordinatorRunResult:
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout).strip() or "unknown error"
+        raise RuntimeError(f"Coordinator runner failed: {msg}")
+
+    try:
+        payload = _parse_strict_json_object(result.stdout)
+        resp = validate_coordinator_response(payload)
+        # Hard-fail if coordinator selected an out-of-policy specialist/runner/model.
+        policy = request.get("policy") if isinstance(request, dict) else None
+        matrix = policy.get("specialist_matrix") if isinstance(policy, dict) else None
+        enforce_specialist_matrix(resp, matrix)
+        return CoordinatorRunResult(response=resp, cmd=result)
+    except ProtocolError as exc:
+        excerpt = (result.stdout or "").strip().replace("\n", " ")[:500]
+        raise ProtocolError(f"{exc} | coordinator_output_excerpt={excerpt!r}") from exc
+
+
 def run_coordinator_v1_with_cmd(
     *,
     session_name: str,
@@ -150,21 +208,7 @@ def run_coordinator_v1_with_cmd(
         else run_codex(session_name=session_name, cwd=cwd, prompt=prompt)
     )
 
-    if result.returncode != 0:
-        msg = (result.stderr or result.stdout).strip() or "unknown error"
-        raise RuntimeError(f"Coordinator runner failed: {msg}")
-
-    try:
-        payload = _parse_strict_json_object(result.stdout)
-        resp = validate_coordinator_response(payload)
-        # Hard-fail if coordinator selected an out-of-policy specialist/runner/model.
-        policy = request.get("policy") if isinstance(request, dict) else None
-        matrix = policy.get("specialist_matrix") if isinstance(policy, dict) else None
-        enforce_specialist_matrix(resp, matrix)
-        return CoordinatorRunResult(response=resp, cmd=result)
-    except ProtocolError as exc:
-        excerpt = (result.stdout or "").strip().replace("\n", " ")[:500]
-        raise ProtocolError(f"{exc} | coordinator_output_excerpt={excerpt!r}") from exc
+    return validate_coordinator_cmd_result(result=result, request=request)
 
 
 def run_coordinator_v1(
