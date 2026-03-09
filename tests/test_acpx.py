@@ -1,5 +1,6 @@
 import subprocess
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from velora.acpx import (
@@ -31,9 +32,9 @@ class TestAcpxDiscovery(unittest.TestCase):
         self.assertEqual(parsed["branch"], "velora/abc")
 
     def test_raises_if_missing_everywhere(self):
-        with patch("velora.acpx.which", return_value=None), patch(
-            "velora.acpx._fallback_acpx_exists", return_value=False
-        ):
+        with patch("velora.acpx.get_config", return_value=SimpleNamespace(acpx_cmd=None, acpx_fallback=None)), patch(
+            "velora.acpx.which", return_value=None
+        ), patch("velora.acpx._fallback_acpx_exists", return_value=False):
             with self.assertRaises(RuntimeError):
                 resolve_acpx_cmd(env={})
 
