@@ -9,6 +9,7 @@ while direct Claude execution can now be exercised behind the same stable call
 surface.
 """
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -59,9 +60,23 @@ def _load_replay_memory(cwd: Path, request: dict[str, Any]) -> str | None:
     return memory_path.read_text(encoding="utf-8")
 
 
+
+def _load_replay_brief(cwd: Path, request: dict[str, Any]) -> dict[str, Any] | None:
+    run_id = str(request.get("run_id") or "")
+    if not run_id:
+        return None
+    brief_path = coordinator_replay_paths(cwd, run_id)["brief"]
+    if not brief_path.exists():
+        return None
+    payload = json.loads(brief_path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else None
+
+
+
 def _run_direct_claude_coordinator(*, cwd: Path, request: dict[str, Any]) -> CoordinatorRunResult:
     replay_memory = _load_replay_memory(cwd, request)
-    prompt = render_coordinator_prompt_v1(request, replay_memory=replay_memory)
+    replay_brief = _load_replay_brief(cwd, request)
+    prompt = render_coordinator_prompt_v1(request, replay_memory=replay_memory, brief=replay_brief)
     env = os.environ.copy()
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     _ensure_anthropic_auth(env)

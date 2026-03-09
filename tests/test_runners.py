@@ -89,6 +89,10 @@ class TestRunners(unittest.TestCase):
             memory_dir = repo_path / ".velora" / "exchange" / "runs" / "task123"
             memory_dir.mkdir(parents=True)
             (memory_dir / "coordinator-memory.md").write_text("# Coordinator Replay\n\nhello", encoding="utf-8")
+            (memory_dir / "coordinator-brief.json").write_text(
+                '{"run_id":"task123","status":{"state":"running"}}',
+                encoding="utf-8",
+            )
 
             request = {"run_id": "task123", "policy": {}}
             with (
@@ -111,7 +115,11 @@ class TestRunners(unittest.TestCase):
                 )
 
         self.assertEqual(result.response.decision, "finalize_success")
-        mock_render.assert_called_once_with(request, replay_memory="# Coordinator Replay\n\nhello")
+        mock_render.assert_called_once_with(
+            request,
+            replay_memory="# Coordinator Replay\n\nhello",
+            brief={"run_id": "task123", "status": {"state": "running"}},
+        )
         mock_auth.assert_called_once()
         env = mock_run_cmd.call_args.kwargs["env"]
         self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")

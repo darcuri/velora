@@ -28,6 +28,29 @@ class TestCoordinator(unittest.TestCase):
         self.assertIn("### Allowed specialist matrix for this run", prompt)
         self.assertIn("- implementer: codex", prompt)
 
+    def test_render_with_brief_uses_compact_request_and_excludes_history_state(self) -> None:
+        request = {
+            "protocol_version": 1,
+            "run_id": "task123",
+            "iteration": 4,
+            "objective": "Tighten Mode A context hygiene",
+            "repo": {"owner": "octocat", "name": "velora"},
+            "policy": {"specialist_matrix": {"implementer": ["codex"]}},
+            "evaluation": {"status": "fail", "outcome": "ci_failure"},
+            "history": {"work_items_executed": [{"id": f"WI-{i:04d}"} for i in range(20)]},
+            "state": {"latest_worker_result": {"summary": "very long state blob" * 20}},
+        }
+        brief = {"run_id": "task123", "status": {"state": "running"}, "open_loops": ["Fix CI"]}
+
+        full_prompt = render_coordinator_prompt_v1(request)
+        compact_prompt = render_coordinator_prompt_v1(request, brief=brief)
+
+        self.assertIn("### Coordinator brief", compact_prompt)
+        self.assertIn("\"open_loops\": [", compact_prompt)
+        self.assertNotIn("work_items_executed", compact_prompt)
+        self.assertNotIn("latest_worker_result", compact_prompt)
+        self.assertLess(len(compact_prompt), len(full_prompt))
+
     def test_run_coordinator_rejects_non_json_output(self) -> None:
         with patch("velora.coordinator.run_claude") as mocked:
             mocked.return_value = type(
