@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -260,6 +261,51 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
         )
         self.assertEqual(gh.create_pull_request.call_args.kwargs["head"], "velora/task123")
         self.assertEqual(poll_ci.call_args.args[3], "abc123")
+
+    def test_mode_a_writes_non_empty_run_scoped_audit_log(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+        gh.create_pull_request.return_value = {"html_url": "https://example/pr/1", "number": 1}
+        gh.post_issue_comment.return_value = {}
+
+        audit_path = Path("/tmp/repo/.velora/runs/audit-task/audit.jsonl")
+        shutil.rmtree(audit_path.parent, ignore_errors=True)
+
+        def _worker_for_audit_task(*args, **kwargs):
+            result_path = Path("/tmp/repo/.velora/exchange/runs/audit-task/WI-0001/result.json")
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(_work_result_json(branch="velora/audit-task"), encoding="utf-8")
+            return CmdResult(0, "worker chatter", "")
+
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.build_task_id", return_value="audit-task"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.run_coordinator", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
+            patch("velora.run.run_worker", side_effect=_worker_for_audit_task),
+            patch("velora.run._poll_ci", return_value=("success", "ok")),
+            patch("velora.run._read_diff_for_review", return_value="diff"),
+            patch("velora.run.run_gemini_review", return_value=CmdResult(0, "OK", "")),
+            patch("velora.run._cleanup_repo_detritus", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
+
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(audit_path.exists())
+        lines = [line for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertGreater(len(lines), 0)
+        event_types = {json.loads(line)["event_type"] for line in lines}
+        self.assertIn("run_start", event_types)
+        self.assertIn("work_item_dispatched", event_types)
+        self.assertIn("work_item_completed", event_types)
+        self.assertIn("run_end", event_types)
 
     def test_mode_a_respects_explicit_worker_backend_override(self):
         gh = MagicMock()

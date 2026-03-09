@@ -63,6 +63,14 @@ Token budget (Mode A):
 export VELORA_MODE_A_MAX_TOKENS=200000
 ```
 
+### Audit inspection
+
+Mode A now writes per-run audit events to `.velora/runs/<run_id>/audit.jsonl` in the checked-out repo. Use `velora audit inspect` to print a summary of the most recent run, or pass a run id for a specific run. The summary includes objective snippet, iterations, coordinator decisions, and final status.
+
+```bash
+velora audit inspect --run 20260309041214-fa55112b
+```
+
 ### Allowed but unsafe: `--unsafe-task`
 You *can* pass a task directly, but it’s unsafe (visible via `ps`):
 

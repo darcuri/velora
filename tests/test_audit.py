@@ -3,6 +3,7 @@ import json
 from velora.audit import (
     CI_RESULT,
     COORDINATOR_DECISION,
+    RUN_END,
     REVIEW_RESULT,
     RUN_STARTED,
     RUN_TERMINAL,
@@ -53,6 +54,7 @@ def test_append_event_writes_valid_jsonl_and_is_append_only(tmp_path):
     assert first == second
     assert first["run_id"] == run_id
     assert first["event_type"] == RUN_STARTED
+    assert path == tmp_path / ".velora" / "runs" / run_id / "audit.jsonl"
 
 
 def test_load_events_round_trips_appended_data(tmp_path):
@@ -233,3 +235,19 @@ def test_multi_iteration_summary_includes_both_iterations_and_work_items(tmp_pat
     assert "Iterations touched: `1, 2`" in summary
     assert "`WI-0001`" in summary
     assert "`WI-0002`" in summary
+
+
+def test_append_event_schema_and_redaction(tmp_path):
+    run_id = "run-secret"
+    event = _event(
+        run_id=run_id,
+        iteration=1,
+        event_type=RUN_END,
+        timestamp="2026-03-09T00:00:50+00:00",
+        payload={"status": "failed", "api_key": "sk-secret-value", "auth_header": "Bearer abc"},
+    )
+    path = append_event(run_id, event, base_dir=tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert set(payload.keys()) == {"event_type", "iteration", "payload", "run_id", "timestamp"}
+    assert payload["payload"]["api_key"] == "[REDACTED]"
+    assert payload["payload"]["auth_header"] == "[REDACTED]"
