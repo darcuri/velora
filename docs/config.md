@@ -57,11 +57,13 @@ Mode A:
 - `VELORA_USD_EQUIV_PER_1M_TOKENS`
 
 - `VELORA_RUNNER` (codex | claude)
+- `VELORA_COORDINATOR_BACKEND` (`acp-claude` | `acp-codex` | `direct-claude`)
+- `VELORA_WORKER_BACKEND` (`acp-claude` | `acp-codex` | `direct-claude` | `direct-codex`)
 - `VELORA_CODEX_SESSION_PREFIX`
 - `VELORA_CLAUDE_SESSION_PREFIX`
 - `VELORA_VAULT_ADDR` (or `VAULT_ADDR`)
 - `VELORA_VAULT_ROLE_ID_FILE`
 - `VELORA_VAULT_SECRET_ID_FILE`
 - `VELORA_VAULT_API_KEYS_PATH`
-- `VELORA_ACPX_CMD`
-- `VELORA_ACPX_FALLBACK`
+- `VELORA_ACPX_CMD` (ACP-backed fallback only)
+- `VELORA_ACPX_FALLBACK` (ACP-backed fallback only)
