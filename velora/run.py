@@ -13,11 +13,24 @@ from pathlib import Path
 from typing import Any
 
 from .acpx import GEMINI_REVIEW_PROMPT_PREFIX, parse_codex_footer, run_codex, run_gemini_review
+from .audit import (
+    CI_RESULT as AUDIT_CI_RESULT,
+    DECISION_MADE as AUDIT_DECISION_MADE,
+    ITERATION_END as AUDIT_ITERATION_END,
+    ITERATION_START as AUDIT_ITERATION_START,
+    REVIEW_RESULT as AUDIT_REVIEW_RESULT,
+    RUN_END as AUDIT_RUN_END,
+    RUN_START as AUDIT_RUN_START,
+    WORK_ITEM_COMPLETED as AUDIT_WORK_ITEM_COMPLETED,
+    WORK_ITEM_DISPATCHED as AUDIT_WORK_ITEM_DISPATCHED,
+    AuditEvent,
+    append_event as append_audit_event,
+)
 from .config import get_config
 from .constants import VALID_VERBS
 from .runners import normalize_worker_backend, run_coordinator, run_worker
 from .run_memory import append_run_replay_event, seed_run_replay, sync_run_replay
-from .exchange import append_event, work_item_exchange_paths, write_json
+from .exchange import append_event as append_exchange_event, work_item_exchange_paths, write_json
 from .github import GitHubClient
 from .orchestrator import coordinator_session_name, worker_session_name
 from .protocol import ProtocolError, WorkResult, validate_work_result
@@ -885,6 +898,34 @@ def _format_preflight_error(exc: Exception) -> str:
     return msg
 
 
+def _objective_snippet(text: str, max_len: int = 160) -> str:
+    compact = " ".join((text or "").split()).strip()
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 1].rstrip() + "…"
+
+
+def _append_audit_event(
+    *,
+    repo_path: Path,
+    run_id: str,
+    iteration: int,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    append_audit_event(
+        run_id,
+        AuditEvent(
+            run_id=run_id,
+            iteration=iteration,
+            event_type=event_type,
+            timestamp=now_iso(),
+            payload=payload,
+        ),
+        base_dir=repo_path,
+    )
+
+
 def _fail_task(record: dict[str, Any], *, home: Path, task_dir: Path, detail: str) -> dict[str, Any]:
     """Mark a task record as failed and write an error artifact.
 
@@ -1404,6 +1445,11 @@ def run_task_mode_a(
         verb=verb,
     )
 
+    def _audit(iteration: int, event_type: str, **payload: Any) -> None:
+        _append_audit_event(repo_path=repo_path, run_id=task_id, iteration=iteration, event_type=event_type, payload=payload)
+
+    _audit(0, AUDIT_RUN_START, repo=repo_ref, branch=work_branch, objective_snippet=_objective_snippet(task_text))
+
     policy = request.get("policy") if isinstance(request, dict) else {}
     if not isinstance(policy, dict):
         policy = {}
@@ -1417,6 +1463,7 @@ def run_task_mode_a(
 
     for attempt in range(1, max_attempts + 1):
         request["iteration"] = attempt
+        _audit(attempt, AUDIT_ITERATION_START, attempt=attempt)
 
         # Breakers: wall clock and token budget.
         hist = request.setdefault("history", {})
@@ -1536,6 +1583,13 @@ def run_task_mode_a(
             "selected_specialist": _json_compatible(coord_resp.selected_specialist),
             "work_item": (_json_compatible(coord_resp.work_item) if coord_resp.work_item is not None else None),
         }
+        _audit(
+            attempt,
+            AUDIT_DECISION_MADE,
+            decision=coord_resp.decision,
+            reason=_objective_snippet(coord_resp.reason, max_len=240),
+            work_item_id=(coord_resp.work_item.id if coord_resp.work_item else None),
+        )
         append_run_replay_event(
             repo_path,
             task_id,
@@ -1577,6 +1631,8 @@ def run_task_mode_a(
 
             record["updated_at"] = now_iso()
             upsert_task(record, home=base_home)
+            _audit(attempt, AUDIT_ITERATION_END, outcome="terminal_decision", status=record["status"])
+            _audit(attempt, AUDIT_RUN_END, status=record["status"], summary=_objective_snippet(coord_resp.reason, max_len=240))
             return {
                 "task_id": task_id,
                 "status": record["status"],
@@ -1622,7 +1678,7 @@ def run_task_mode_a(
                 "updated_at": now_iso(),
             },
         )
-        append_event(
+        append_exchange_event(
             exchange_paths["events"],
             "work_item_dispatched",
             {
@@ -1632,6 +1688,13 @@ def run_task_mode_a(
                 "runner": worker_runner,
                 "backend": worker_backend_key,
             },
+        )
+        _audit(
+            attempt,
+            AUDIT_WORK_ITEM_DISPATCHED,
+            work_item_id=coord_resp.work_item.id,
+            role=coord_resp.selected_specialist.role,
+            runner=worker_runner,
         )
 
         prompt = build_worker_prompt_v1(
@@ -1732,7 +1795,7 @@ def run_task_mode_a(
                     "updated_at": now_iso(),
                 },
             )
-            append_event(
+            append_exchange_event(
                 exchange_paths["events"],
                 "worker_nonzero_exit",
                 {"iteration": attempt, "runner": worker_runner, "rc": agent_result.returncode},
@@ -1776,7 +1839,7 @@ def run_task_mode_a(
                     "updated_at": now_iso(),
                 },
             )
-            append_event(
+            append_exchange_event(
                 exchange_paths["events"],
                 "worker_protocol_failure",
                 {"iteration": attempt, "runner": worker_runner, "detail": str(exc)},
@@ -1808,7 +1871,7 @@ def run_task_mode_a(
                 "updated_at": now_iso(),
             },
         )
-        append_event(
+        append_exchange_event(
             exchange_paths["events"],
             "worker_outcome_loaded",
             {
@@ -1818,6 +1881,13 @@ def run_task_mode_a(
                 "outcome_kind": outcome_kind,
                 "result_status": work_result.status,
             },
+        )
+        _audit(
+            attempt,
+            AUDIT_WORK_ITEM_COMPLETED,
+            work_item_id=coord_resp.work_item.id,
+            status=work_result.status,
+            outcome_kind=outcome_kind,
         )
 
         record["branch"] = work_result.branch
@@ -1887,6 +1957,7 @@ def run_task_mode_a(
                 outcome="worker_handoff",
             )
             sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
+            _audit(attempt, AUDIT_ITERATION_END, outcome="worker_handoff", status="handoff")
             continue
 
         if work_result.status != "completed":
@@ -1944,6 +2015,7 @@ def run_task_mode_a(
                 outcome=f"worker_{work_result.status}",
             )
             sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
+            _audit(attempt, AUDIT_ITERATION_END, outcome=f"worker_{work_result.status}", status=work_result.status)
             continue
 
         try:
@@ -2115,6 +2187,7 @@ def run_task_mode_a(
             }
             request.setdefault("state", {})
             request["state"]["latest_ci"] = ci_artifact
+            _audit(attempt, AUDIT_CI_RESULT, status="fail", ci_state=ci_state)
             append_run_replay_event(
                 repo_path,
                 task_id,
@@ -2142,11 +2215,13 @@ def run_task_mode_a(
                 outcome="ci_failure",
                 ci=ci_artifact,
             )
+            _audit(attempt, AUDIT_ITERATION_END, outcome="ci_failure", status="failed")
             continue
 
         # CI success → review gate.
         request.setdefault("state", {})
         request["state"]["latest_ci"] = {"state": ci_state, "detail": ci_detail, "classification": None}
+        _audit(attempt, AUDIT_CI_RESULT, status="pass", ci_state=ci_state)
         append_run_replay_event(
             repo_path,
             task_id,
@@ -2175,6 +2250,7 @@ def run_task_mode_a(
         review_t0 = time.monotonic()
         review_result, review_text = _run_review_with_retry(diff_text, debug_task_dir=dbg_dir)
         review_dt = round(time.monotonic() - review_t0, 2)
+        _audit(attempt, AUDIT_REVIEW_RESULT, status=review_result)
 
         _dbg(
             dbg_dir,
@@ -2264,6 +2340,7 @@ def run_task_mode_a(
                 ci={"state": ci_state, "detail": ci_detail, "classification": None},
                 review=review_artifact,
             )
+            _audit(attempt, AUDIT_ITERATION_END, outcome=detail, status="failed")
             continue
 
         # Success.
@@ -2321,6 +2398,8 @@ def run_task_mode_a(
                 "duration_s": round(time.monotonic() - loop_start, 2),
             },
         )
+        _audit(attempt, AUDIT_ITERATION_END, outcome="accepted", status="ready")
+        _audit(attempt, AUDIT_RUN_END, status="ready", summary=_objective_snippet(str(record.get("summary") or ""), max_len=240))
         return {
             "task_id": task_id,
             "status": record["status"],
@@ -2335,4 +2414,5 @@ def run_task_mode_a(
     record["updated_at"] = now_iso()
     record["failure_reason"] = f"Mode A loop exhausted after {max_attempts} iterations"
     upsert_task(record, home=base_home)
+    _audit(max_attempts, AUDIT_RUN_END, status="failed", summary=record["failure_reason"])
     return {"task_id": task_id, "status": record["status"], "pr_url": record["pr_url"], "summary": record["failure_reason"]}

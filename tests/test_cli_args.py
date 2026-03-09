@@ -42,6 +42,13 @@ class TestCliArgs(unittest.TestCase):
         self.assertIsNone(args.spec)
         self.assertTrue(args.json)
 
+    def test_audit_inspect_args_parsing(self):
+        parser = build_parser()
+        args = parser.parse_args(["audit", "inspect", "--run", "run-123"])
+        self.assertEqual(args.cmd, "audit")
+        self.assertEqual(args.audit_cmd, "inspect")
+        self.assertEqual(args.run_id, "run-123")
+
 
 if __name__ == "__main__":
     unittest.main()

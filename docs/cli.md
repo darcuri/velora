@@ -77,6 +77,17 @@ velora resume 20260304203339-b5a843aa
 velora resume 20260304203339-b5a843aa --debug
 ```
 
+### `velora audit inspect`
+Inspect run-scoped audit artifacts from `.velora/runs/<run_id>/audit.jsonl`.
+
+```bash
+# latest run
+velora audit inspect
+
+# specific run
+velora audit inspect --run 20260309041214-fa55112b
+```
+
 ## Useful environment variables (v0)
 
 Velora also supports a JSON config file; see [Configuration](./config.md).

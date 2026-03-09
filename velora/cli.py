@@ -5,7 +5,9 @@ import json
 import os
 import sys
 from dataclasses import asdict
+from pathlib import Path
 
+from .audit import latest_run_id, load_events, summarize
 from .runners import run_coordinator
 from .orchestrator import build_initial_coordinator_request, coordinator_session_name
 from .constants import VERBS
@@ -77,6 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
     coord_run_src.add_argument("--unsafe-task", help="Task description as a CLI arg (UNSAFE)")
     coord_run.add_argument("--json", action="store_true", help="Emit compact machine-readable JSON")
 
+    audit_p = sub.add_parser("audit", help="Audit log utilities")
+    audit_sub = audit_p.add_subparsers(dest="audit_cmd", required=True)
+    audit_inspect = audit_sub.add_parser("inspect", help="Inspect audit logs for latest or specific run")
+    audit_inspect.add_argument("--run", dest="run_id", help="Run ID to inspect (defaults to latest run)")
+
     return parser
 
 
@@ -133,6 +140,30 @@ def _load_spec_from_args(args: argparse.Namespace) -> RunSpec:
     if getattr(args, "spec", None):
         return load_run_spec(args.spec)
     return RunSpec(task=str(getattr(args, "unsafe_task")))
+
+
+def _print_audit_inspect(run_id: str | None) -> int:
+    base_dir = Path.cwd()
+    selected_run = (run_id or "").strip() or latest_run_id(base_dir=base_dir)
+    if not selected_run:
+        print("No audit runs found.")
+        return 1
+
+    events = load_events(selected_run, base_dir=base_dir)
+    if not events:
+        print(f"No audit events found for run '{selected_run}'.")
+        return 1
+
+    summary = summarize(events)
+    print(f"run_id: {summary.run_id}")
+    print(f"objective: {summary.objective_snippet or 'unknown'}")
+    print(f"iterations: {', '.join(str(x) for x in summary.iterations) or 'none'}")
+    print("decisions:")
+    for item in (summary.decisions or ["none"]):
+        print(f"- {item}")
+    print(f"final_status: {summary.final_status}")
+    print(f"events: {summary.event_count}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -195,6 +226,10 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(json.dumps(payload, indent=2, sort_keys=True))
                 return 0
+
+        if args.cmd == "audit":
+            if args.audit_cmd == "inspect":
+                return _print_audit_inspect(getattr(args, "run_id", None))
 
     except Exception as exc:  # noqa: BLE001
         if getattr(args, "json", False):
