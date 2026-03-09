@@ -11,6 +11,22 @@ class TestCoordinator(unittest.TestCase):
         prompt = render_coordinator_prompt_v1({"protocol_version": 1, "hello": "world"})
         self.assertIn("CoordinatorRequest", prompt)
         self.assertIn('"hello": "world"', prompt)
+        self.assertIn("MUST be EXACTLY one of: 50, 100, 200, 400", prompt)
+
+    def test_render_can_embed_replay_memory(self) -> None:
+        prompt = render_coordinator_prompt_v1(
+            {
+                "protocol_version": 1,
+                "hello": "world",
+                "policy": {"specialist_matrix": {"implementer": ["codex"], "docs": ["claude", "codex"]}},
+            },
+            replay_memory="# Coordinator Replay\n\nPrior run summary",
+        )
+        self.assertIn("### Replay context", prompt)
+        self.assertIn("Prior run summary", prompt)
+        self.assertIn("trust CoordinatorRequest", prompt)
+        self.assertIn("### Allowed specialist matrix for this run", prompt)
+        self.assertIn("- implementer: codex", prompt)
 
     def test_run_coordinator_rejects_non_json_output(self) -> None:
         with patch("velora.coordinator.run_claude") as mocked:

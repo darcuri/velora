@@ -141,9 +141,9 @@ class TestRunUsesDefaultBranch(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run._write_text", return_value=None),
             patch("velora.run._append_text", return_value=None),
-            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=[coord_run, coord_run]) as mock_coord,
+            patch("velora.run.run_coordinator", side_effect=[coord_run, coord_run]) as mock_coord,
             patch("velora.run.build_worker_prompt_v1", return_value="prompt"),
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_mode_a_work_result_json())),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_mode_a_work_result_json())),
             patch("velora.run._poll_ci", return_value=("failure", "stuck-no-progress")),
             patch("velora.run.time.sleep", return_value=None),
         ):
@@ -174,9 +174,9 @@ class TestRunUsesDefaultBranch(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run._write_text", return_value=None),
             patch("velora.run._append_text", return_value=None),
-            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=[coord_run, coord_run]) as mock_coord,
+            patch("velora.run.run_coordinator", side_effect=[coord_run, coord_run]) as mock_coord,
             patch("velora.run.build_worker_prompt_v1", return_value="prompt"),
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_mode_a_work_result_json())),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_mode_a_work_result_json())),
             patch("velora.run._poll_ci", return_value=("failure", "check-runs=failure")),
         ):
             run_task("octocat/velora", "feature", RunSpec(task="task text", max_attempts=2), use_coordinator=True)

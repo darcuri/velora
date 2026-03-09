@@ -13,12 +13,12 @@ from velora.run import _parse_worker_work_result, run_task_mode_a
 from velora.spec import RunSpec
 
 
-def _execute_response():
+def _execute_response(*, runner: str = "codex"):
     payload = {
         "protocol_version": 1,
         "decision": "execute_work_item",
         "reason": "apply change",
-        "selected_specialist": {"role": "implementer", "runner": "codex"},
+        "selected_specialist": {"role": "implementer", "runner": runner},
         "work_item": {
             "id": "WI-0001",
             "kind": "implement",
@@ -121,8 +121,8 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=coord_runs),
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json())),
+            patch("velora.run.run_coordinator", side_effect=coord_runs),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_work_result_json())),
             patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
             patch("velora.run._read_diff_for_review", return_value="diff"),
             patch("velora.run.run_gemini_review", return_value=CmdResult(0, "OK", "")),
@@ -142,6 +142,112 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
         self.assertEqual(gh.create_pull_request.call_args.kwargs["head"], "velora/task123")
         self.assertEqual(poll_ci.call_args.args[3], "abc123")
 
+    def test_mode_a_respects_explicit_worker_backend_override(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+        gh.create_pull_request.return_value = {"html_url": "https://example/pr/1", "number": 1}
+        gh.post_issue_comment.return_value = {}
+
+        with (
+            patch.dict(
+                os.environ,
+                {"VELORA_ALLOWED_OWNERS": "octocat", "VELORA_WORKER_BACKEND": "direct-claude"},
+                clear=False,
+            ),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch(
+                "velora.run.run_coordinator",
+                return_value=SimpleNamespace(response=_execute_response(runner="claude"), cmd=CmdResult(0, "", "")),
+            ),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_work_result_json())) as run_worker,
+            patch("velora.run._poll_ci", return_value=("success", "ok")),
+            patch("velora.run._read_diff_for_review", return_value="diff"),
+            patch("velora.run.run_gemini_review", return_value=CmdResult(0, "OK", "")),
+            patch("velora.run._cleanup_repo_detritus", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(run_worker.call_args.kwargs["runner"], "claude")
+        self.assertEqual(run_worker.call_args.kwargs["backend"], "direct-claude")
+
+    def test_mode_a_respects_explicit_direct_codex_worker_backend_override(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+        gh.create_pull_request.return_value = {"html_url": "https://example/pr/1", "number": 1}
+        gh.post_issue_comment.return_value = {}
+
+        with (
+            patch.dict(
+                os.environ,
+                {"VELORA_ALLOWED_OWNERS": "octocat", "VELORA_WORKER_BACKEND": "direct-codex"},
+                clear=False,
+            ),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch(
+                "velora.run.run_coordinator",
+                return_value=SimpleNamespace(response=_execute_response(runner="codex"), cmd=CmdResult(0, "", "")),
+            ),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_work_result_json())) as run_worker,
+            patch("velora.run._poll_ci", return_value=("success", "ok")),
+            patch("velora.run._read_diff_for_review", return_value="diff"),
+            patch("velora.run.run_gemini_review", return_value=CmdResult(0, "OK", "")),
+            patch("velora.run._cleanup_repo_detritus", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(run_worker.call_args.kwargs["runner"], "codex")
+        self.assertEqual(run_worker.call_args.kwargs["backend"], "direct-codex")
+
+    def test_mode_a_rejects_mismatched_worker_backend_override(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+
+        with (
+            patch.dict(
+                os.environ,
+                {"VELORA_ALLOWED_OWNERS": "octocat", "VELORA_WORKER_BACKEND": "direct-claude"},
+                clear=False,
+            ),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch(
+                "velora.run.run_coordinator",
+                return_value=SimpleNamespace(response=_execute_response(runner="codex"), cmd=CmdResult(0, "", "")),
+            ),
+            patch("velora.run.run_worker") as run_worker,
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Invalid worker backend selection", result["summary"])
+        self.assertIn("does not match selected runner", result["summary"])
+        run_worker.assert_not_called()
+
     def test_mode_a_treats_malformed_worker_output_as_protocol_failure(self):
         gh = MagicMock()
         gh.get_default_branch.return_value = "main"
@@ -154,8 +260,8 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
-            patch("velora.run.run_codex", return_value=CmdResult(0, "not json", "")),
+            patch("velora.run.run_coordinator", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
+            patch("velora.run.run_worker", return_value=CmdResult(0, "not json", "")),
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
             patch("velora.run._write_text", return_value=None),
@@ -178,8 +284,8 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json(status="blocked"), filename="block.json")),
+            patch("velora.run.run_coordinator", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_work_result_json(status="blocked"), filename="block.json")),
             patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
@@ -204,8 +310,8 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json(branch="velora/not-task123"))),
+            patch("velora.run.run_coordinator", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_work_result_json(branch="velora/not-task123"))),
             patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
@@ -238,8 +344,8 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=_coord_side_effect),
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json(), filename="handoff.json")),
+            patch("velora.run.run_coordinator", side_effect=_coord_side_effect),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_work_result_json(), filename="handoff.json")),
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
             patch("velora.run._write_text", return_value=None),
@@ -273,8 +379,8 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=_coord_side_effect),
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json(status="blocked"), filename="block.json")),
+            patch("velora.run.run_coordinator", side_effect=_coord_side_effect),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_work_result_json(status="blocked"), filename="block.json")),
             patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
@@ -316,8 +422,8 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=_coord_side_effect),
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json())),
+            patch("velora.run.run_coordinator", side_effect=_coord_side_effect),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_work_result_json())),
             patch("velora.run._poll_ci", return_value=("success", "ok")),
             patch("velora.run._read_diff_for_review", return_value="diff"),
             patch("velora.run.run_gemini_review", return_value=CmdResult(0, "- BLOCKER: tests failing", "")),
@@ -361,8 +467,8 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
             patch("velora.run.upsert_task", return_value={}),
             patch("velora.run.GitHubClient.from_env", return_value=gh),
             patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
-            patch("velora.run.run_coordinator_v1_with_cmd", side_effect=_coord_side_effect),
-            patch("velora.run.run_codex", side_effect=_run_codex_writing_result(_work_result_json())),
+            patch("velora.run.run_coordinator", side_effect=_coord_side_effect),
+            patch("velora.run.run_worker", side_effect=_run_codex_writing_result(_work_result_json())),
             patch("velora.run._poll_ci", return_value=("failure", "tests failed")),
             patch("velora.run._cleanup_repo_detritus", return_value=None),
             patch("velora.run._append_text", return_value=None),
