@@ -32,7 +32,7 @@ COORDINATOR_PROMPT_TEMPLATE_V1 = """You are Velora Coordinator, the control-plan
 ### Input
 You will be given a single JSON object called CoordinatorRequest.
 Treat it as the authoritative state of the run. Do not assume additional context.
-{specialist_matrix_section}{replay_section}
+{specialist_matrix_section}{brief_section}{replay_section}{self_audit_section}
 CoordinatorRequest:
 {request_json}
 
@@ -115,9 +115,31 @@ def _render_specialist_matrix_section(request: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def render_coordinator_prompt_v1(request: dict[str, Any], *, replay_memory: str | None = None) -> str:
-    request_json = json.dumps(request, indent=2, sort_keys=True)
+def _compact_request_for_brief(request: dict[str, Any]) -> dict[str, Any]:
+    keys = ("protocol_version", "run_id", "iteration", "objective", "repo", "policy", "evaluation")
+    return {key: request.get(key) for key in keys if key in request}
+
+
+
+def render_coordinator_prompt_v1(
+    request: dict[str, Any],
+    *,
+    replay_memory: str | None = None,
+    brief: dict[str, Any] | None = None,
+) -> str:
+    request_payload = _compact_request_for_brief(request) if brief is not None else request
+    request_json = json.dumps(request_payload, indent=2, sort_keys=True)
     specialist_matrix_section = _render_specialist_matrix_section(request)
+    brief_section = ""
+    if brief is not None:
+        brief_json = json.dumps(brief, indent=2, sort_keys=True)
+        brief_section = (
+            "\n### Coordinator brief\n"
+            "The following CoordinatorBrief is a compact machine summary for the current run.\n"
+            "Use it to orient yourself quickly, but treat CoordinatorRequest as authoritative if they differ.\n\n"
+            "CoordinatorBrief:\n"
+            f"{brief_json}\n\n"
+        )
     replay_text = (replay_memory or "").strip()
     replay_section = ""
     if replay_text:
@@ -128,10 +150,24 @@ def render_coordinator_prompt_v1(request: dict[str, Any], *, replay_memory: str 
             "If anything here conflicts with CoordinatorRequest, trust CoordinatorRequest.\n\n"
             f"{replay_text}\n\n"
         )
+
+    history = request.get("history") if isinstance(request, dict) else None
+    no_progress_streak = int(history.get("no_progress_streak") or 0) if isinstance(history, dict) else 0
+    self_audit_section = ""
+    if no_progress_streak > 0:
+        self_audit_section = (
+            "\n### No-progress self-audit\n"
+            f"The run currently has no_progress_streak={no_progress_streak}.\n"
+            "Before choosing the next step, re-read the objective and decide whether the current approach is still aligned.\n"
+            "If a fundamentally different strategy is needed, take it and say what you are changing in the reason field.\n"
+            "Do not merely patch symptoms from the previous failed attempt.\n\n"
+        )
     return COORDINATOR_PROMPT_TEMPLATE_V1.format(
         request_json=request_json,
         specialist_matrix_section=specialist_matrix_section,
+        brief_section=brief_section,
         replay_section=replay_section,
+        self_audit_section=self_audit_section,
     )
 
 

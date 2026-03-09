@@ -538,6 +538,7 @@ def _append_iteration_history_entry(
             "outcome": outcome,
         }
     )
+    del work_items[:-3]
 
 
 def _is_oscillating_failure_signatures(sigs: list[str]) -> bool:
@@ -1454,13 +1455,38 @@ def run_task_mode_a(
                 },
             )
             coord_t0 = time.monotonic()
-            coord_run = run_coordinator(
-                session_name=coord_session,
-                cwd=repo_path,
-                request=request,
-                runner=coord_runner,
-                backend=coord_backend,
-            )
+            coord_run = None
+            for coord_try in range(2):
+                try:
+                    coord_run = run_coordinator(
+                        session_name=coord_session,
+                        cwd=repo_path,
+                        request=request,
+                        runner=coord_runner,
+                        backend=coord_backend,
+                    )
+                    break
+                except ProtocolError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    detail = _format_preflight_error(exc)
+                    if coord_try >= 1:
+                        raise RuntimeError(
+                            f"Coordinator retry exhausted after {coord_try + 1} attempts: {detail}"
+                        ) from exc
+                    _dbg(
+                        dbg_dir,
+                        "coordinator_retry",
+                        {
+                            "iteration": attempt,
+                            "retry": coord_try + 1,
+                            "delay_s": 1,
+                            "detail": detail,
+                        },
+                    )
+                    time.sleep(1)
+            if coord_run is None:
+                raise RuntimeError("Coordinator retry loop exited without a result")
             coord_dt = round(time.monotonic() - coord_t0, 2)
             coord_resp = coord_run.response
             _accumulate_acpx_usage(request, session_name=coord_session, result=coord_run.cmd, actor="coordinator")
@@ -1576,8 +1602,8 @@ def run_task_mode_a(
                 detail=f"Invalid worker backend selection on iteration {attempt}: {detail}",
             )
 
-        # One stable worker session per run/runner.
-        worker_session = worker_session_name(owner, repo, task_id, worker_runner)
+        # ACP workers should be stateless across iterations, so session names are iteration-scoped.
+        worker_session = worker_session_name(owner, repo, task_id, worker_runner, iteration=attempt)
 
         exchange_paths = work_item_exchange_paths(repo_path, task_id, coord_resp.work_item.id)
         for key in ("result", "handoff", "block", "error"):

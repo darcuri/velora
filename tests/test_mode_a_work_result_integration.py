@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 from velora.acpx import CmdResult
 from velora.config import get_config
 from velora.protocol import ProtocolError, validate_coordinator_response
-from velora.run import _parse_worker_work_result, run_task_mode_a
+from velora.run import _append_iteration_history_entry, _parse_worker_work_result, run_task_mode_a
 from velora.spec import RunSpec
 
 
@@ -40,6 +40,16 @@ def _stop_response(reason: str = "stop") -> Any:
     payload = {
         "protocol_version": 1,
         "decision": "stop_failure",
+        "reason": reason,
+        "selected_specialist": {"role": "investigator", "runner": "codex"},
+    }
+    return validate_coordinator_response(payload)
+
+
+def _finalize_response(reason: str = "done") -> Any:
+    payload = {
+        "protocol_version": 1,
+        "decision": "finalize_success",
         "reason": reason,
         "selected_specialist": {"role": "investigator", "runner": "codex"},
     }
@@ -102,6 +112,115 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
                 expected_work_item_id="WI-0001",
                 expected_branch="velora/task123",
             )
+
+    def test_iteration_history_keeps_only_last_three_work_items(self):
+        request = {"history": {"work_items_executed": []}}
+        work_item = SimpleNamespace(
+            id="WI-0001",
+            kind="implement",
+            rationale="make progress",
+            acceptance=SimpleNamespace(gates=["tests"]),
+        )
+        specialist = SimpleNamespace(role="implementer", runner="codex", model=None)
+        worker_result = _parse_worker_work_result(
+            _work_result_json(),
+            expected_work_item_id="WI-0001",
+            expected_branch="velora/task123",
+        )
+
+        for iteration in range(1, 7):
+            _append_iteration_history_entry(
+                request,
+                iteration=iteration,
+                work_item=work_item,
+                selected_specialist=specialist,
+                worker_result=worker_result,
+                outcome=f"iteration-{iteration}",
+            )
+
+        history = request["history"]["work_items_executed"]
+        self.assertEqual(len(history), 3)
+        self.assertEqual([entry["iteration"] for entry in history], [4, 5, 6])
+        self.assertEqual([entry["outcome"] for entry in history], ["iteration-4", "iteration-5", "iteration-6"])
+
+    def test_coordinator_retries_once_on_transient_error(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+
+        coord_runs = [
+            RuntimeError("upstream timeout"),
+            SimpleNamespace(response=_finalize_response("recovered"), cmd=CmdResult(0, "", "")),
+        ]
+
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.run_coordinator", side_effect=coord_runs) as run_coord,
+            patch("velora.run.time.sleep", return_value=None) as mock_sleep,
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["summary"], "recovered")
+        self.assertEqual(run_coord.call_count, 2)
+        mock_sleep.assert_called_once_with(1)
+
+    def test_coordinator_does_not_retry_protocol_error(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.run_coordinator", side_effect=ProtocolError("bad coordinator json")) as run_coord,
+            patch("velora.run.time.sleep", return_value=None) as mock_sleep,
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("bad coordinator json", result["summary"])
+        self.assertEqual(run_coord.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    def test_coordinator_retry_exhaustion_fails_task(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.run_coordinator", side_effect=[RuntimeError("timeout one"), RuntimeError("timeout two")]) as run_coord,
+            patch("velora.run.time.sleep", return_value=None) as mock_sleep,
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("retry exhausted", result["summary"].lower())
+        self.assertIn("timeout two", result["summary"])
+        self.assertEqual(run_coord.call_count, 2)
+        mock_sleep.assert_called_once_with(1)
 
     def test_mode_a_uses_work_result_fields_for_pr_and_ci(self):
         gh = MagicMock()

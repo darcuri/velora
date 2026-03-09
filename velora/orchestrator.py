@@ -24,7 +24,13 @@ def coordinator_session_name(owner: str, repo: str, run_id: str) -> str:
     return f"{cfg.claude_session_prefix}{repo_slug(owner, repo)}-{run_id}-coord"
 
 
-def worker_session_name(owner: str, repo: str, run_id: str, runner: str) -> str:
+def worker_session_name(
+    owner: str,
+    repo: str,
+    run_id: str,
+    runner: str,
+    iteration: int | None = None,
+) -> str:
     cfg = get_config()
     worker_runner = (runner or "").strip().lower()
     if worker_runner == "codex":
@@ -33,7 +39,11 @@ def worker_session_name(owner: str, repo: str, run_id: str, runner: str) -> str:
         prefix = cfg.claude_session_prefix
     else:
         raise ValueError("worker runner must be one of: codex, claude")
-    return f"{prefix}{repo_slug(owner, repo)}-{run_id}-worker"
+
+    base = f"{prefix}{repo_slug(owner, repo)}-{run_id}"
+    if iteration is None:
+        return f"{base}-worker"
+    return f"{base}-iter-{int(iteration)}-worker"
 
 
 def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:

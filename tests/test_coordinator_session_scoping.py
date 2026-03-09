@@ -106,23 +106,35 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
         self.assertEqual(second, f"{prefix}-run-2-coord")
         self.assertNotEqual(first, second)
 
-    def test_worker_session_name_uses_run_id_and_runner_prefix(self):
+    def test_worker_session_name_uses_iteration_when_provided(self):
         with patch.dict(
             os.environ,
             {"VELORA_CLAUDE_SESSION_PREFIX": "coord-", "VELORA_CODEX_SESSION_PREFIX": "worker-"},
             clear=False,
         ):
             get_config.cache_clear()
-            first = worker_session_name("octocat", "velora", "run-1", "codex")
-            second = worker_session_name("octocat", "velora", "run-2", "codex")
-            third = worker_session_name("octocat", "velora", "run-1", "claude")
+            first = worker_session_name("octocat", "velora", "run-1", "codex", iteration=1)
+            second = worker_session_name("octocat", "velora", "run-1", "codex", iteration=2)
+            third = worker_session_name("octocat", "velora", "run-1", "claude", iteration=1)
 
         slug = repo_slug("octocat", "velora")
-        self.assertEqual(first, f"worker-{slug}-run-1-worker")
-        self.assertEqual(second, f"worker-{slug}-run-2-worker")
-        self.assertEqual(third, f"coord-{slug}-run-1-worker")
+        self.assertEqual(first, f"worker-{slug}-run-1-iter-1-worker")
+        self.assertEqual(second, f"worker-{slug}-run-1-iter-2-worker")
+        self.assertEqual(third, f"coord-{slug}-run-1-iter-1-worker")
         self.assertNotEqual(first, second)
         self.assertNotEqual(first, third)
+
+    def test_worker_session_name_stays_backward_compatible_without_iteration(self):
+        with patch.dict(
+            os.environ,
+            {"VELORA_CODEX_SESSION_PREFIX": "worker-"},
+            clear=False,
+        ):
+            get_config.cache_clear()
+            session = worker_session_name("octocat", "velora", "run-1", "codex")
+
+        slug = repo_slug("octocat", "velora")
+        self.assertEqual(session, f"worker-{slug}-run-1-worker")
 
     def test_mode_a_reuses_same_run_scoped_coordinator_session_each_iteration(self):
         gh = MagicMock()
@@ -164,7 +176,7 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
         expected = f"coord-{repo_slug('octocat', 'velora')}-task123-coord"
         self.assertEqual(sessions, [expected, expected])
 
-    def test_mode_a_reuses_same_run_scoped_worker_session_each_iteration(self):
+    def test_mode_a_uses_iteration_scoped_worker_session_each_iteration(self):
         gh = MagicMock()
         gh.get_default_branch.return_value = "main"
         gh.create_pull_request.return_value = {"html_url": "https://example/pr/1", "number": 1}
@@ -206,8 +218,11 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(run_worker.call_count, 2)
         sessions = [call.kwargs["session_name"] for call in run_worker.call_args_list]
-        expected = f"worker-{repo_slug('octocat', 'velora')}-task123-worker"
-        self.assertEqual(sessions, [expected, expected])
+        expected = [
+            f"worker-{repo_slug('octocat', 'velora')}-task123-iter-1-worker",
+            f"worker-{repo_slug('octocat', 'velora')}-task123-iter-2-worker",
+        ]
+        self.assertEqual(sessions, expected)
 
     def test_mode_a_worker_sessions_do_not_leak_across_runs(self):
         gh = MagicMock()
@@ -257,7 +272,10 @@ class TestCoordinatorSessionScoping(unittest.TestCase):
         self.assertEqual(run_worker.call_count, 2)
         sessions = [call.kwargs["session_name"] for call in run_worker.call_args_list]
         slug = repo_slug("octocat", "velora")
-        self.assertEqual(sessions, [f"worker-{slug}-task111-worker", f"worker-{slug}-task222-worker"])
+        self.assertEqual(
+            sessions,
+            [f"worker-{slug}-task111-iter-1-worker", f"worker-{slug}-task222-iter-1-worker"],
+        )
 
 
 if __name__ == "__main__":
