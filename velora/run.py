@@ -538,6 +538,7 @@ def _append_iteration_history_entry(
             "outcome": outcome,
         }
     )
+    del work_items[:-3]
 
 
 def _is_oscillating_failure_signatures(sigs: list[str]) -> bool:

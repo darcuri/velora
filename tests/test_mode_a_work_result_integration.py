@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 from velora.acpx import CmdResult
 from velora.config import get_config
 from velora.protocol import ProtocolError, validate_coordinator_response
-from velora.run import _parse_worker_work_result, run_task_mode_a
+from velora.run import _append_iteration_history_entry, _parse_worker_work_result, run_task_mode_a
 from velora.spec import RunSpec
 
 
@@ -102,6 +102,36 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
                 expected_work_item_id="WI-0001",
                 expected_branch="velora/task123",
             )
+
+    def test_iteration_history_keeps_only_last_three_work_items(self):
+        request = {"history": {"work_items_executed": []}}
+        work_item = SimpleNamespace(
+            id="WI-0001",
+            kind="implement",
+            rationale="make progress",
+            acceptance=SimpleNamespace(gates=["tests"]),
+        )
+        specialist = SimpleNamespace(role="implementer", runner="codex", model=None)
+        worker_result = _parse_worker_work_result(
+            _work_result_json(),
+            expected_work_item_id="WI-0001",
+            expected_branch="velora/task123",
+        )
+
+        for iteration in range(1, 7):
+            _append_iteration_history_entry(
+                request,
+                iteration=iteration,
+                work_item=work_item,
+                selected_specialist=specialist,
+                worker_result=worker_result,
+                outcome=f"iteration-{iteration}",
+            )
+
+        history = request["history"]["work_items_executed"]
+        self.assertEqual(len(history), 3)
+        self.assertEqual([entry["iteration"] for entry in history], [4, 5, 6])
+        self.assertEqual([entry["outcome"] for entry in history], ["iteration-4", "iteration-5", "iteration-6"])
 
     def test_mode_a_uses_work_result_fields_for_pr_and_ci(self):
         gh = MagicMock()
