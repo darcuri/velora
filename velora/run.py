@@ -959,6 +959,57 @@ def _format_preflight_error(exc: Exception) -> str:
     return msg
 
 
+def _run_coordinator_with_schema_retry(
+    *,
+    session_name: str,
+    cwd: Path,
+    request: dict[str, Any],
+    runner: str,
+    backend: str | None,
+) -> Any:
+    try:
+        return run_coordinator(
+            session_name=session_name,
+            cwd=cwd,
+            request=request,
+            runner=runner,
+            backend=backend,
+        )
+    except ProtocolError as first_exc:
+        policy = request.get("policy") if isinstance(request, dict) else None
+        specialist_matrix = policy.get("specialist_matrix") if isinstance(policy, dict) else None
+        repair_request: dict[str, Any] = {
+            "protocol_version": 1,
+            "run_id": request.get("run_id"),
+            "iteration": request.get("iteration"),
+            "repo": request.get("repo"),
+            "repair": {
+                "validation_error": str(first_exc),
+                "instructions": "Return one corrected CoordinatorResponse JSON object only. No markdown.",
+            },
+        }
+        if isinstance(specialist_matrix, dict):
+            repair_request["policy"] = {"specialist_matrix": specialist_matrix}
+
+        try:
+            return run_coordinator(
+                session_name=session_name,
+                cwd=cwd,
+                request=repair_request,
+                runner=runner,
+                backend=backend,
+            )
+        except ProtocolError as second_exc:
+            raise ProtocolError(
+                f"Coordinator schema validation failed after one retry: initial_error={first_exc}; retry_error={second_exc}"
+            ) from second_exc
+        except Exception as second_exc:  # noqa: BLE001
+            detail = _format_preflight_error(second_exc)
+            raise ProtocolError(
+                f"Coordinator schema repair attempt failed after one retry: initial_error={first_exc}; retry_error={detail}"
+            ) from second_exc
+
+
 def _objective_snippet(text: str, max_len: int = 160) -> str:
     compact = " ".join((text or "").split()).strip()
     if len(compact) <= max_len:
@@ -1569,7 +1620,7 @@ def run_task_mode_a(
             coord_run = None
             for coord_try in range(2):
                 try:
-                    coord_run = run_coordinator(
+                    coord_run = _run_coordinator_with_schema_retry(
                         session_name=coord_session,
                         cwd=repo_path,
                         request=request,
