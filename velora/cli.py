@@ -83,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     audit_sub = audit_p.add_subparsers(dest="audit_cmd", required=True)
     audit_inspect = audit_sub.add_parser("inspect", help="Inspect audit logs for latest or specific run")
     audit_inspect.add_argument("--run", dest="run_id", help="Run ID to inspect (defaults to latest run)")
+    # Emit JSON summary keys: run_id, objective, iterations, decisions, final_status, event_count, optional review_events.
+    audit_inspect.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     return parser
 
@@ -142,7 +144,7 @@ def _load_spec_from_args(args: argparse.Namespace) -> RunSpec:
     return RunSpec(task=str(getattr(args, "unsafe_task")))
 
 
-def _print_audit_inspect(run_id: str | None) -> int:
+def _print_audit_inspect(run_id: str | None, json_mode: bool = False) -> int:
     base_dir = Path.cwd()
     selected_run = (run_id or "").strip() or latest_run_id(base_dir=base_dir)
     if not selected_run:
@@ -155,6 +157,29 @@ def _print_audit_inspect(run_id: str | None) -> int:
         return 1
 
     summary = summarize(events)
+    review_events = [event for event in events if event.event_type in {REVIEW_STARTED, REVIEW_COMPLETED}]
+    if json_mode:
+        payload: dict[str, object] = {
+            "run_id": summary.run_id,
+            "objective": summary.objective_snippet[:120],
+            "iterations": len(summary.iterations),
+            "decisions": list(summary.decisions),
+            "final_status": summary.final_status,
+            "event_count": summary.event_count,
+        }
+        if review_events:
+            review_items: list[str] = []
+            for event in review_events:
+                if event.event_type == REVIEW_STARTED:
+                    review_items.append(f"iter {event.iteration}: started")
+                    continue
+                outcome = str(event.payload.get("outcome") or "unknown")
+                summary_text = str(event.payload.get("summary") or "").strip() or "none"
+                review_items.append(f"iter {event.iteration}: completed outcome={outcome} summary={summary_text}")
+            payload["review_events"] = review_items
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
     print(f"run_id: {summary.run_id}")
     print(f"objective: {summary.objective_snippet or 'unknown'}")
     print(f"iterations: {', '.join(str(x) for x in summary.iterations) or 'none'}")
@@ -163,7 +188,6 @@ def _print_audit_inspect(run_id: str | None) -> int:
         print(f"- {item}")
     print(f"final_status: {summary.final_status}")
     print(f"events: {summary.event_count}")
-    review_events = [event for event in events if event.event_type in {REVIEW_STARTED, REVIEW_COMPLETED}]
     if review_events:
         print("review_events:")
         for event in review_events:
@@ -239,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "audit":
             if args.audit_cmd == "inspect":
-                return _print_audit_inspect(getattr(args, "run_id", None))
+                return _print_audit_inspect(getattr(args, "run_id", None), bool(getattr(args, "json", False)))
 
     except Exception as exc:  # noqa: BLE001
         if getattr(args, "json", False):
