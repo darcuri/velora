@@ -26,6 +26,7 @@ Velora supports configuration via a JSON config file and environment variables.
   "mode_a_max_cost_usd": 20,
   "mode_a_no_progress_max": 4,
   "mode_a_max_wall_seconds": 1800,
+  "mode_a_review_enabled": false,
 
   "runner": "codex",
   "codex_session_prefix": "velora-codex-",
@@ -53,6 +54,7 @@ Mode A:
 - `VELORA_MODE_A_MAX_COST_USD`
 - `VELORA_MODE_A_NO_PROGRESS_MAX`
 - `VELORA_MODE_A_MAX_WALL_SECONDS`
+- `VELORA_MODE_A_REVIEW_ENABLED` (`true/false`; default: `false`)
 - `VELORA_COORDINATOR_RUNNER`
 - `VELORA_USD_EQUIV_PER_1M_TOKENS`
 

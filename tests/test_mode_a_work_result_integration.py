@@ -307,6 +307,68 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
         self.assertIn("work_item_completed", event_types)
         self.assertIn("run_end", event_types)
 
+    def test_mode_a_optional_post_success_review_handoff_populates_evaluation_and_audit_events(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+        gh.create_pull_request.return_value = {"html_url": "https://example/pr/1", "number": 1}
+        gh.post_issue_comment.return_value = {}
+
+        captured_requests: list[dict[str, Any]] = []
+
+        def _coord_side_effect(*args, **kwargs):
+            captured_requests.append(json.loads(json.dumps(kwargs["request"])))
+            if len(captured_requests) == 1:
+                return SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))
+            return SimpleNamespace(response=_finalize_response("approved"), cmd=CmdResult(0, "", ""))
+
+        audit_path = Path("/tmp/repo/.velora/runs/review-stage-task/audit.jsonl")
+        shutil.rmtree(audit_path.parent, ignore_errors=True)
+
+        def _worker_for_review_stage_task(*args, **kwargs):
+            result_path = Path("/tmp/repo/.velora/exchange/runs/review-stage-task/WI-0001/result.json")
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(_work_result_json(branch="velora/review-stage-task"), encoding="utf-8")
+            return CmdResult(0, "worker chatter", "")
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "VELORA_ALLOWED_OWNERS": "octocat",
+                    "VELORA_MODE_A_REVIEW_ENABLED": "1",
+                },
+                clear=False,
+            ),
+            patch("velora.run.build_task_id", return_value="review-stage-task"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.run_coordinator", side_effect=_coord_side_effect),
+            patch("velora.run.run_worker", side_effect=_worker_for_review_stage_task),
+            patch("velora.run._poll_ci", return_value=("success", "ok")),
+            patch("velora.run._read_diff_for_review", return_value="diff"),
+            patch("velora.run.run_gemini_review", return_value=CmdResult(0, "- NIT: add edge-case test coverage", "")),
+            patch("velora.run._cleanup_repo_detritus", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=2))
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(len(captured_requests), 2)
+        second = captured_requests[1]
+        self.assertEqual(second["evaluation"]["outcome"], "post_success_review_repair")
+        self.assertEqual(second["evaluation"]["review_result"]["outcome"], "repair")
+        self.assertEqual(second["evaluation"]["review_result"]["issues_found"], ["add edge-case test coverage"])
+
+        lines = [line for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        event_types = [json.loads(line)["event_type"] for line in lines]
+        self.assertIn("review_started", event_types)
+        self.assertIn("review_completed", event_types)
+
     def test_mode_a_respects_explicit_worker_backend_override(self):
         gh = MagicMock()
         gh.get_default_branch.return_value = "main"

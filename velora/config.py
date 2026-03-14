@@ -20,6 +20,7 @@ class VeloraConfig:
     mode_a_max_cost_usd: int
     mode_a_no_progress_max: int
     mode_a_max_wall_seconds: int
+    mode_a_review_enabled: bool
 
     # Coordinator-selected specialist policy.
     # JSON shape: { role: {"runners": ["codex"|"claude"], "models": ["..."]} }
@@ -99,6 +100,20 @@ def _parse_int(value: object, default: int) -> int:
     return default
 
 
+def _parse_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
 def _parse_specialist_matrix(value: object, default: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
     """Parse the coordinator-selected specialist policy matrix.
 
@@ -169,6 +184,7 @@ def load_config() -> VeloraConfig:
         "mode_a_max_cost_usd": 20,
         "mode_a_no_progress_max": 4,
         "mode_a_max_wall_seconds": 30 * 60,
+        "mode_a_review_enabled": False,
 
         # Coordinator-selected specialist policy.
         "specialist_matrix": {
@@ -214,6 +230,8 @@ def load_config() -> VeloraConfig:
         env_cfg["mode_a_no_progress_max"] = env.get("VELORA_MODE_A_NO_PROGRESS_MAX")
     if env.get("VELORA_MODE_A_MAX_WALL_SECONDS"):
         env_cfg["mode_a_max_wall_seconds"] = env.get("VELORA_MODE_A_MAX_WALL_SECONDS")
+    if env.get("VELORA_MODE_A_REVIEW_ENABLED"):
+        env_cfg["mode_a_review_enabled"] = env.get("VELORA_MODE_A_REVIEW_ENABLED")
 
     if env.get("VELORA_RUNNER"):
         env_cfg["runner"] = env.get("VELORA_RUNNER")
@@ -248,6 +266,7 @@ def load_config() -> VeloraConfig:
     mode_a_max_cost_usd = max(1, min(_parse_int(merged.get("mode_a_max_cost_usd"), 20), 500))
     mode_a_no_progress_max = max(1, min(_parse_int(merged.get("mode_a_no_progress_max"), 4), 50))
     mode_a_max_wall_seconds = max(60, min(_parse_int(merged.get("mode_a_max_wall_seconds"), 30 * 60), 24 * 60 * 60))
+    mode_a_review_enabled = _parse_bool(merged.get("mode_a_review_enabled"), False)
 
     specialist_matrix = _parse_specialist_matrix(merged.get("specialist_matrix"), defaults["specialist_matrix"])
 
@@ -280,6 +299,7 @@ def load_config() -> VeloraConfig:
         mode_a_max_cost_usd=mode_a_max_cost_usd,
         mode_a_no_progress_max=mode_a_no_progress_max,
         mode_a_max_wall_seconds=mode_a_max_wall_seconds,
+        mode_a_review_enabled=mode_a_review_enabled,
 
         specialist_matrix=specialist_matrix,
 

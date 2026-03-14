@@ -42,8 +42,30 @@ class TestCliSmoke(unittest.TestCase):
                 AuditEvent(
                     run_id=run_id,
                     iteration=1,
-                    event_type="run_end",
+                    event_type="review_started",
+                    timestamp="2026-03-09T00:00:01+00:00",
+                    payload={},
+                ),
+                base_dir=Path(tmp),
+            )
+            append_event(
+                run_id,
+                AuditEvent(
+                    run_id=run_id,
+                    iteration=1,
+                    event_type="review_completed",
                     timestamp="2026-03-09T00:00:02+00:00",
+                    payload={"outcome": "repair", "summary": "Needs one follow-up"},
+                ),
+                base_dir=Path(tmp),
+            )
+            append_event(
+                run_id,
+                AuditEvent(
+                    run_id=run_id,
+                    iteration=1,
+                    event_type="run_end",
+                    timestamp="2026-03-09T00:00:03+00:00",
                     payload={"status": "ready"},
                 ),
                 base_dir=Path(tmp),
@@ -59,6 +81,8 @@ class TestCliSmoke(unittest.TestCase):
             text = out.getvalue()
             self.assertIn("run_id: run-001", text)
             self.assertIn("final_status: ready", text)
+            self.assertIn("review_events:", text)
+            self.assertIn("outcome=repair", text)
 
             with (
                 redirect_stdout(StringIO()) as out_latest,

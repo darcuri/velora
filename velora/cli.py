@@ -7,7 +7,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from .audit import latest_run_id, load_events, summarize
+from .audit import REVIEW_COMPLETED, REVIEW_STARTED, latest_run_id, load_events, summarize
 from .runners import run_coordinator
 from .orchestrator import build_initial_coordinator_request, coordinator_session_name
 from .constants import VERBS
@@ -163,6 +163,16 @@ def _print_audit_inspect(run_id: str | None) -> int:
         print(f"- {item}")
     print(f"final_status: {summary.final_status}")
     print(f"events: {summary.event_count}")
+    review_events = [event for event in events if event.event_type in {REVIEW_STARTED, REVIEW_COMPLETED}]
+    if review_events:
+        print("review_events:")
+        for event in review_events:
+            if event.event_type == REVIEW_STARTED:
+                print(f"- iter {event.iteration}: started")
+                continue
+            outcome = str(event.payload.get("outcome") or "unknown")
+            summary_text = str(event.payload.get("summary") or "").strip() or "none"
+            print(f"- iter {event.iteration}: completed outcome={outcome} summary={summary_text}")
     return 0
 
 

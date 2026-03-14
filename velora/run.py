@@ -7,10 +7,10 @@ import re
 import shutil
 import subprocess
 import time
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .acpx import GEMINI_REVIEW_PROMPT_PREFIX, parse_codex_footer, run_codex, run_gemini_review
 from .audit import (
@@ -18,6 +18,8 @@ from .audit import (
     DECISION_MADE as AUDIT_DECISION_MADE,
     ITERATION_END as AUDIT_ITERATION_END,
     ITERATION_START as AUDIT_ITERATION_START,
+    REVIEW_COMPLETED as AUDIT_REVIEW_COMPLETED,
+    REVIEW_STARTED as AUDIT_REVIEW_STARTED,
     REVIEW_RESULT as AUDIT_REVIEW_RESULT,
     RUN_END as AUDIT_RUN_END,
     RUN_START as AUDIT_RUN_START,
@@ -59,6 +61,13 @@ CHECKPOINT_AFTER_REVIEW_RESOLUTION = "after_review_resolution"
 
 class InternalFaultInjectionTriggered(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ReviewResult:
+    outcome: Literal["approve", "repair"]
+    summary: str
+    issues_found: list[str]
 
 
 def _run_checked(cmd: list[str], cwd: Path | None = None) -> str:
@@ -490,6 +499,58 @@ def _json_compatible(value: Any) -> Any:
     return value
 
 
+def _coerce_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _extract_review_issues(review_text: str, review_result: str) -> list[str]:
+    if review_result != "nits":
+        return []
+
+    issues: list[str] = []
+    for raw_line in review_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        normalized = re.sub(r"^(?:[-*+]\s+|\d+\.\s+)", "", line)
+        if normalized.lower().startswith("nit:"):
+            issue = normalized[4:].strip()
+            if issue:
+                issues.append(issue)
+    return issues
+
+
+def run_review_stage(context: dict[str, Any]) -> ReviewResult:
+    raw_issues = context.get("issues_found")
+    issues: list[str] = []
+    if isinstance(raw_issues, list):
+        for issue in raw_issues:
+            text = str(issue).strip()
+            if text:
+                issues.append(text)
+    if issues:
+        return ReviewResult(
+            outcome="repair",
+            summary=f"Post-success review found {len(issues)} follow-up issue(s).",
+            issues_found=issues,
+        )
+    return ReviewResult(
+        outcome="approve",
+        summary="Post-success review approved with no follow-up issues.",
+        issues_found=[],
+    )
+
+
 def _set_evaluation_state(
     request: dict[str, Any],
     *,
@@ -498,7 +559,7 @@ def _set_evaluation_state(
     worker_result: WorkResult | None,
     ci_state: str | None = None,
     ci_detail: str | None = None,
-    review_result: str | None = None,
+    review_result: Any | None = None,
     failing_checks: list[dict[str, Any]] | None = None,
     logs_excerpt: str = "",
 ) -> None:
@@ -1394,6 +1455,7 @@ def run_task_mode_a(
             "max_wall_seconds": cfg.mode_a_max_wall_seconds,
             "allow_self_merge": False,
             "required_gates": ["tests", "security"],
+            "review_enabled": cfg.mode_a_review_enabled,
             "specialist_matrix": cfg.specialist_matrix,
         },
         "state": {
@@ -1405,6 +1467,7 @@ def run_task_mode_a(
             "latest_handoff": None,
             "latest_ci": None,
             "latest_review": None,
+            "latest_post_success_review": None,
         },
         "evaluation": {
             "status": "none",
@@ -1457,6 +1520,7 @@ def run_task_mode_a(
     no_progress_max = int(policy.get("no_progress_max") or cfg.mode_a_no_progress_max)
     max_wall_seconds = int(policy.get("max_wall_seconds") or cfg.mode_a_max_wall_seconds)
     max_tokens = int(policy.get("max_tokens") or cfg.mode_a_max_tokens)
+    review_enabled = _coerce_bool(policy.get("review_enabled"), default=cfg.mode_a_review_enabled)
 
     loop_start = time.monotonic()
     last_failure_sig: str | None = None
@@ -2353,6 +2417,90 @@ def run_task_mode_a(
             event="review_result",
             data={"result": review_result, "summary": review_text[:2000]},
         )
+        if review_enabled:
+            _audit(attempt, AUDIT_REVIEW_STARTED)
+            review_stage_result = run_review_stage(
+                {
+                    "review_result": review_result,
+                    "review_text": review_text,
+                    "issues_found": _extract_review_issues(review_text, review_result),
+                }
+            )
+            review_stage_payload = _json_compatible(review_stage_result)
+            request["state"]["latest_post_success_review"] = review_stage_payload
+            _audit(
+                attempt,
+                AUDIT_REVIEW_COMPLETED,
+                outcome=review_stage_result.outcome,
+                summary=review_stage_result.summary,
+                issues_found=list(review_stage_result.issues_found),
+            )
+            append_run_replay_event(
+                repo_path,
+                task_id,
+                iteration=attempt,
+                event="review_stage_result",
+                data=review_stage_payload,
+            )
+            if review_stage_result.outcome == "repair":
+                _set_evaluation_state(
+                    request,
+                    status="fail",
+                    outcome="post_success_review_repair",
+                    worker_result=work_result,
+                    ci_state=ci_state,
+                    ci_detail=ci_detail,
+                    review_result=review_stage_payload,
+                    failing_checks=[
+                        {
+                            "name": "post_success_review",
+                            "kind": "review",
+                            "url": record.get("pr_url"),
+                            "summary": review_stage_result.summary,
+                        }
+                    ],
+                    logs_excerpt=review_stage_result.summary,
+                )
+            else:
+                _set_evaluation_state(
+                    request,
+                    status="success",
+                    outcome="post_success_review_approve",
+                    worker_result=work_result,
+                    ci_state=ci_state,
+                    ci_detail=ci_detail,
+                    review_result=review_stage_payload,
+                    failing_checks=[],
+                    logs_excerpt="",
+                )
+            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
+            hist["no_progress_streak"] = 0
+            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
+            hist.pop("failure_signatures", None)
+            last_failure_sig = None
+            _append_iteration_history_entry(
+                request,
+                iteration=attempt,
+                work_item=coord_resp.work_item,
+                selected_specialist=coord_resp.selected_specialist,
+                worker_result=work_result,
+                outcome=f"post_success_review_{review_stage_result.outcome}",
+                ci={"state": ci_state, "detail": ci_detail, "classification": None},
+                review={
+                    "result": review_result,
+                    "summary": review_text[:2000],
+                    "post_success": review_stage_payload,
+                },
+            )
+            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
+            _audit(
+                attempt,
+                AUDIT_ITERATION_END,
+                outcome=f"post_success_review_{review_stage_result.outcome}",
+                status="reviewed",
+            )
+            continue
+
         _set_evaluation_state(
             request,
             status="success",
