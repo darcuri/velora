@@ -1,4 +1,5 @@
 import unittest
+import warnings
 
 from velora.protocol import ProtocolError, validate_coordinator_response
 
@@ -99,6 +100,26 @@ class TestProtocol(unittest.TestCase):
     def test_unknown_keys_are_rejected(self) -> None:
         payload = _valid_execute_payload()
         payload["extra"] = 123
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_commit_font_typo_normalizes_to_footer_and_warns(self) -> None:
+        payload = _valid_execute_payload()
+        commit = payload["work_item"]["commit"]
+        commit["font"] = commit.pop("footer")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resp = validate_coordinator_response(payload)
+
+        assert resp.work_item is not None
+        self.assertEqual(resp.work_item.commit.footer["WORK_ITEM_ID"], "WI-0001")
+        self.assertTrue(any("normalized" in str(w.message) for w in caught))
+
+    def test_commit_unknown_key_still_rejected(self) -> None:
+        payload = _valid_execute_payload()
+        payload["work_item"]["commit"]["foobar"] = "x"
+
         with self.assertRaises(ProtocolError):
             validate_coordinator_response(payload)
 

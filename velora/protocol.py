@@ -13,6 +13,7 @@ Principles:
 The coordinator produces a CoordinatorResponse; Velora validates it before doing anything.
 """
 
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -148,6 +149,10 @@ class WorkItemCommit:
     @staticmethod
     def from_dict(raw: object, *, ctx: str = "work_item.commit") -> WorkItemCommit:
         obj = _expect_dict(raw, ctx=ctx)
+        if "font" in obj and "footer" not in obj:
+            obj = dict(obj)
+            obj["footer"] = obj.pop("font")
+            warnings.warn(f"{ctx}.font was normalized to {ctx}.footer", stacklevel=2)
         _no_extra_keys(obj, ctx=ctx, allowed_keys={"message", "footer"})
 
         message = _expect_str(obj.get("message"), ctx=f"{ctx}.message")
