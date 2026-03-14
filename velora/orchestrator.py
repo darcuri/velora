@@ -106,6 +106,7 @@ def build_initial_coordinator_request(
             "max_cost_usd": cfg.mode_a_max_cost_usd,
             "no_progress_max": cfg.mode_a_no_progress_max,
             "max_wall_seconds": cfg.mode_a_max_wall_seconds,
+            "review_enabled": cfg.mode_a_review_enabled,
             "allow_self_merge": False,
             "required_gates": ["tests", "security"],
             "specialist_matrix": cfg.specialist_matrix,

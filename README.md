@@ -63,9 +63,19 @@ Token budget (Mode A):
 export VELORA_MODE_A_MAX_TOKENS=200000
 ```
 
+Optional post-success review stage (Mode A):
+
+```bash
+export VELORA_MODE_A_REVIEW_ENABLED=true
+```
+
+When enabled, after CI + review pass Velora runs a structured review stage with outcomes:
+- `approve`: coordinator can choose `finalize_success`
+- `repair`: coordinator can choose a follow-up repair WorkItem
+
 ### Audit inspection
 
-Mode A now writes per-run audit events to `.velora/runs/<run_id>/audit.jsonl` in the checked-out repo. Use `velora audit inspect` to print a summary of the most recent run, or pass a run id for a specific run. The summary includes objective snippet, iterations, coordinator decisions, and final status.
+Mode A now writes per-run audit events to `.velora/runs/<run_id>/audit.jsonl` in the checked-out repo. Use `velora audit inspect` to print a summary of the most recent run, or pass a run id for a specific run. The summary includes objective snippet, iterations, coordinator decisions, final status, and post-success review events when present.
 
 ```bash
 velora audit inspect --run 20260309041214-fa55112b

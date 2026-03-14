@@ -17,6 +17,8 @@ WORKER_BLOCKED = "worker_blocked"
 WORKER_FAILED = "worker_failed"
 CI_RESULT = "ci_result"
 REVIEW_RESULT = "review_result"
+REVIEW_STARTED = "review_started"
+REVIEW_COMPLETED = "review_completed"
 RUN_TERMINAL = "run_terminal"
 
 # Back-compat aliases from the initial audit helper naming.
@@ -198,7 +200,7 @@ def generate_summary(events: list[AuditEvent]) -> str:
                 dispatched[work_item_id]["outcome"] = outcome
         elif event.event_type == CI_RESULT:
             ci_status = str(payload.get("status") or payload.get("outcome") or ci_status)
-        elif event.event_type == REVIEW_RESULT:
+        elif event.event_type in {REVIEW_RESULT, REVIEW_COMPLETED}:
             review_status = str(payload.get("status") or payload.get("outcome") or review_status)
         elif event.event_type in {RUN_END, RUN_TERMINAL}:
             terminal_status = str(payload.get("status") or payload.get("outcome") or terminal_status)

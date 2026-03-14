@@ -52,6 +52,12 @@ Enable Mode A (coordinator → WorkItem → worker → CI + review → repeat):
 velora run octocat/hello-world feature --spec spec.json --coordinator
 ```
 
+Optional post-success review stage:
+- Enable with `VELORA_MODE_A_REVIEW_ENABLED=true`.
+- After CI + review pass, Velora runs a structured review stage that returns:
+  - `approve`: coordinator should finalize success.
+  - `repair`: coordinator should issue a repair follow-up WorkItem.
+
 #### Common options
 
 ```bash
@@ -99,6 +105,7 @@ Mode A policy defaults:
 - `VELORA_MODE_A_MAX_TOKENS` (default: `200000`; primary token budget breaker)
 - `VELORA_MODE_A_NO_PROGRESS_MAX` (default: `4`)
 - `VELORA_MODE_A_MAX_WALL_SECONDS` (default: `1800`)
+- `VELORA_MODE_A_REVIEW_ENABLED` (default: `false`; enables post-success review stage)
 - `VELORA_USD_EQUIV_PER_1M_TOKENS` (default: unset/0; informational only)
 - `VELORA_COORDINATOR_RUNNER` (default: `claude`; also supports `codex`)
 
