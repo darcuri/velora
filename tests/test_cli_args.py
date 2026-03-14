@@ -44,10 +44,11 @@ class TestCliArgs(unittest.TestCase):
 
     def test_audit_inspect_args_parsing(self):
         parser = build_parser()
-        args = parser.parse_args(["audit", "inspect", "--run", "run-123"])
+        args = parser.parse_args(["audit", "inspect", "--run", "run-123", "--json"])
         self.assertEqual(args.cmd, "audit")
         self.assertEqual(args.audit_cmd, "inspect")
         self.assertEqual(args.run_id, "run-123")
+        self.assertTrue(args.json)
 
 
 if __name__ == "__main__":
