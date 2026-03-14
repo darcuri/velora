@@ -12,6 +12,7 @@ This directory holds user-facing documentation for Velora.
 - [JSON Run Spec](./json-run-spec.md)
 - [Configuration](./config.md)
 - [Mode A Safety Rails](./mode-a-safety-rails.md)
+- [Plans](./plans/current-state.md) — current state + near-term roadmap
 
 ## Why Markdown (for now)
 
