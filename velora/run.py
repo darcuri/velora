@@ -410,6 +410,10 @@ def _parse_worker_work_result(
     except json.JSONDecodeError as exc:
         raise ProtocolError(f"Worker output is not valid JSON: {exc}") from exc
 
+    if isinstance(payload, dict) and payload.get("status") == "blocked":
+        payload["branch"] = ""
+        payload["head_sha"] = ""
+
     result = validate_work_result(payload)
     if result.work_item_id != expected_work_item_id:
         raise ProtocolError(

@@ -57,13 +57,20 @@ def _finalize_response(reason: str = "done") -> Any:
     return validate_coordinator_response(payload)
 
 
-def _work_result_json(*, status: str = "completed", branch: str = "velora/task123", sha: str = "abc123") -> str:
+def _work_result_json(
+    *,
+    status: str = "completed",
+    branch: str = "velora/task123",
+    sha: str = "abc123",
+    clear_refs_for_non_completed: bool = True,
+) -> str:
     if status == "completed":
         blockers = []
     else:
         blockers = ["blocked on missing credentials"]
-        branch = ""
-        sha = ""
+        if clear_refs_for_non_completed:
+            branch = ""
+            sha = ""
     return (
         '{'
         f'"protocol_version":1,"work_item_id":"WI-0001","status":"{status}","summary":"worker summary",'
@@ -557,6 +564,39 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
         poll_ci.assert_not_called()
         gh.create_pull_request.assert_not_called()
 
+    def test_mode_a_worker_blocked_noop_path_sanitizes_branch_and_sha(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.run_coordinator", return_value=SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))),
+            patch(
+                "velora.run.run_worker",
+                side_effect=_run_codex_writing_result(
+                    _work_result_json(status="blocked", clear_refs_for_non_completed=False), filename="block.json"
+                ),
+            ),
+            patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
+            patch("velora.run._cleanup_repo_detritus", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=1))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Mode A loop exhausted", result["summary"])
+        self.assertNotIn("Worker protocol failure", result["summary"])
+        poll_ci.assert_not_called()
+        gh.create_pull_request.assert_not_called()
+
     def test_mode_a_rejects_completed_result_on_unassigned_branch(self):
         gh = MagicMock()
         gh.get_default_branch.return_value = "main"
@@ -659,6 +699,52 @@ class TestModeAWorkResultIntegration(unittest.TestCase):
         self.assertEqual(entry["outcome"], "worker_blocked")
         self.assertEqual(entry["artifacts"]["worker_result"]["status"], "blocked")
         self.assertNotIn("patch_suggestion", entry)
+
+    def test_mode_a_second_iteration_worker_blocked_sanitizes_branch_and_sha(self):
+        gh = MagicMock()
+        gh.get_default_branch.return_value = "main"
+        captured_requests: list[dict[str, Any]] = []
+
+        def _coord_side_effect(*args, **kwargs):
+            captured_requests.append(json.loads(json.dumps(kwargs["request"])))
+            if len(captured_requests) == 1:
+                return SimpleNamespace(response=_execute_response(), cmd=CmdResult(0, "", ""))
+            return SimpleNamespace(response=_stop_response("blocked"), cmd=CmdResult(0, "", ""))
+
+        with (
+            patch.dict(os.environ, {"VELORA_ALLOWED_OWNERS": "octocat"}, clear=False),
+            patch("velora.run.build_task_id", return_value="task123"),
+            patch("velora.run.velora_home", return_value=Path("/tmp/velora-home")),
+            patch("velora.run.ensure_dir", side_effect=lambda p: p),
+            patch("velora.run.upsert_task", return_value={}),
+            patch("velora.run.GitHubClient.from_env", return_value=gh),
+            patch("velora.run.ensure_repo_checkout", return_value=Path("/tmp/repo")),
+            patch("velora.run.run_coordinator", side_effect=_coord_side_effect),
+            patch(
+                "velora.run.run_worker",
+                side_effect=_run_codex_writing_result(
+                    _work_result_json(status="blocked", clear_refs_for_non_completed=False), filename="block.json"
+                ),
+            ),
+            patch("velora.run._poll_ci", return_value=("success", "ok")) as poll_ci,
+            patch("velora.run._cleanup_repo_detritus", return_value=None),
+            patch("velora.run._append_text", return_value=None),
+            patch("velora.run._write_text", return_value=None),
+            patch("velora.run._dbg", return_value=None),
+        ):
+            result = run_task_mode_a("octocat/velora", "feature", RunSpec(task="test", max_attempts=2))
+
+        self.assertEqual(result["status"], "failed")
+        poll_ci.assert_not_called()
+        self.assertEqual(len(captured_requests), 2)
+        second = captured_requests[1]
+        self.assertEqual(second["state"]["latest_worker_result"]["status"], "blocked")
+        self.assertEqual(second["state"]["latest_worker_result"]["branch"], "")
+        self.assertEqual(second["state"]["latest_worker_result"]["head_sha"], "")
+        entry = second["history"]["work_items_executed"][0]
+        self.assertEqual(entry["artifacts"]["worker_result"]["status"], "blocked")
+        self.assertEqual(entry["artifacts"]["worker_result"]["branch"], "")
+        self.assertEqual(entry["artifacts"]["worker_result"]["head_sha"], "")
 
     def test_mode_a_second_iteration_request_includes_ci_and_review_artifact_outcomes(self):
         gh = MagicMock()
