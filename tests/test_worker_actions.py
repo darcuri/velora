@@ -13,6 +13,8 @@ from velora.worker_actions import (
     execute_patch_file,
     execute_search_files,
     execute_run_tests,
+    dispatch_action,
+    KNOWN_ACTIONS,
 )
 
 
@@ -241,6 +243,35 @@ class TestRunTests(unittest.TestCase):
         # It ran (returned something), not blocked by allowlist
         self.assertIn(result["status"], {"ok", "error"})
         self.assertNotIn("not in allowlist", result["result"].lower())
+
+
+class TestDispatch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = Path(self.tmp)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "main.py").write_text("x = 1\n")
+        self.scope = WorkerScope(
+            repo_root=self.repo,
+            allowed_files={"src/main.py"},
+            allowed_dirs={"src"},
+            test_commands=["python -m pytest -q"],
+            work_branch="velora/wi-001",
+        )
+
+    def test_dispatch_known_action(self):
+        result = dispatch_action(self.scope, "read_file", {"path": "src/main.py"})
+        self.assertEqual(result["status"], "ok")
+
+    def test_dispatch_unknown_action(self):
+        result = dispatch_action(self.scope, "delete_file", {"path": "src/main.py"})
+        self.assertEqual(result["status"], "error")
+        self.assertIn("unknown action", result["result"].lower())
+
+    def test_known_actions_list(self):
+        expected = {"read_file", "list_files", "write_file", "patch_file",
+                    "search_files", "run_tests", "work_complete", "work_blocked"}
+        self.assertEqual(set(KNOWN_ACTIONS.keys()), expected)
 
 
 if __name__ == "__main__":

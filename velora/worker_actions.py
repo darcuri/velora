@@ -241,3 +241,38 @@ def execute_run_tests(scope: WorkerScope, params: dict[str, Any]) -> dict[str, s
     output = (proc.stdout or "") + (proc.stderr or "")
     status = "ok" if proc.returncode == 0 else "error"
     return _action_result(status, output)
+
+
+# Terminal actions return None — the loop handles them specially.
+def _terminal_noop(scope: WorkerScope, params: dict[str, Any]) -> dict[str, str]:
+    """Placeholder executor for terminal actions (work_complete, work_blocked).
+    The loop handles these before dispatch reaches here."""
+    return _action_result("ok", "")
+
+
+KNOWN_ACTIONS: dict[str, Any] = {
+    "read_file": execute_read_file,
+    "list_files": execute_list_files,
+    "write_file": execute_write_file,
+    "patch_file": execute_patch_file,
+    "search_files": execute_search_files,
+    "run_tests": execute_run_tests,
+    "work_complete": _terminal_noop,
+    "work_blocked": _terminal_noop,
+}
+
+TERMINAL_ACTIONS = {"work_complete", "work_blocked"}
+
+
+def dispatch_action(
+    scope: WorkerScope,
+    action: str,
+    params: dict[str, Any],
+) -> dict[str, str]:
+    executor = KNOWN_ACTIONS.get(action)
+    if executor is None:
+        return _action_result(
+            "error",
+            f"Unknown action: {action}. Valid actions: {', '.join(sorted(KNOWN_ACTIONS))}",
+        )
+    return executor(scope, params)
