@@ -97,15 +97,14 @@ class TestRunners(unittest.TestCase):
             request = {"run_id": "task123", "policy": {}}
             with (
                 patch("velora.runners.render_coordinator_prompt_v1", return_value="PROMPT") as mock_render,
-                patch("velora.runners._ensure_anthropic_auth") as mock_auth,
                 patch(
-                    "velora.runners.run_cmd",
+                    "velora.runners._call_anthropic_api",
                     return_value=CmdResult(
                         0,
                         '{"protocol_version":1,"decision":"finalize_success","reason":"done","selected_specialist":{"role":"implementer","runner":"claude"}}',
                         "",
                     ),
-                ) as mock_run_cmd,
+                ) as mock_api,
             ):
                 result = run_coordinator(
                     session_name="coord-session",
@@ -120,14 +119,7 @@ class TestRunners(unittest.TestCase):
             replay_memory="# Coordinator Replay\n\nhello",
             brief={"run_id": "task123", "status": {"state": "running"}},
         )
-        mock_auth.assert_called_once()
-        env = mock_run_cmd.call_args.kwargs["env"]
-        self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
-        mock_run_cmd.assert_called_once_with(
-            ["claude", "--print", "--permission-mode", "bypassPermissions", "-p", "PROMPT"],
-            cwd=repo_path,
-            env=env,
-        )
+        mock_api.assert_called_once_with("PROMPT")
 
     def test_run_worker_routes_to_acp_claude(self) -> None:
         fake = CmdResult(0, "ok", "")

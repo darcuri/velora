@@ -78,22 +78,62 @@ def _run_direct_claude_coordinator(*, cwd: Path, request: dict[str, Any]) -> Coo
     replay_memory = _load_replay_memory(cwd, request)
     replay_brief = _load_replay_brief(cwd, request)
     prompt = render_coordinator_prompt_v1(request, replay_memory=replay_memory, brief=replay_brief)
-    env = os.environ.copy()
-    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    _ensure_anthropic_auth(env)
-    result = run_cmd(
-        [
-            "claude",
-            "--print",
-            "--permission-mode",
-            "bypassPermissions",
-            "-p",
-            prompt,
-        ],
-        cwd=cwd,
-        env=env,
-    )
+    result = _call_anthropic_api(prompt)
     return validate_coordinator_cmd_result(result=result, request=request)
+
+
+def _call_anthropic_api(prompt: str) -> CmdResult:
+    """Call the Anthropic Messages API directly via urllib."""
+    import urllib.request
+    import urllib.error
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
+    if not api_key:
+        return CmdResult(
+            returncode=1, stdout="",
+            stderr="Neither ANTHROPIC_API_KEY nor ANTHROPIC_AUTH_TOKEN is set",
+        )
+
+    model = os.environ.get("VELORA_COORDINATOR_MODEL", "claude-sonnet-4-6")
+    timeout_s = int(os.environ.get("VELORA_COORDINATOR_TIMEOUT", "120"))
+
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url="https://api.anthropic.com/v1/messages",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        data=body,
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310 (Anthropic API)
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic API HTTP {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic API connection failed: {exc.reason}")
+    except TimeoutError:
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic API timed out after {timeout_s}s")
+
+    try:
+        payload = json.loads(raw)
+        text = payload["content"][0]["text"]
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic API response parse error: {exc}")
+
+    return CmdResult(returncode=0, stdout=text, stderr="")
 
 
 def run_coordinator(
