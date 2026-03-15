@@ -1,13 +1,20 @@
 import unittest
 
+import tempfile
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
 from velora.local_worker import (
     HarnessReason,
     HarnessOutcome,
     assemble_work_result,
     build_local_worker_prompt,
     ConversationManager,
+    run_local_worker_loop,
 )
 from velora.protocol import validate_work_result, WorkItem
+from velora.worker_actions import WorkerScope
+from velora.acpx import CmdResult
 
 
 class TestHarnessOutcome(unittest.TestCase):
@@ -185,6 +192,81 @@ class TestConversationManager(unittest.TestCase):
         big_msg = msgs[2]  # first user message
         self.assertIn("[truncated]", big_msg["content"])
         self.assertLess(len(big_msg["content"]), 5000)
+
+
+def _make_scope(repo: Path) -> WorkerScope:
+    return WorkerScope(
+        repo_root=repo,
+        allowed_files={"src/main.py"},
+        allowed_dirs={"src"},
+        test_commands=["python -m pytest -q"],
+        work_branch="velora/wi-001",
+    )
+
+
+class TestHarnessLoop(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = Path(self.tmp)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "main.py").write_text("x = 1\n")
+
+    def _mock_llm_responses(self, responses: list[str]):
+        """Create a side_effect that returns CmdResult for each response."""
+        results = [CmdResult(returncode=0, stdout=r, stderr="") for r in responses]
+        return results
+
+    def test_work_complete_terminates_loop(self):
+        responses = self._mock_llm_responses([
+            '{"action": "read_file", "params": {"path": "src/main.py"}}',
+            '{"action": "work_complete", "params": {"summary": "read the file"}}',
+        ])
+        with patch("velora.local_worker._call_local_llm_chat", side_effect=responses):
+            outcome = run_local_worker_loop(
+                scope=_make_scope(self.repo),
+                system_prompt="You are a tool.",
+            )
+        self.assertEqual(outcome.reason, HarnessReason.SUCCESS)
+        self.assertEqual(outcome.llm_summary, "read the file")
+
+    def test_work_blocked_terminates_loop(self):
+        responses = self._mock_llm_responses([
+            '{"action": "work_blocked", "params": {"reason": "SCOPE_INSUFFICIENT", "blockers": ["need config.py"]}}',
+        ])
+        with patch("velora.local_worker._call_local_llm_chat", side_effect=responses):
+            outcome = run_local_worker_loop(
+                scope=_make_scope(self.repo),
+                system_prompt="You are a tool.",
+            )
+        self.assertEqual(outcome.reason, HarnessReason.SCOPE_INSUFFICIENT)
+        self.assertFalse(outcome.success)
+
+    def test_iteration_cap_terminates_loop(self):
+        # 25 read_file actions — exceeds default cap of 20
+        responses = self._mock_llm_responses(
+            ['{"action": "read_file", "params": {"path": "src/main.py"}}'] * 25
+        )
+        with patch("velora.local_worker._call_local_llm_chat", side_effect=responses):
+            outcome = run_local_worker_loop(
+                scope=_make_scope(self.repo),
+                system_prompt="You are a tool.",
+                iteration_cap=20,
+            )
+        self.assertEqual(outcome.reason, HarnessReason.ITERATION_LIMIT)
+
+    def test_parse_failure_cap_terminates_loop(self):
+        responses = self._mock_llm_responses([
+            "this is not json",
+            "also not json",
+            "still not json",
+        ])
+        with patch("velora.local_worker._call_local_llm_chat", side_effect=responses):
+            outcome = run_local_worker_loop(
+                scope=_make_scope(self.repo),
+                system_prompt="You are a tool.",
+                parse_failure_cap=3,
+            )
+        self.assertEqual(outcome.reason, HarnessReason.PARSE_FAILURES)
 
 
 if __name__ == "__main__":

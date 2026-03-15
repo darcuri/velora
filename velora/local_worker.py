@@ -229,3 +229,218 @@ class ConversationManager:
                 old_bytes = content_bytes
                 msg["content"] = truncated
                 self.context_bytes -= old_bytes - len(truncated.encode("utf-8"))
+
+
+# -- Cap defaults --
+
+_ITERATION_CAP = int(os.environ.get("VELORA_HARNESS_ITERATION_CAP", "20"))
+_CONTEXT_CAP_BYTES = int(os.environ.get("VELORA_HARNESS_CONTEXT_CAP", str(128 * 1024)))
+_PARSE_FAILURE_CAP = int(os.environ.get("VELORA_HARNESS_PARSE_FAILURE_CAP", "3"))
+
+# LLM blocked reasons the worker can emit
+_LLM_BLOCKED_REASONS = {"SCOPE_INSUFFICIENT", "TASK_UNCLEAR", "CANNOT_RESOLVE"}
+
+
+@dataclass
+class LoopOutcome:
+    """Internal outcome from the action loop (before endgame)."""
+    success: bool
+    reason: HarnessReason
+    evidence: list[str]
+    llm_summary: str        # from work_complete, empty otherwise
+    llm_blockers: list[str] # from work_blocked, empty otherwise
+    conversation: ConversationManager | None = None  # preserved for test retry re-entry
+
+
+def _parse_action(raw: str) -> tuple[str, dict[str, Any]] | None:
+    """Parse an LLM response into (action, params). Returns None on failure."""
+    text = raw.strip()
+    # Strip markdown fences if the model wraps JSON
+    if text.startswith("```"):
+        lines = text.splitlines()
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    action = obj.get("action")
+    params = obj.get("params")
+    if not isinstance(action, str) or not isinstance(params, dict):
+        return None
+    return action, params
+
+
+def run_local_worker_loop(
+    *,
+    scope: WorkerScope,
+    system_prompt: str,
+    conversation: ConversationManager | None = None,
+    iteration_cap: int = _ITERATION_CAP,
+    context_cap_bytes: int = _CONTEXT_CAP_BYTES,
+    parse_failure_cap: int = _PARSE_FAILURE_CAP,
+) -> LoopOutcome:
+    """Run the multi-turn action loop with a local LLM.
+
+    Returns a LoopOutcome describing how the loop terminated. The caller
+    (run_local_worker) handles the endgame and WorkResult assembly.
+
+    If `conversation` is provided, resumes from an existing conversation
+    (used for test failure re-entry). Otherwise starts fresh.
+    """
+    conv = conversation if conversation is not None else ConversationManager(system_prompt)
+    iteration = 0
+    parse_failures = 0
+
+    while True:
+        # -- Context cap --
+        if conv.context_bytes > context_cap_bytes:
+            return LoopOutcome(
+                success=False,
+                reason=HarnessReason.CONTEXT_OVERFLOW,
+                evidence=[f"context exceeded {context_cap_bytes} bytes after {iteration} turns"],
+                llm_summary="",
+                llm_blockers=[],
+                conversation=conv,
+            )
+
+        # -- Call LLM --
+        llm_result = _call_local_llm_chat(conv.messages(), scope.repo_root)
+
+        if llm_result.returncode != 0:
+            return LoopOutcome(
+                success=False,
+                reason=HarnessReason.PARSE_FAILURES,
+                evidence=[f"LLM call failed: {llm_result.stderr}"],
+                llm_summary="",
+                llm_blockers=[],
+                conversation=conv,
+            )
+
+        raw_response = llm_result.stdout
+        conv.append_assistant(raw_response)
+
+        # -- Parse --
+        parsed = _parse_action(raw_response)
+        if parsed is None:
+            parse_failures += 1
+            if parse_failures >= parse_failure_cap:
+                return LoopOutcome(
+                    success=False,
+                    reason=HarnessReason.PARSE_FAILURES,
+                    evidence=[f"{parse_failures} consecutive parse failures"],
+                    llm_summary="",
+                    llm_blockers=[],
+                    conversation=conv,
+                )
+            error_msg = json.dumps({
+                "status": "error",
+                "result": "Invalid response. Emit exactly one JSON object with action and params.",
+            })
+            conv.append_user(error_msg)
+            iteration += 1
+            continue
+
+        parse_failures = 0
+        action, params = parsed
+
+        # -- Terminal actions --
+        if action == "work_complete":
+            summary = params.get("summary", "")
+            return LoopOutcome(
+                success=True,
+                reason=HarnessReason.SUCCESS,
+                evidence=[],
+                llm_summary=summary if isinstance(summary, str) else "",
+                llm_blockers=[],
+                conversation=conv,
+            )
+
+        if action == "work_blocked":
+            reason_str = params.get("reason", "CANNOT_RESOLVE")
+            if reason_str not in _LLM_BLOCKED_REASONS:
+                reason_str = "CANNOT_RESOLVE"
+            blockers = params.get("blockers", [])
+            if not isinstance(blockers, list):
+                blockers = []
+            blockers = [str(b) for b in blockers if isinstance(b, str)]
+
+            if reason_str == "SCOPE_INSUFFICIENT":
+                reason = HarnessReason.SCOPE_INSUFFICIENT
+            else:
+                reason = HarnessReason.WORKER_BLOCKED
+
+            return LoopOutcome(
+                success=False,
+                reason=reason,
+                evidence=blockers,
+                llm_summary="",
+                llm_blockers=blockers,
+                conversation=conv,
+            )
+
+        # -- Execute action --
+        result = dispatch_action(scope, action, params)
+        result_json = json.dumps(result)
+        conv.append_user(result_json)
+        conv.summarize()
+
+        iteration += 1
+        if iteration >= iteration_cap:
+            return LoopOutcome(
+                success=False,
+                reason=HarnessReason.ITERATION_LIMIT,
+                evidence=[f"{iteration} turns exhausted"],
+                llm_summary="",
+                llm_blockers=[],
+                conversation=conv,
+            )
+
+
+def _call_local_llm_chat(messages: list[dict[str, str]], cwd: Path) -> CmdResult:
+    """Call the local LLM with the full chat message list.
+
+    Uses the OpenAI-compatible /v1/chat/completions endpoint.
+    """
+    import urllib.request
+    import urllib.error
+
+    base_url = os.environ.get("VELORA_LOCAL_BASE_URL", "http://localhost:1234").rstrip("/")
+    model = os.environ.get("VELORA_LOCAL_MODEL", "")
+    timeout_s = int(os.environ.get("VELORA_LOCAL_TIMEOUT", "600"))
+
+    body: dict[str, Any] = {
+        "messages": messages,
+        "temperature": 0.2,
+    }
+    if model:
+        body["model"] = model
+
+    url = f"{base_url}/v1/chat/completions"
+    req = urllib.request.Request(
+        url=url,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(body).encode("utf-8"),
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM HTTP {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM connection failed: {exc.reason}")
+    except TimeoutError:
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM timed out after {timeout_s}s")
+
+    try:
+        payload = json.loads(raw)
+        text = payload["choices"][0]["message"]["content"]
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM response parse error: {exc}")
+
+    return CmdResult(returncode=0, stdout=text, stderr="")
