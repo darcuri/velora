@@ -5,6 +5,7 @@ from velora.local_worker import (
     HarnessOutcome,
     assemble_work_result,
     build_local_worker_prompt,
+    ConversationManager,
 )
 from velora.protocol import validate_work_result, WorkItem
 
@@ -148,6 +149,42 @@ class TestBuildPrompt(unittest.TestCase):
         for action in ["read_file", "list_files", "write_file", "patch_file",
                         "search_files", "run_tests", "work_complete", "work_blocked"]:
             self.assertIn(action, prompt)
+
+
+class TestConversationManager(unittest.TestCase):
+    def test_init_with_system_prompt(self):
+        cm = ConversationManager(system_prompt="You are a tool.")
+        msgs = cm.messages()
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["role"], "system")
+
+    def test_append_turn(self):
+        cm = ConversationManager(system_prompt="You are a tool.")
+        cm.append_assistant('{"action": "read_file", "params": {"path": "x.py"}}')
+        cm.append_user('{"status": "ok", "result": "contents"}')
+        self.assertEqual(len(cm.messages()), 3)
+
+    def test_context_bytes_tracked(self):
+        cm = ConversationManager(system_prompt="short")
+        cm.append_assistant("a" * 100)
+        cm.append_user("b" * 200)
+        self.assertGreater(cm.context_bytes, 0)
+
+    def test_summarization_truncates_old_large_messages(self):
+        cm = ConversationManager(system_prompt="sys", recency_window=2)
+        # Add 6 turns (3 assistant + 3 user), first user message is huge
+        cm.append_assistant("act1")
+        cm.append_user("x" * 5000)  # big result, will be old after more turns
+        cm.append_assistant("act2")
+        cm.append_user("small")
+        cm.append_assistant("act3")
+        cm.append_user("small2")
+        cm.summarize()
+        # The big message (index 2, the first user msg) should be truncated
+        msgs = cm.messages()
+        big_msg = msgs[2]  # first user message
+        self.assertIn("[truncated]", big_msg["content"])
+        self.assertLess(len(big_msg["content"]), 5000)
 
 
 if __name__ == "__main__":

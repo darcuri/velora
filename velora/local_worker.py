@@ -169,3 +169,63 @@ def build_local_worker_prompt(
     lines.append("- If you cannot complete the task with the files in scope, use work_blocked.")
 
     return "\n".join(lines) + "\n"
+
+
+# -- Conversation manager --
+
+# -- Tunable constants --
+
+_SUMMARIZE_THRESHOLD_BYTES = int(os.environ.get("VELORA_HARNESS_SUMMARIZE_THRESHOLD", "2048"))
+_SUMMARIZE_KEEP_LINES = int(os.environ.get("VELORA_HARNESS_SUMMARIZE_LINES", "40"))
+_RECENCY_WINDOW = int(os.environ.get("VELORA_HARNESS_RECENCY_WINDOW", "4"))
+
+
+class ConversationManager:
+    """Manages the chat message list for the local worker harness.
+
+    Handles appending turns, tracking context size, and summarizing old
+    large messages to keep context within budget.
+    """
+
+    def __init__(self, system_prompt: str, *, recency_window: int = _RECENCY_WINDOW):
+        self._messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+        ]
+        self._recency_window = recency_window
+        self.context_bytes = len(system_prompt.encode("utf-8"))
+
+    def messages(self) -> list[dict[str, str]]:
+        return list(self._messages)
+
+    def append_assistant(self, content: str) -> None:
+        self._messages.append({"role": "assistant", "content": content})
+        self.context_bytes += len(content.encode("utf-8"))
+
+    def append_user(self, content: str) -> None:
+        self._messages.append({"role": "user", "content": content})
+        self.context_bytes += len(content.encode("utf-8"))
+
+    def summarize(self) -> None:
+        """Truncate old large messages outside the recency window."""
+        # Messages: [system, asst, user, asst, user, ...]
+        # recency_window=4 means keep the last 4 non-system messages intact.
+        non_system_count = len(self._messages) - 1
+        if non_system_count <= self._recency_window:
+            return
+
+        cutoff_idx = len(self._messages) - self._recency_window
+        for i in range(1, cutoff_idx):
+            msg = self._messages[i]
+            content = msg["content"]
+            content_bytes = len(content.encode("utf-8"))
+            if content_bytes > _SUMMARIZE_THRESHOLD_BYTES:
+                lines = content.splitlines()
+                if len(lines) > _SUMMARIZE_KEEP_LINES * 2:
+                    head = lines[:_SUMMARIZE_KEEP_LINES]
+                    tail = lines[-_SUMMARIZE_KEEP_LINES:]
+                    truncated = "\n".join(head) + "\n\n[truncated]\n\n" + "\n".join(tail)
+                else:
+                    truncated = content[:_SUMMARIZE_THRESHOLD_BYTES] + "\n\n[truncated]"
+                old_bytes = content_bytes
+                msg["content"] = truncated
+                self.context_bytes -= old_bytes - len(truncated.encode("utf-8"))
