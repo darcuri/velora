@@ -70,6 +70,22 @@ class TestCoordinator(unittest.TestCase):
         self.assertIn("what you are changing in the reason field", with_audit)
         self.assertNotIn("### No-progress self-audit", without_audit)
 
+    def test_prompt_contains_request_review_schema(self) -> None:
+        prompt = render_coordinator_prompt_v1({"protocol_version": 1})
+        self.assertIn("request_review", prompt)
+        self.assertIn("review_brief", prompt)
+        self.assertIn('"reviewer": "gemini" | "claude"', prompt)
+        self.assertIn("acceptance_criteria", prompt)
+        self.assertIn("REQUIRED only when decision=request_review", prompt)
+
+    def test_prompt_contains_dismiss_finding_schema(self) -> None:
+        prompt = render_coordinator_prompt_v1({"protocol_version": 1})
+        self.assertIn("dismiss_finding", prompt)
+        self.assertIn("finding_dismissal", prompt)
+        self.assertIn("finding_ids", prompt)
+        self.assertIn("justification", prompt)
+        self.assertIn("REQUIRED only when decision=dismiss_finding", prompt)
+
     def test_run_coordinator_rejects_non_json_output(self) -> None:
         with patch("velora.coordinator.run_claude") as mocked:
             mocked.return_value = type(

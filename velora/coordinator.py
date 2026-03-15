@@ -43,7 +43,7 @@ The JSON MUST conform to this CoordinatorResponse schema (protocol_version=1):
 
 {{
   "protocol_version": 1,
-  "decision": "execute_work_item" | "finalize_success" | "stop_failure",
+  "decision": "execute_work_item" | "request_review" | "dismiss_finding" | "finalize_success" | "stop_failure",
   "reason": "string",
 
   "selected_specialist": {{
@@ -72,6 +72,27 @@ The JSON MUST conform to this CoordinatorResponse schema (protocol_version=1):
         "WORK_ITEM_ID": "WI-####"
       }}
     }}
+  }},
+
+  "review_brief": {{
+    "id": "RB-####",
+    "reviewer": "gemini" | "claude",
+    "model": "string (optional, null if not needed)",
+    "objective": "what the work item aimed to accomplish",
+    "acceptance_criteria": ["what done means", "..."],
+    "rejection_criteria": ["what is forbidden", "..."],
+    "areas_of_concern": ["specific things to look harder at", "..."],
+    "scope": {{
+      "kind": "full_diff" | "files",
+      "base_ref": "main",
+      "head_sha": "commit sha to review",
+      "files": ["path/to/file.py", "..."]
+    }}
+  }},
+
+  "finding_dismissal": {{
+    "finding_ids": ["RF-001", "..."],
+    "justification": "why these findings are non-blocking"
   }}
 }}
 
@@ -79,6 +100,10 @@ Rules:
 - selected_specialist is REQUIRED for ALL decisions (attribution)
 - You MUST choose selected_specialist within CoordinatorRequest.policy.specialist_matrix (out-of-bounds is a hard failure)
 - work_item is REQUIRED only when decision=execute_work_item; it must be omitted otherwise
+- review_brief is REQUIRED only when decision=request_review; it must be omitted otherwise
+- finding_dismissal is REQUIRED only when decision=dismiss_finding; it must be omitted otherwise
+- Use request_review after CI passes and you want a structured review of the changes
+- Use dismiss_finding after seeing a ReviewResult with findings you consider non-blocking
 - reason MUST be a string
 - Unknown keys are forbidden
 - `work_item.limits.max_diff_lines` MUST be EXACTLY one of: 50, 100, 200, 400
