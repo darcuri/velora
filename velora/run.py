@@ -1489,25 +1489,53 @@ class RunContext:
     agent_output_path: Path | None = None
 
 
-def run_task_mode_a(
-    repo_ref: str,
-    verb: str,
-    spec: RunSpec,
-    home: Path | None = None,
-    base_branch: str | None = None,
-    debug: bool = False,
-) -> dict[str, Any]:
-    """Mode A loop: coordinator → work_item → worker → evaluate → repeat."""
 
-    base_home = home or velora_home()
 
-    # Use our own durable run_id/task_id so failures during preflight still get recorded.
-    task_id = build_task_id()
-    task_text = spec.task
+def _ctx_audit(ctx: RunContext, iteration: int, event_type: str, **payload: Any) -> None:
+    """Audit helper that reads repo_path and task_id from RunContext."""
+    _append_audit_event(
+        repo_path=ctx.repo_path,
+        run_id=ctx.task_id,
+        iteration=iteration,
+        event_type=event_type,
+        payload=payload,
+    )
+
+
+def _ctx_sync_replay(ctx: RunContext) -> None:
+    """Convenience wrapper for sync_run_replay using RunContext fields."""
+    sync_run_replay(ctx.repo_path, request=ctx.request, max_attempts=ctx.max_attempts, verb=ctx.verb)
+
+
+def _ctx_replay_event(ctx: RunContext, iteration: int, event: str, data: dict[str, Any]) -> None:
+    """Convenience wrapper for append_run_replay_event using RunContext fields."""
+    append_run_replay_event(ctx.repo_path, ctx.task_id, iteration=iteration, event=event, data=data)
+
+
+# ---------------------------------------------------------------------------
+# State handlers
+# ---------------------------------------------------------------------------
+# Each handler: _state_xxx(ctx: RunContext) -> OrchestratorState
+# Returns the next state.  The main loop continues until DONE.
+
+
+def _state_preflight(ctx: RunContext) -> OrchestratorState:
+    """Set up repo, build request dict, seed replay, emit run-start audit.
+
+    On success, transitions to AWAITING_DECISION.
+    On preflight failure, sets ctx.result and transitions to DONE.
+    """
+    base_home = ctx.home
+    task_id = ctx.task_id
+    task_text = ctx.spec.task
+    repo_ref = ctx.repo_ref
+    verb = ctx.verb
+    debug = ctx.debug
 
     task_dir = ensure_dir(base_home / "tasks" / task_id)
-    coord_output_path = task_dir / "coord-output.txt"
-    agent_output_path = task_dir / "agent-output.txt"
+    ctx.task_dir = task_dir
+    ctx.coord_output_path = task_dir / "coord-output.txt"
+    ctx.agent_output_path = task_dir / "agent-output.txt"
 
     record: dict[str, Any] = {
         "task_id": task_id,
@@ -1524,8 +1552,10 @@ def run_task_mode_a(
         "summary": None,
     }
     upsert_task(record, home=base_home)
+    ctx.record = record
 
     dbg_dir = task_dir if debug else None
+    ctx.dbg_dir = dbg_dir
     _dbg(
         dbg_dir,
         "run_start",
@@ -1533,26 +1563,33 @@ def run_task_mode_a(
             "task_id": task_id,
             "repo": repo_ref,
             "verb": verb,
-            "base_branch_override": (base_branch or "").strip() or None,
-            "max_attempts": spec.max_attempts,
+            "base_branch_override": ctx.base_branch or None,
+            "max_attempts": ctx.spec.max_attempts,
             "max_tokens": os.environ.get("VELORA_MODE_A_MAX_TOKENS"),
         },
     )
 
-    cfg = get_config()
+    cfg = ctx.config
 
     try:
         owner, repo = validate_repo_allowed(repo_ref)
         gh = GitHubClient.from_env()
-        base_branch = (base_branch or "").strip() or gh.get_default_branch(owner, repo)
-        repo_path = ensure_repo_checkout(owner, repo, home=home, base_branch=base_branch)
+        base_branch = ctx.base_branch or gh.get_default_branch(owner, repo)
+        repo_path = ensure_repo_checkout(owner, repo, home=base_home, base_branch=base_branch)
     except Exception as exc:  # noqa: BLE001
         detail = _format_preflight_error(exc)
         record["status"] = "failed"
         record["updated_at"] = now_iso()
         record["failure_reason"] = detail
         upsert_task(record, home=base_home)
-        return {"task_id": task_id, "status": record["status"], "pr_url": None, "summary": detail}
+        ctx.result = {"task_id": task_id, "status": record["status"], "pr_url": None, "summary": detail}
+        return OrchestratorState.DONE
+
+    ctx.owner = owner
+    ctx.repo = repo
+    ctx.base_branch = base_branch
+    ctx.repo_path = repo_path
+    ctx.gh = gh
 
     _dbg(
         dbg_dir,
@@ -1566,6 +1603,7 @@ def run_task_mode_a(
     )
 
     work_branch = f"velora/{task_id}"
+    ctx.work_branch = work_branch
 
     request: dict[str, Any] = {
         "protocol_version": 1,
@@ -1622,14 +1660,20 @@ def run_task_mode_a(
             "worker_tokens_by_branch_estimate": {},
         },
     }
+    ctx.request = request
 
     coord_session = coordinator_session_name(owner, repo, task_id)
     coord_runner = os.environ.get("VELORA_COORDINATOR_RUNNER", "claude").strip().lower() or "claude"
     coord_backend = os.environ.get("VELORA_COORDINATOR_BACKEND", "").strip().lower() or None
     worker_backend = os.environ.get("VELORA_WORKER_BACKEND", "").strip().lower() or None
+    ctx.coord_session = coord_session
+    ctx.coord_runner = coord_runner
+    ctx.coord_backend = coord_backend
+    ctx.worker_backend = worker_backend
 
-    max_attempts = spec.max_attempts if spec.max_attempts is not None else cfg.max_attempts
+    max_attempts = ctx.spec.max_attempts if ctx.spec.max_attempts is not None else cfg.max_attempts
     max_attempts = max(1, min(int(max_attempts), 10))
+    ctx.max_attempts = max_attempts
 
     seed_run_replay(
         repo_path,
@@ -1638,1059 +1682,1255 @@ def run_task_mode_a(
         verb=verb,
     )
 
-    def _audit(iteration: int, event_type: str, **payload: Any) -> None:
-        _append_audit_event(repo_path=repo_path, run_id=task_id, iteration=iteration, event_type=event_type, payload=payload)
-
-    _audit(0, AUDIT_RUN_START, repo=repo_ref, branch=work_branch, objective_snippet=_objective_snippet(task_text))
+    _ctx_audit(ctx, 0, AUDIT_RUN_START, repo=repo_ref, branch=work_branch, objective_snippet=_objective_snippet(task_text))
 
     policy = request.get("policy") if isinstance(request, dict) else {}
     if not isinstance(policy, dict):
         policy = {}
 
-    no_progress_max = int(policy.get("no_progress_max") or cfg.mode_a_no_progress_max)
-    max_wall_seconds = int(policy.get("max_wall_seconds") or cfg.mode_a_max_wall_seconds)
-    max_tokens = int(policy.get("max_tokens") or cfg.mode_a_max_tokens)
-    review_enabled = _coerce_bool(policy.get("review_enabled"), default=cfg.mode_a_review_enabled)
+    ctx.no_progress_max = int(policy.get("no_progress_max") or cfg.mode_a_no_progress_max)
+    ctx.max_wall_seconds = int(policy.get("max_wall_seconds") or cfg.mode_a_max_wall_seconds)
+    ctx.max_tokens = int(policy.get("max_tokens") or cfg.mode_a_max_tokens)
+    ctx.review_enabled = _coerce_bool(policy.get("review_enabled"), default=cfg.mode_a_review_enabled)
 
-    loop_start = time.monotonic()
-    last_failure_sig: str | None = None
+    ctx.loop_start = time.monotonic()
+    ctx.last_failure_sig = None
+    ctx.iteration = 1
 
-    for attempt in range(1, max_attempts + 1):
-        request["iteration"] = attempt
-        _audit(attempt, AUDIT_ITERATION_START, attempt=attempt)
+    return OrchestratorState.AWAITING_DECISION
 
-        # Breakers: wall clock and token budget.
-        hist = request.setdefault("history", {})
-        elapsed = time.monotonic() - loop_start
-        hist["elapsed_seconds"] = round(elapsed, 2)
 
-        if max_wall_seconds and elapsed > max_wall_seconds:
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Wall-clock breaker tripped: elapsed={elapsed:.1f}s > max_wall_seconds={max_wall_seconds}",
-            )
+def _state_awaiting_decision(ctx: RunContext) -> OrchestratorState:
+    """Run breaker checks, call coordinator, route on decision type.
 
-        tokens_used = int(hist.get("tokens_used_estimate") or 0)
-        if max_tokens and tokens_used > max_tokens:
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Token breaker tripped: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
-            )
+    Transitions:
+    - TERMINAL if coordinator says finalize_success / stop_failure
+    - DISPATCHING_WORKER if coordinator says execute_work_item
+    - DISPATCHING_REVIEW if coordinator says request_review
+    - PROCESSING_DISMISSAL if coordinator says dismiss_finding
+    - DONE on fatal errors (sets ctx.result)
+    """
+    attempt = ctx.iteration
+    record = ctx.record
+    request = ctx.request
+    base_home = ctx.home
+    task_dir = ctx.task_dir
+    dbg_dir = ctx.dbg_dir
 
-        iter_start = time.monotonic()
+    # Check loop exhaustion before starting this iteration.
+    if attempt > ctx.max_attempts:
+        record["status"] = "failed"
+        record["updated_at"] = now_iso()
+        record["failure_reason"] = f"Mode A loop exhausted after {ctx.max_attempts} iterations"
+        upsert_task(record, home=base_home)
+        _ctx_audit(ctx, ctx.max_attempts, AUDIT_RUN_END, status="failed", summary=record["failure_reason"])
+        ctx.result = {"task_id": ctx.task_id, "status": record["status"], "pr_url": record["pr_url"], "summary": record["failure_reason"]}
+        return OrchestratorState.DONE
 
-        try:
-            _dbg(
-                dbg_dir,
-                "coordinator_start",
-                {
-                    "iteration": attempt,
-                    "runner": coord_runner,
-                    "backend": coord_backend,
-                    "session": coord_session,
-                    "tokens_total": int(hist.get("tokens_used_estimate") or 0),
-                },
-            )
-            coord_t0 = time.monotonic()
-            coord_run = None
-            for coord_try in range(2):
-                try:
-                    coord_run = _run_coordinator_with_schema_retry(
-                        session_name=coord_session,
-                        cwd=repo_path,
-                        request=request,
-                        runner=coord_runner,
-                        backend=coord_backend,
-                    )
-                    break
-                except ProtocolError:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    detail = _format_preflight_error(exc)
-                    if coord_try >= 1:
-                        raise RuntimeError(
-                            f"Coordinator retry exhausted after {coord_try + 1} attempts: {detail}"
-                        ) from exc
-                    _dbg(
-                        dbg_dir,
-                        "coordinator_retry",
-                        {
-                            "iteration": attempt,
-                            "retry": coord_try + 1,
-                            "delay_s": 1,
-                            "detail": detail,
-                        },
-                    )
-                    time.sleep(1)
-            if coord_run is None:
-                raise RuntimeError("Coordinator retry loop exited without a result")
-            coord_dt = round(time.monotonic() - coord_t0, 2)
-            coord_resp = coord_run.response
-            _accumulate_acpx_usage(request, session_name=coord_session, result=coord_run.cmd, actor="coordinator")
-            _sync_budget_to_record(record, request)
-            _dbg(
-                dbg_dir,
-                "coordinator_done",
-                {
-                    "iteration": attempt,
-                    "duration_s": coord_dt,
-                    "backend": coord_backend,
-                    "decision": coord_resp.decision,
-                    "selected_role": coord_resp.selected_specialist.role,
-                    "selected_runner": coord_resp.selected_specialist.runner,
-                    "work_item_id": (coord_resp.work_item.id if coord_resp.work_item else None),
-                    "work_item_kind": (coord_resp.work_item.kind if coord_resp.work_item else None),
-                    "model_id": getattr(getattr(coord_run.cmd, "usage", None), "model_id", None),
-                    "tokens_total": record.get("tokens_used_estimate"),
-                },
-            )
+    request["iteration"] = attempt
+    _ctx_audit(ctx, attempt, AUDIT_ITERATION_START, attempt=attempt)
 
-            # Trip immediately if the coordinator itself blew the token budget.
-            hist = request.setdefault("history", {})
-            tokens_used = int(hist.get("tokens_used_estimate") or 0)
-            if max_tokens and tokens_used > max_tokens:
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=f"Token breaker tripped after coordinator: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
+    # Breakers: wall clock and token budget.
+    hist = request.setdefault("history", {})
+    elapsed = time.monotonic() - ctx.loop_start
+    hist["elapsed_seconds"] = round(elapsed, 2)
+
+    if ctx.max_wall_seconds and elapsed > ctx.max_wall_seconds:
+        ctx.result = _fail_task(
+            record,
+            home=base_home,
+            task_dir=task_dir,
+            detail=f"Wall-clock breaker tripped: elapsed={elapsed:.1f}s > max_wall_seconds={ctx.max_wall_seconds}",
+        )
+        return OrchestratorState.DONE
+
+    tokens_used = int(hist.get("tokens_used_estimate") or 0)
+    if ctx.max_tokens and tokens_used > ctx.max_tokens:
+        ctx.result = _fail_task(
+            record,
+            home=base_home,
+            task_dir=task_dir,
+            detail=f"Token breaker tripped: tokens_used_estimate={tokens_used} > max_tokens={ctx.max_tokens}",
+        )
+        return OrchestratorState.DONE
+
+    ctx.iter_start = time.monotonic()
+
+    try:
+        _dbg(
+            dbg_dir,
+            "coordinator_start",
+            {
+                "iteration": attempt,
+                "runner": ctx.coord_runner,
+                "backend": ctx.coord_backend,
+                "session": ctx.coord_session,
+                "tokens_total": int(hist.get("tokens_used_estimate") or 0),
+            },
+        )
+        coord_t0 = time.monotonic()
+        coord_run = None
+        for coord_try in range(2):
+            try:
+                coord_run = _run_coordinator_with_schema_retry(
+                    session_name=ctx.coord_session,
+                    cwd=ctx.repo_path,
+                    request=request,
+                    runner=ctx.coord_runner,
+                    backend=ctx.coord_backend,
                 )
-        except Exception as exc:  # noqa: BLE001
-            detail = _format_preflight_error(exc)
-            return _fail_task(
+                break
+            except ProtocolError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                detail = _format_preflight_error(exc)
+                if coord_try >= 1:
+                    raise RuntimeError(
+                        f"Coordinator retry exhausted after {coord_try + 1} attempts: {detail}"
+                    ) from exc
+                _dbg(
+                    dbg_dir,
+                    "coordinator_retry",
+                    {
+                        "iteration": attempt,
+                        "retry": coord_try + 1,
+                        "delay_s": 1,
+                        "detail": detail,
+                    },
+                )
+                time.sleep(1)
+        if coord_run is None:
+            raise RuntimeError("Coordinator retry loop exited without a result")
+        coord_dt = round(time.monotonic() - coord_t0, 2)
+        coord_resp = coord_run.response
+        ctx.coord_resp = coord_resp
+        _accumulate_acpx_usage(request, session_name=ctx.coord_session, result=coord_run.cmd, actor="coordinator")
+        _sync_budget_to_record(record, request)
+        _dbg(
+            dbg_dir,
+            "coordinator_done",
+            {
+                "iteration": attempt,
+                "duration_s": coord_dt,
+                "backend": ctx.coord_backend,
+                "decision": coord_resp.decision,
+                "selected_role": coord_resp.selected_specialist.role,
+                "selected_runner": coord_resp.selected_specialist.runner,
+                "work_item_id": (coord_resp.work_item.id if coord_resp.work_item else None),
+                "work_item_kind": (coord_resp.work_item.kind if coord_resp.work_item else None),
+                "model_id": getattr(getattr(coord_run.cmd, "usage", None), "model_id", None),
+                "tokens_total": record.get("tokens_used_estimate"),
+            },
+        )
+
+        # Trip immediately if the coordinator itself blew the token budget.
+        hist = request.setdefault("history", {})
+        tokens_used = int(hist.get("tokens_used_estimate") or 0)
+        if ctx.max_tokens and tokens_used > ctx.max_tokens:
+            ctx.result = _fail_task(
                 record,
                 home=base_home,
                 task_dir=task_dir,
-                detail=f"Coordinator failed on iteration {attempt}: {detail}",
+                detail=f"Token breaker tripped after coordinator: tokens_used_estimate={tokens_used} > max_tokens={ctx.max_tokens}",
             )
+            return OrchestratorState.DONE
+    except Exception as exc:  # noqa: BLE001
+        detail = _format_preflight_error(exc)
+        ctx.result = _fail_task(
+            record,
+            home=base_home,
+            task_dir=task_dir,
+            detail=f"Coordinator failed on iteration {attempt}: {detail}",
+        )
+        return OrchestratorState.DONE
 
-        _append_text(coord_output_path, f"---- iteration {attempt} decision={coord_resp.decision} ----\n{coord_resp.reason}")
+    _append_text(ctx.coord_output_path, f"---- iteration {attempt} decision={coord_resp.decision} ----\n{coord_resp.reason}")
 
-        request.setdefault("state", {})
-        request["state"]["latest_coordinator_decision"] = {
+    request.setdefault("state", {})
+    request["state"]["latest_coordinator_decision"] = {
+        "decision": coord_resp.decision,
+        "reason": coord_resp.reason,
+        "selected_specialist": _json_compatible(coord_resp.selected_specialist),
+        "work_item": (_json_compatible(coord_resp.work_item) if coord_resp.work_item is not None else None),
+    }
+    _ctx_audit(
+        ctx,
+        attempt,
+        AUDIT_DECISION_MADE,
+        decision=coord_resp.decision,
+        reason=_objective_snippet(coord_resp.reason, max_len=240),
+        work_item_id=(coord_resp.work_item.id if coord_resp.work_item else None),
+    )
+    _ctx_replay_event(
+        ctx,
+        attempt,
+        "coordinator_decision",
+        {
             "decision": coord_resp.decision,
             "reason": coord_resp.reason,
             "selected_specialist": _json_compatible(coord_resp.selected_specialist),
             "work_item": (_json_compatible(coord_resp.work_item) if coord_resp.work_item is not None else None),
-        }
-        _audit(
-            attempt,
-            AUDIT_DECISION_MADE,
-            decision=coord_resp.decision,
-            reason=_objective_snippet(coord_resp.reason, max_len=240),
-            work_item_id=(coord_resp.work_item.id if coord_resp.work_item else None),
-        )
-        append_run_replay_event(
-            repo_path,
-            task_id,
-            iteration=attempt,
-            event="coordinator_decision",
-            data={
-                "decision": coord_resp.decision,
-                "reason": coord_resp.reason,
-                "selected_specialist": _json_compatible(coord_resp.selected_specialist),
-                "work_item": (_json_compatible(coord_resp.work_item) if coord_resp.work_item is not None else None),
-            },
-        )
-        sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
+        },
+    )
+    _ctx_sync_replay(ctx)
 
-        if coord_resp.decision != "execute_work_item":
-            # In Mode A, finalize/stop must be explicit and we should surface it.
-            record["status"] = _mode_a_status_for_terminal_decision(coord_resp.decision)
-            if record["status"] == "failed":
-                record["failure_reason"] = coord_resp.reason
-            else:
-                record.pop("failure_reason", None)
+    # Route on decision type.
+    if coord_resp.decision == "execute_work_item":
+        return OrchestratorState.DISPATCHING_WORKER
+    if coord_resp.decision in {"finalize_success", "stop_failure"}:
+        return OrchestratorState.TERMINAL
+    if coord_resp.decision == "request_review":
+        return OrchestratorState.DISPATCHING_REVIEW
+    if coord_resp.decision == "dismiss_finding":
+        return OrchestratorState.PROCESSING_DISMISSAL
 
-            hist = request.setdefault("history", {})
-            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
+    # Unknown decision -- treat as terminal via _mode_a_status_for_terminal_decision
+    # which will raise ValueError for truly unknown decisions.
+    return OrchestratorState.TERMINAL
 
-            request.setdefault("state", {})
-            request["state"]["run_terminal"] = {
-                "decision": coord_resp.decision,
-                "reason": coord_resp.reason,
-            }
-            append_run_replay_event(
-                repo_path,
-                task_id,
-                iteration=attempt,
-                event="run_terminal",
-                data={"decision": coord_resp.decision, "reason": coord_resp.reason},
-            )
-            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
 
-            record["updated_at"] = now_iso()
-            upsert_task(record, home=base_home)
-            _audit(attempt, AUDIT_ITERATION_END, outcome="terminal_decision", status=record["status"])
-            _audit(attempt, AUDIT_RUN_END, status=record["status"], summary=_objective_snippet(coord_resp.reason, max_len=240))
-            return {
-                "task_id": task_id,
-                "status": record["status"],
-                "pr_url": record["pr_url"],
-                "summary": coord_resp.reason,
-            }
+def _state_terminal(ctx: RunContext) -> OrchestratorState:
+    """Handle finalize_success / stop_failure decisions.
 
-        if coord_resp.work_item is None:
-            raise RuntimeError("CoordinatorResponse missing work_item")
+    Sets ctx.result and transitions to DONE.
+    """
+    attempt = ctx.iteration
+    record = ctx.record
+    request = ctx.request
+    coord_resp = ctx.coord_resp
+    base_home = ctx.home
 
-        worker_runner = coord_resp.selected_specialist.runner
-        if worker_runner not in {"codex", "claude"}:
-            # Protocol should prevent this.
-            raise RuntimeError(f"Unsupported worker runner: {worker_runner}")
-        try:
-            worker_backend_key = normalize_worker_backend(backend=worker_backend, runner=worker_runner)
-        except Exception as exc:  # noqa: BLE001
-            detail = _format_preflight_error(exc)
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Invalid worker backend selection on iteration {attempt}: {detail}",
-            )
+    record["status"] = _mode_a_status_for_terminal_decision(coord_resp.decision)
+    if record["status"] == "failed":
+        record["failure_reason"] = coord_resp.reason
+    else:
+        record.pop("failure_reason", None)
 
-        # ACP workers should be stateless across iterations, so session names are iteration-scoped.
-        worker_session = worker_session_name(owner, repo, task_id, worker_runner, iteration=attempt)
+    hist = request.setdefault("history", {})
+    hist["last_iteration_seconds"] = round(time.monotonic() - ctx.iter_start, 2)
 
-        exchange_paths = work_item_exchange_paths(repo_path, task_id, coord_resp.work_item.id)
-        for key in ("result", "handoff", "block", "error"):
-            if exchange_paths[key].exists():
-                exchange_paths[key].unlink()
-        write_json(exchange_paths["work_item"], _json_compatible(coord_resp.work_item))
-        write_json(
-            exchange_paths["status"],
-            {
-                "run_id": task_id,
-                "work_item_id": coord_resp.work_item.id,
-                "iteration": attempt,
-                "runner": worker_runner,
-                "backend": worker_backend_key,
-                "status": "running",
-                "updated_at": now_iso(),
-            },
-        )
-        append_exchange_event(
-            exchange_paths["events"],
-            "work_item_dispatched",
-            {
-                "run_id": task_id,
-                "work_item_id": coord_resp.work_item.id,
-                "iteration": attempt,
-                "runner": worker_runner,
-                "backend": worker_backend_key,
-            },
-        )
-        _audit(
-            attempt,
-            AUDIT_WORK_ITEM_DISPATCHED,
-            work_item_id=coord_resp.work_item.id,
-            role=coord_resp.selected_specialist.role,
-            runner=worker_runner,
-        )
+    request.setdefault("state", {})
+    request["state"]["run_terminal"] = {
+        "decision": coord_resp.decision,
+        "reason": coord_resp.reason,
+    }
+    _ctx_replay_event(
+        ctx,
+        attempt,
+        "run_terminal",
+        {"decision": coord_resp.decision, "reason": coord_resp.reason},
+    )
+    _ctx_sync_replay(ctx)
 
-        prompt = build_worker_prompt_v1(
-            repo_ref=repo_ref,
-            verb=verb,
-            objective=str(request["objective"]),
-            run_id=task_id,
-            iteration=attempt,
-            work_branch=work_branch,
-            work_item_path=str(exchange_paths["work_item"]),
-            result_path=str(exchange_paths["result"]),
-            work_item=coord_resp.work_item,
-        )
+    record["updated_at"] = now_iso()
+    upsert_task(record, home=base_home)
+    _ctx_audit(ctx, attempt, AUDIT_ITERATION_END, outcome="terminal_decision", status=record["status"])
+    _ctx_audit(ctx, attempt, AUDIT_RUN_END, status=record["status"], summary=_objective_snippet(coord_resp.reason, max_len=240))
+    ctx.result = {
+        "task_id": ctx.task_id,
+        "status": record["status"],
+        "pr_url": record["pr_url"],
+        "summary": coord_resp.reason,
+    }
+    return OrchestratorState.DONE
 
-        _dbg(
-            dbg_dir,
-            "worker_start",
-            {
-                "iteration": attempt,
-                "runner": worker_runner,
-                "backend": worker_backend_key,
-                "session": worker_session,
-                "work_item_id": coord_resp.work_item.id,
-                "work_item_kind": coord_resp.work_item.kind,
-                "tokens_total": record.get("tokens_used_estimate"),
-            },
-        )
-        worker_t0 = time.monotonic()
 
-        try:
-            agent_result = run_worker(
-                session_name=worker_session,
-                cwd=repo_path,
-                prompt=prompt,
-                runner=worker_runner,
-                backend=worker_backend_key,
-            )
-        except Exception as exc:  # noqa: BLE001
-            detail = _format_preflight_error(exc)
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Worker backend '{worker_backend_key}' failed on iteration {attempt}: {detail}",
-            )
+def _state_dispatching_worker(ctx: RunContext) -> OrchestratorState:
+    """Execute the worker, load work result, publish branch, create PR.
 
-        worker_dt = round(time.monotonic() - worker_t0, 2)
-        _dbg(
-            dbg_dir,
-            "worker_done",
-            {
-                "iteration": attempt,
-                "backend": worker_backend_key,
-                "duration_s": worker_dt,
-                "rc": agent_result.returncode,
-                "model_id": getattr(getattr(agent_result, "usage", None), "model_id", None),
-                "stdout_chars": len(agent_result.stdout or ""),
-                "stderr_chars": len(agent_result.stderr or ""),
-            },
-        )
+    Transitions:
+    - POLLING_CI on completed+published work
+    - AWAITING_DECISION on handoff or non-completed worker result (next iteration)
+    - DONE on fatal errors (sets ctx.result)
+    """
+    attempt = ctx.iteration
+    record = ctx.record
+    request = ctx.request
+    base_home = ctx.home
+    task_dir = ctx.task_dir
+    dbg_dir = ctx.dbg_dir
+    coord_resp = ctx.coord_resp
+    task_id = ctx.task_id
+    repo_path = ctx.repo_path
+    work_branch = ctx.work_branch
 
-        _accumulate_acpx_usage(
-            request,
-            session_name=worker_session,
-            result=agent_result,
-            actor="worker",
-            branch=work_branch,
-        )
-        _sync_budget_to_record(record, request)
-        hist = request.setdefault("history", {})
-        tokens_used = int(hist.get("tokens_used_estimate") or 0)
-        if max_tokens and tokens_used > max_tokens:
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Token breaker tripped after worker: tokens_used_estimate={tokens_used} > max_tokens={max_tokens}",
-            )
+    if coord_resp.work_item is None:
+        raise RuntimeError("CoordinatorResponse missing work_item")
 
-        if agent_result.returncode != 0:
-            _write_worker_raw_output(
-                exchange_paths["raw_output"],
-                iteration=attempt,
-                runner=worker_runner,
-                rc=agent_result.returncode,
-                stdout=agent_result.stdout,
-                stderr=agent_result.stderr,
-            )
-            _write_text(exchange_paths["error"], (agent_result.stderr or agent_result.stdout).strip())
-            write_json(
-                exchange_paths["status"],
-                {
-                    "run_id": task_id,
-                    "work_item_id": coord_resp.work_item.id,
-                    "iteration": attempt,
-                    "runner": worker_runner,
-                    "status": "failed",
-                    "updated_at": now_iso(),
-                },
-            )
-            append_exchange_event(
-                exchange_paths["events"],
-                "worker_nonzero_exit",
-                {"iteration": attempt, "runner": worker_runner, "rc": agent_result.returncode},
-            )
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=(
-                    f"worker backend {worker_backend_key} returned non-zero on iteration {attempt}: "
-                    f"{(agent_result.stderr or agent_result.stdout).strip()}"
-                ),
-            )
-
-        _cleanup_repo_detritus(repo_path)
-
-        try:
-            outcome_kind, work_result = _load_worker_outcome(
-                exchange_paths,
-                expected_work_item_id=coord_resp.work_item.id,
-                expected_branch=work_branch,
-            )
-        except ProtocolError as exc:
-            _write_worker_raw_output(
-                exchange_paths["raw_output"],
-                iteration=attempt,
-                runner=worker_runner,
-                rc=agent_result.returncode,
-                stdout=agent_result.stdout,
-                stderr=agent_result.stderr,
-            )
-            _write_text(exchange_paths["error"], str(exc))
-            write_json(
-                exchange_paths["status"],
-                {
-                    "run_id": task_id,
-                    "work_item_id": coord_resp.work_item.id,
-                    "iteration": attempt,
-                    "runner": worker_runner,
-                    "status": "failed",
-                    "updated_at": now_iso(),
-                },
-            )
-            append_exchange_event(
-                exchange_paths["events"],
-                "worker_protocol_failure",
-                {"iteration": attempt, "runner": worker_runner, "detail": str(exc)},
-            )
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Worker protocol failure on iteration {attempt}: {exc}",
-            )
-
-        if debug:
-            _write_worker_raw_output(
-                exchange_paths["raw_output"],
-                iteration=attempt,
-                runner=worker_runner,
-                rc=agent_result.returncode,
-                stdout=agent_result.stdout,
-                stderr=agent_result.stderr,
-            )
-        write_json(
-            exchange_paths["status"],
-            {
-                "run_id": task_id,
-                "work_item_id": coord_resp.work_item.id,
-                "iteration": attempt,
-                "runner": worker_runner,
-                "status": ("handoff" if outcome_kind == "handoff" else work_result.status),
-                "updated_at": now_iso(),
-            },
-        )
-        append_exchange_event(
-            exchange_paths["events"],
-            "worker_outcome_loaded",
-            {
-                "iteration": attempt,
-                "runner": worker_runner,
-                "work_item_id": coord_resp.work_item.id,
-                "outcome_kind": outcome_kind,
-                "result_status": work_result.status,
-            },
-        )
-        _audit(
-            attempt,
-            AUDIT_WORK_ITEM_COMPLETED,
-            work_item_id=coord_resp.work_item.id,
-            status=work_result.status,
-            outcome_kind=outcome_kind,
-        )
-
-        record["branch"] = work_result.branch
-        record["head_sha"] = work_result.head_sha
-        record["summary"] = work_result.summary
-        record["worker_status"] = work_result.status
-        record["tests_run"] = [
-            {"command": t.command, "status": t.status, "details": t.details} for t in work_result.tests_run
-        ]
-        record["files_touched"] = list(work_result.files_touched)
-        record["evidence"] = list(work_result.evidence)
-        record["blockers"] = list(work_result.blockers)
-        record["follow_up"] = list(work_result.follow_up)
-        record["updated_at"] = now_iso()
-        upsert_task(record, home=base_home)
-        _dbg(
-            dbg_dir,
-            "worker_work_result",
-            {
-                "iteration": attempt,
-                "branch": record.get("branch"),
-                "head_sha": record.get("head_sha"),
-                "summary": record.get("summary"),
-                "work_result_status": work_result.status,
-                "tests_run_count": len(work_result.tests_run),
-                "tokens_total": record.get("tokens_used_estimate"),
-            },
-        )
-
-        # Update coordinator state snapshot.
-        request.setdefault("state", {})
-        request["state"]["last_commit"] = work_result.head_sha
-        request["state"]["diff_summary"] = work_result.summary
-        request["state"]["latest_worker_result"] = _work_result_artifact(work_result)
-        append_run_replay_event(
-            repo_path,
-            task_id,
-            iteration=attempt,
-            event=("worker_handoff" if outcome_kind == "handoff" else f"worker_{work_result.status}"),
-            data={
-                "work_item_id": work_result.work_item_id,
-                "status": work_result.status,
-                "summary": work_result.summary,
-                "head_sha": work_result.head_sha,
-                "branch": work_result.branch,
-            },
-        )
-        sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
-        hist = request.setdefault("history", {})
-
-        if outcome_kind == "handoff":
-            request["state"]["latest_handoff"] = _work_result_artifact(work_result)
-            notes = request["state"].setdefault("notes", [])
-            if isinstance(notes, list):
-                notes.append(f"handoff[{coord_resp.work_item.id}]={work_result.summary}")
-                del notes[:-12]
-            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
-            hist["no_progress_streak"] = 0
-            last_failure_sig = None
-            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
-            _append_iteration_history_entry(
-                request,
-                iteration=attempt,
-                work_item=coord_resp.work_item,
-                selected_specialist=coord_resp.selected_specialist,
-                worker_result=work_result,
-                outcome="worker_handoff",
-            )
-            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
-            _audit(attempt, AUDIT_ITERATION_END, outcome="worker_handoff", status="handoff")
-            continue
-
-        if work_result.status != "completed":
-            failure_sig = f"worker:{work_result.status}:{'|'.join(work_result.blockers)}"
-            no_prog = int(hist.get("no_progress_streak") or 0)
-            no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
-            last_failure_sig = failure_sig
-            hist["no_progress_streak"] = no_prog
-            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
-
-            sigs = hist.setdefault("failure_signatures", [])
-            sigs.append(failure_sig)
-            del sigs[:-6]
-
-            if _is_oscillating_failure_signatures(sigs):
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
-                )
-
-            if no_prog >= no_progress_max:
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=(
-                        f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
-                        f"(failure_sig={failure_sig})"
-                    ),
-                )
-
-            _set_evaluation_state(
-                request,
-                status="fail",
-                outcome=f"worker_{work_result.status}",
-                worker_result=work_result,
-                failing_checks=[
-                    {
-                        "name": "worker",
-                        "kind": "worker",
-                        "url": record.get("pr_url"),
-                        "summary": "; ".join(work_result.blockers),
-                    }
-                ],
-                logs_excerpt="; ".join(work_result.blockers),
-            )
-            _append_iteration_history_entry(
-                request,
-                iteration=attempt,
-                work_item=coord_resp.work_item,
-                selected_specialist=coord_resp.selected_specialist,
-                worker_result=work_result,
-                outcome=f"worker_{work_result.status}",
-            )
-            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
-            _audit(attempt, AUDIT_ITERATION_END, outcome=f"worker_{work_result.status}", status=work_result.status)
-            continue
-
-        try:
-            _publish_branch(repo_path=repo_path, branch=work_result.branch, expected_head_sha=work_result.head_sha)
-        except Exception as exc:  # noqa: BLE001
-            detail = _format_preflight_error(exc)
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"Failed to publish branch on iteration {attempt}: {detail}",
-            )
-
-        if attempt == 1:
-            try:
-                pr = gh.create_pull_request(
-                    owner=owner,
-                    repo=repo,
-                    title=_task_title(verb, task_text, spec.title),
-                    body=_build_pr_body(
-                        repo_path=repo_path,
-                        task_id=task_id,
-                        summary=work_result.summary,
-                        extra_body=spec.body,
-                    ),
-                    head=work_result.branch,
-                    base=base_branch,
-                )
-            except Exception as exc:  # noqa: BLE001
-                detail = _format_preflight_error(exc)
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=f"Failed to create PR on iteration {attempt}: {detail}",
-                )
-
-            record["pr_url"] = pr["html_url"]
-            record["pr_number"] = pr["number"]
-            _persist_record_checkpoint(record, home=base_home, checkpoint=CHECKPOINT_AFTER_PR_CREATED)
-            _dbg(
-                dbg_dir,
-                "pr_created",
-                {
-                    "iteration": attempt,
-                    "pr_url": record.get("pr_url"),
-                    "pr_number": record.get("pr_number"),
-                    "base_branch": base_branch,
-                },
-            )
-
-        ci_log = task_dir / f"ci-iter-{attempt}.log"
-        _dbg(
-            dbg_dir,
-            "ci_start",
-            {
-                "iteration": attempt,
-                "head_sha": work_result.head_sha,
-                "pr_url": record.get("pr_url"),
-            },
-        )
-        ci_t0 = time.monotonic()
-        _append_text(ci_log, f"[{now_iso()}] polling CI for {work_result.head_sha}")
-        try:
-            ci_state, ci_detail = _poll_ci(gh, owner, repo, work_result.head_sha, ci_log)
-        except Exception as exc:  # noqa: BLE001
-            detail = _format_preflight_error(exc)
-            return _fail_task(
-                record,
-                home=base_home,
-                task_dir=task_dir,
-                detail=f"CI polling failed on iteration {attempt}: {detail}",
-            )
-        ci_dt = round(time.monotonic() - ci_t0, 2)
-        _append_text(ci_log, f"[{now_iso()}] final {ci_state}: {ci_detail}")
-        _dbg(
-            dbg_dir,
-            "ci_done",
-            {
-                "iteration": attempt,
-                "duration_s": ci_dt,
-                "ci_state": ci_state,
-                "ci_detail": ci_detail,
-            },
-        )
-
-        # Record history entry skeleton.
-        if ci_state != "success":
-            ci_checks: dict[str, Any] = {}
-            ci_class = _classify_ci_failure(ci_state, ci_detail, None)
-            infra_retries = 0
-            while True:
-                if str(record.get("head_sha") or "").strip():
-                    try:
-                        payload = gh.get_check_runs(owner, repo, str(record.get("head_sha")))
-                        if isinstance(payload, dict):
-                            ci_checks = payload
-                    except Exception as exc:  # noqa: BLE001
-                        _dbg(dbg_dir, "ci_check_runs_error", {"iteration": attempt, "detail": str(exc)})
-                ci_class = _classify_ci_failure(ci_state, ci_detail, ci_checks)
-                _dbg(
-                    dbg_dir,
-                    "ci_classification",
-                    {"iteration": attempt, "ci_detail": ci_detail, **ci_class},
-                )
-                if ci_state == "success" or ci_class["classification"] != "infra_outage" or infra_retries >= 2:
-                    break
-                infra_retries += 1
-                backoff = 30 * infra_retries
-                _append_text(ci_log, f"[{now_iso()}] infra-outage suspected; backoff {backoff}s before retry {infra_retries}/2")
-                time.sleep(backoff)
-                ci_state, ci_detail = _poll_ci(
-                    gh,
-                    owner,
-                    repo,
-                    str(record["head_sha"]),
-                    ci_log,
-                    poll_seconds=45,
-                    stuck_warn_seconds=20 * 60,
-                    stuck_fail_seconds=45 * 60,
-                )
-                _append_text(ci_log, f"[{now_iso()}] infra-retry result {ci_state}: {ci_detail}")
-
-            if ci_state != "success" and ci_class["classification"] == "infra_outage":
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=(
-                        "CI outage suspected after retries; no code/workflow FIRE attempted "
-                        f"(reasons={','.join(ci_class['reason_codes']) or 'none'})"
-                    ),
-                )
-
-            failure_sig = f"ci:{ci_detail}"
-            no_prog = int(hist.get("no_progress_streak") or 0)
-            no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
-            last_failure_sig = failure_sig
-            hist["no_progress_streak"] = no_prog
-            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
-
-            sigs = hist.setdefault("failure_signatures", [])
-            sigs.append(failure_sig)
-            del sigs[:-6]
-
-            if _is_oscillating_failure_signatures(sigs):
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
-                )
-
-            if no_prog >= no_progress_max:
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=(
-                        f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
-                        f"(failure_sig={failure_sig})"
-                    ),
-                )
-
-            ci_artifact = {
-                "state": ci_state,
-                "detail": ci_detail,
-                "classification": ci_class,
-            }
-            request.setdefault("state", {})
-            request["state"]["latest_ci"] = ci_artifact
-            _audit(attempt, AUDIT_CI_RESULT, status="fail", ci_state=ci_state)
-            append_run_replay_event(
-                repo_path,
-                task_id,
-                iteration=attempt,
-                event="ci_result",
-                data={"state": ci_state, "detail": ci_detail, "classification": ci_class},
-            )
-            _set_evaluation_state(
-                request,
-                status="fail",
-                outcome="ci_failure",
-                worker_result=work_result,
-                ci_state=ci_state,
-                ci_detail=ci_detail,
-                failing_checks=[{"name": "ci", "kind": "ci", "url": record.get("pr_url"), "summary": ci_detail}],
-                logs_excerpt=ci_detail,
-            )
-            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
-            _append_iteration_history_entry(
-                request,
-                iteration=attempt,
-                work_item=coord_resp.work_item,
-                selected_specialist=coord_resp.selected_specialist,
-                worker_result=work_result,
-                outcome="ci_failure",
-                ci=ci_artifact,
-            )
-            _audit(attempt, AUDIT_ITERATION_END, outcome="ci_failure", status="failed")
-            continue
-
-        # CI success → review gate.
-        request.setdefault("state", {})
-        request["state"]["latest_ci"] = {"state": ci_state, "detail": ci_detail, "classification": None}
-        _audit(attempt, AUDIT_CI_RESULT, status="pass", ci_state=ci_state)
-        append_run_replay_event(
-            repo_path,
-            task_id,
-            iteration=attempt,
-            event="ci_result",
-            data={"state": ci_state, "detail": ci_detail, "classification": None},
-        )
-        sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
-        _persist_record_checkpoint(
+    worker_runner = coord_resp.selected_specialist.runner
+    if worker_runner not in {"codex", "claude"}:
+        raise RuntimeError(f"Unsupported worker runner: {worker_runner}")
+    try:
+        worker_backend_key = normalize_worker_backend(backend=ctx.worker_backend, runner=worker_runner)
+    except Exception as exc:  # noqa: BLE001
+        detail = _format_preflight_error(exc)
+        ctx.result = _fail_task(
             record,
             home=base_home,
-            checkpoint=CHECKPOINT_AFTER_CI_SUCCESS_BEFORE_REVIEW,
-            updates={"ci_state": ci_state, "ci_detail": ci_detail},
+            task_dir=task_dir,
+            detail=f"Invalid worker backend selection on iteration {attempt}: {detail}",
         )
+        return OrchestratorState.DONE
 
-        diff_text = _read_diff_for_review(repo_path, base_branch, str(record["head_sha"]))
-        _dbg(
-            dbg_dir,
-            "review_start",
-            {
-                "iteration": attempt,
-                "head_sha": record.get("head_sha"),
-                "diff_chars": len(diff_text or ""),
-            },
+    # ACP workers should be stateless across iterations, so session names are iteration-scoped.
+    worker_session = worker_session_name(ctx.owner, ctx.repo, task_id, worker_runner, iteration=attempt)
+
+    exchange_paths = work_item_exchange_paths(repo_path, task_id, coord_resp.work_item.id)
+    for key in ("result", "handoff", "block", "error"):
+        if exchange_paths[key].exists():
+            exchange_paths[key].unlink()
+    write_json(exchange_paths["work_item"], _json_compatible(coord_resp.work_item))
+    write_json(
+        exchange_paths["status"],
+        {
+            "run_id": task_id,
+            "work_item_id": coord_resp.work_item.id,
+            "iteration": attempt,
+            "runner": worker_runner,
+            "backend": worker_backend_key,
+            "status": "running",
+            "updated_at": now_iso(),
+        },
+    )
+    append_exchange_event(
+        exchange_paths["events"],
+        "work_item_dispatched",
+        {
+            "run_id": task_id,
+            "work_item_id": coord_resp.work_item.id,
+            "iteration": attempt,
+            "runner": worker_runner,
+            "backend": worker_backend_key,
+        },
+    )
+    _ctx_audit(
+        ctx,
+        attempt,
+        AUDIT_WORK_ITEM_DISPATCHED,
+        work_item_id=coord_resp.work_item.id,
+        role=coord_resp.selected_specialist.role,
+        runner=worker_runner,
+    )
+
+    prompt = build_worker_prompt_v1(
+        repo_ref=ctx.repo_ref,
+        verb=ctx.verb,
+        objective=str(request["objective"]),
+        run_id=task_id,
+        iteration=attempt,
+        work_branch=work_branch,
+        work_item_path=str(exchange_paths["work_item"]),
+        result_path=str(exchange_paths["result"]),
+        work_item=coord_resp.work_item,
+    )
+
+    _dbg(
+        dbg_dir,
+        "worker_start",
+        {
+            "iteration": attempt,
+            "runner": worker_runner,
+            "backend": worker_backend_key,
+            "session": worker_session,
+            "work_item_id": coord_resp.work_item.id,
+            "work_item_kind": coord_resp.work_item.kind,
+            "tokens_total": record.get("tokens_used_estimate"),
+        },
+    )
+    worker_t0 = time.monotonic()
+
+    try:
+        agent_result = run_worker(
+            session_name=worker_session,
+            cwd=repo_path,
+            prompt=prompt,
+            runner=worker_runner,
+            backend=worker_backend_key,
         )
-        review_t0 = time.monotonic()
-        review_result, review_text = _run_review_with_retry(diff_text, debug_task_dir=dbg_dir)
-        review_dt = round(time.monotonic() - review_t0, 2)
-        _audit(attempt, AUDIT_REVIEW_RESULT, status=review_result)
-
-        _dbg(
-            dbg_dir,
-            "review_done",
-            {
-                "iteration": attempt,
-                "duration_s": review_dt,
-                "review_result": review_result,
-                "has_blocker": review_result == "blocker",
-                "review_first_line": (review_text.splitlines()[0][:200] if review_text else ""),
-            },
+    except Exception as exc:  # noqa: BLE001
+        detail = _format_preflight_error(exc)
+        ctx.result = _fail_task(
+            record,
+            home=base_home,
+            task_dir=task_dir,
+            detail=f"Worker backend '{worker_backend_key}' failed on iteration {attempt}: {detail}",
         )
+        return OrchestratorState.DONE
 
-        review_attempt_path = task_dir / f"review-iter-{attempt}.txt"
-        _write_text(review_attempt_path, review_text)
+    worker_dt = round(time.monotonic() - worker_t0, 2)
+    _dbg(
+        dbg_dir,
+        "worker_done",
+        {
+            "iteration": attempt,
+            "backend": worker_backend_key,
+            "duration_s": worker_dt,
+            "rc": agent_result.returncode,
+            "model_id": getattr(getattr(agent_result, "usage", None), "model_id", None),
+            "stdout_chars": len(agent_result.stdout or ""),
+            "stderr_chars": len(agent_result.stderr or ""),
+        },
+    )
 
-        if record["pr_number"] is None:
-            raise RuntimeError("PR number missing; cannot post review comment")
-        gh.post_issue_comment(owner, repo, int(record["pr_number"]), review_text)
+    _accumulate_acpx_usage(
+        request,
+        session_name=worker_session,
+        result=agent_result,
+        actor="worker",
+        branch=work_branch,
+    )
+    _sync_budget_to_record(record, request)
+    hist = request.setdefault("history", {})
+    tokens_used = int(hist.get("tokens_used_estimate") or 0)
+    if ctx.max_tokens and tokens_used > ctx.max_tokens:
+        ctx.result = _fail_task(
+            record,
+            home=base_home,
+            task_dir=task_dir,
+            detail=f"Token breaker tripped after worker: tokens_used_estimate={tokens_used} > max_tokens={ctx.max_tokens}",
+        )
+        return OrchestratorState.DONE
 
-        if review_result in {"tool-error", "malformed", "blocker"}:
-            if review_result == "tool-error":
-                detail = "review-tool-error"
-            elif review_result == "malformed":
-                detail = "review-malformed"
-            else:
-                detail = "review-blocker"
-            failure_sig = f"review:{detail}"
-            no_prog = int(hist.get("no_progress_streak") or 0)
-            no_prog = no_prog + 1 if last_failure_sig == failure_sig else 1
-            last_failure_sig = failure_sig
-            hist["no_progress_streak"] = no_prog
-            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
-
-            sigs = hist.setdefault("failure_signatures", [])
-            sigs.append(failure_sig)
-            del sigs[:-6]
-
-            if _is_oscillating_failure_signatures(sigs):
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
-                )
-
-            if no_prog >= no_progress_max:
-                return _fail_task(
-                    record,
-                    home=base_home,
-                    task_dir=task_dir,
-                    detail=(
-                        f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={no_progress_max} "
-                        f"(failure_sig={failure_sig})"
-                    ),
-                )
-
-            review_artifact = {"result": review_result, "summary": review_text[:2000]}
-            request.setdefault("state", {})
-            request["state"]["latest_review"] = review_artifact
-            append_run_replay_event(
-                repo_path,
-                task_id,
-                iteration=attempt,
-                event="review_result",
-                data=review_artifact,
-            )
-            _set_evaluation_state(
-                request,
-                status="fail",
-                outcome=detail,
-                worker_result=work_result,
-                ci_state=ci_state,
-                ci_detail=ci_detail,
-                review_result=review_result,
-                failing_checks=[{"name": "review", "kind": "review", "url": record.get("pr_url"), "summary": review_text[:2000]}],
-                logs_excerpt=review_text[:2000],
-            )
-            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
-            _append_iteration_history_entry(
-                request,
-                iteration=attempt,
-                work_item=coord_resp.work_item,
-                selected_specialist=coord_resp.selected_specialist,
-                worker_result=work_result,
-                outcome=detail,
-                ci={"state": ci_state, "detail": ci_detail, "classification": None},
-                review=review_artifact,
-            )
-            _audit(attempt, AUDIT_ITERATION_END, outcome=detail, status="failed")
-            continue
-
-        # Success.
-        request.setdefault("state", {})
-        request["state"]["latest_review"] = {"result": review_result, "summary": review_text[:2000]}
-        append_run_replay_event(
-            repo_path,
-            task_id,
+    if agent_result.returncode != 0:
+        _write_worker_raw_output(
+            exchange_paths["raw_output"],
             iteration=attempt,
-            event="review_result",
-            data={"result": review_result, "summary": review_text[:2000]},
+            runner=worker_runner,
+            rc=agent_result.returncode,
+            stdout=agent_result.stdout,
+            stderr=agent_result.stderr,
         )
-        if review_enabled:
-            _audit(attempt, AUDIT_REVIEW_STARTED)
-            review_stage_result = run_review_stage(
-                {
-                    "review_result": review_result,
-                    "review_text": review_text,
-                    "issues_found": _extract_review_issues(review_text, review_result),
-                }
-            )
-            review_stage_payload = _json_compatible(review_stage_result)
-            request["state"]["latest_post_success_review"] = review_stage_payload
-            _audit(
-                attempt,
-                AUDIT_REVIEW_COMPLETED,
-                outcome=review_stage_result.outcome,
-                summary=review_stage_result.summary,
-                issues_found=list(review_stage_result.issues_found),
-            )
-            append_run_replay_event(
-                repo_path,
-                task_id,
-                iteration=attempt,
-                event="review_stage_result",
-                data=review_stage_payload,
-            )
-            if review_stage_result.outcome == "repair":
-                _set_evaluation_state(
-                    request,
-                    status="fail",
-                    outcome="post_success_review_repair",
-                    worker_result=work_result,
-                    ci_state=ci_state,
-                    ci_detail=ci_detail,
-                    review_result=review_stage_payload,
-                    failing_checks=[
-                        {
-                            "name": "post_success_review",
-                            "kind": "review",
-                            "url": record.get("pr_url"),
-                            "summary": review_stage_result.summary,
-                        }
-                    ],
-                    logs_excerpt=review_stage_result.summary,
-                )
-            else:
-                _set_evaluation_state(
-                    request,
-                    status="success",
-                    outcome="post_success_review_approve",
-                    worker_result=work_result,
-                    ci_state=ci_state,
-                    ci_detail=ci_detail,
-                    review_result=review_stage_payload,
-                    failing_checks=[],
-                    logs_excerpt="",
-                )
-            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
-            hist["no_progress_streak"] = 0
-            hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
-            hist.pop("failure_signatures", None)
-            last_failure_sig = None
-            _append_iteration_history_entry(
-                request,
-                iteration=attempt,
-                work_item=coord_resp.work_item,
-                selected_specialist=coord_resp.selected_specialist,
-                worker_result=work_result,
-                outcome=f"post_success_review_{review_stage_result.outcome}",
-                ci={"state": ci_state, "detail": ci_detail, "classification": None},
-                review={
-                    "result": review_result,
-                    "summary": review_text[:2000],
-                    "post_success": review_stage_payload,
-                },
-            )
-            sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
-            _audit(
-                attempt,
-                AUDIT_ITERATION_END,
-                outcome=f"post_success_review_{review_stage_result.outcome}",
-                status="reviewed",
-            )
-            continue
+        _write_text(exchange_paths["error"], (agent_result.stderr or agent_result.stdout).strip())
+        write_json(
+            exchange_paths["status"],
+            {
+                "run_id": task_id,
+                "work_item_id": coord_resp.work_item.id,
+                "iteration": attempt,
+                "runner": worker_runner,
+                "status": "failed",
+                "updated_at": now_iso(),
+            },
+        )
+        append_exchange_event(
+            exchange_paths["events"],
+            "worker_nonzero_exit",
+            {"iteration": attempt, "runner": worker_runner, "rc": agent_result.returncode},
+        )
+        ctx.result = _fail_task(
+            record,
+            home=base_home,
+            task_dir=task_dir,
+            detail=(
+                f"worker backend {worker_backend_key} returned non-zero on iteration {attempt}: "
+                f"{(agent_result.stderr or agent_result.stdout).strip()}"
+            ),
+        )
+        return OrchestratorState.DONE
 
-        _set_evaluation_state(
-            request,
-            status="success",
-            outcome="accepted",
-            worker_result=work_result,
-            ci_state=ci_state,
-            ci_detail=ci_detail,
-            review_result=review_result,
-            failing_checks=[],
-            logs_excerpt="",
+    _cleanup_repo_detritus(repo_path)
+
+    try:
+        outcome_kind, work_result = _load_worker_outcome(
+            exchange_paths,
+            expected_work_item_id=coord_resp.work_item.id,
+            expected_branch=work_branch,
         )
-        sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
+    except ProtocolError as exc:
+        _write_worker_raw_output(
+            exchange_paths["raw_output"],
+            iteration=attempt,
+            runner=worker_runner,
+            rc=agent_result.returncode,
+            stdout=agent_result.stdout,
+            stderr=agent_result.stderr,
+        )
+        _write_text(exchange_paths["error"], str(exc))
+        write_json(
+            exchange_paths["status"],
+            {
+                "run_id": task_id,
+                "work_item_id": coord_resp.work_item.id,
+                "iteration": attempt,
+                "runner": worker_runner,
+                "status": "failed",
+                "updated_at": now_iso(),
+            },
+        )
+        append_exchange_event(
+            exchange_paths["events"],
+            "worker_protocol_failure",
+            {"iteration": attempt, "runner": worker_runner, "detail": str(exc)},
+        )
+        ctx.result = _fail_task(
+            record,
+            home=base_home,
+            task_dir=task_dir,
+            detail=f"Worker protocol failure on iteration {attempt}: {exc}",
+        )
+        return OrchestratorState.DONE
+
+    if ctx.debug:
+        _write_worker_raw_output(
+            exchange_paths["raw_output"],
+            iteration=attempt,
+            runner=worker_runner,
+            rc=agent_result.returncode,
+            stdout=agent_result.stdout,
+            stderr=agent_result.stderr,
+        )
+    write_json(
+        exchange_paths["status"],
+        {
+            "run_id": task_id,
+            "work_item_id": coord_resp.work_item.id,
+            "iteration": attempt,
+            "runner": worker_runner,
+            "status": ("handoff" if outcome_kind == "handoff" else work_result.status),
+            "updated_at": now_iso(),
+        },
+    )
+    append_exchange_event(
+        exchange_paths["events"],
+        "worker_outcome_loaded",
+        {
+            "iteration": attempt,
+            "runner": worker_runner,
+            "work_item_id": coord_resp.work_item.id,
+            "outcome_kind": outcome_kind,
+            "result_status": work_result.status,
+        },
+    )
+    _ctx_audit(
+        ctx,
+        attempt,
+        AUDIT_WORK_ITEM_COMPLETED,
+        work_item_id=coord_resp.work_item.id,
+        status=work_result.status,
+        outcome_kind=outcome_kind,
+    )
+
+    record["branch"] = work_result.branch
+    record["head_sha"] = work_result.head_sha
+    record["summary"] = work_result.summary
+    record["worker_status"] = work_result.status
+    record["tests_run"] = [
+        {"command": t.command, "status": t.status, "details": t.details} for t in work_result.tests_run
+    ]
+    record["files_touched"] = list(work_result.files_touched)
+    record["evidence"] = list(work_result.evidence)
+    record["blockers"] = list(work_result.blockers)
+    record["follow_up"] = list(work_result.follow_up)
+    record["updated_at"] = now_iso()
+    upsert_task(record, home=base_home)
+    _dbg(
+        dbg_dir,
+        "worker_work_result",
+        {
+            "iteration": attempt,
+            "branch": record.get("branch"),
+            "head_sha": record.get("head_sha"),
+            "summary": record.get("summary"),
+            "work_result_status": work_result.status,
+            "tests_run_count": len(work_result.tests_run),
+            "tokens_total": record.get("tokens_used_estimate"),
+        },
+    )
+
+    # Update coordinator state snapshot.
+    request.setdefault("state", {})
+    request["state"]["last_commit"] = work_result.head_sha
+    request["state"]["diff_summary"] = work_result.summary
+    request["state"]["latest_worker_result"] = _work_result_artifact(work_result)
+    _ctx_replay_event(
+        ctx,
+        attempt,
+        ("worker_handoff" if outcome_kind == "handoff" else f"worker_{work_result.status}"),
+        {
+            "work_item_id": work_result.work_item_id,
+            "status": work_result.status,
+            "summary": work_result.summary,
+            "head_sha": work_result.head_sha,
+            "branch": work_result.branch,
+        },
+    )
+    _ctx_sync_replay(ctx)
+    hist = request.setdefault("history", {})
+
+    if outcome_kind == "handoff":
+        request["state"]["latest_handoff"] = _work_result_artifact(work_result)
+        notes = request["state"].setdefault("notes", [])
+        if isinstance(notes, list):
+            notes.append(f"handoff[{coord_resp.work_item.id}]={work_result.summary}")
+            del notes[:-12]
+        _ctx_sync_replay(ctx)
         hist["no_progress_streak"] = 0
-        hist["last_iteration_seconds"] = round(time.monotonic() - iter_start, 2)
-        hist.pop("failure_signatures", None)
-        last_failure_sig = None
+        ctx.last_failure_sig = None
+        hist["last_iteration_seconds"] = round(time.monotonic() - ctx.iter_start, 2)
         _append_iteration_history_entry(
             request,
             iteration=attempt,
             work_item=coord_resp.work_item,
             selected_specialist=coord_resp.selected_specialist,
             worker_result=work_result,
-            outcome="accepted",
-            ci={"state": ci_state, "detail": ci_detail, "classification": None},
-            review={"result": review_result, "summary": review_text[:2000]},
+            outcome="worker_handoff",
         )
-        sync_run_replay(repo_path, request=request, max_attempts=max_attempts, verb=verb)
+        _ctx_sync_replay(ctx)
+        _ctx_audit(ctx, attempt, AUDIT_ITERATION_END, outcome="worker_handoff", status="handoff")
+        ctx.iteration += 1
+        return OrchestratorState.AWAITING_DECISION
 
-        record["status"] = "ready"
-        _persist_record_checkpoint(
+    if work_result.status != "completed":
+        failure_sig = f"worker:{work_result.status}:{'|'.join(work_result.blockers)}"
+        no_prog = int(hist.get("no_progress_streak") or 0)
+        no_prog = no_prog + 1 if ctx.last_failure_sig == failure_sig else 1
+        ctx.last_failure_sig = failure_sig
+        hist["no_progress_streak"] = no_prog
+        hist["last_iteration_seconds"] = round(time.monotonic() - ctx.iter_start, 2)
+
+        sigs = hist.setdefault("failure_signatures", [])
+        sigs.append(failure_sig)
+        del sigs[:-6]
+
+        if _is_oscillating_failure_signatures(sigs):
+            ctx.result = _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+            )
+            return OrchestratorState.DONE
+
+        if no_prog >= ctx.no_progress_max:
+            ctx.result = _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=(
+                    f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={ctx.no_progress_max} "
+                    f"(failure_sig={failure_sig})"
+                ),
+            )
+            return OrchestratorState.DONE
+
+        _set_evaluation_state(
+            request,
+            status="fail",
+            outcome=f"worker_{work_result.status}",
+            worker_result=work_result,
+            failing_checks=[
+                {
+                    "name": "worker",
+                    "kind": "worker",
+                    "url": record.get("pr_url"),
+                    "summary": "; ".join(work_result.blockers),
+                }
+            ],
+            logs_excerpt="; ".join(work_result.blockers),
+        )
+        _append_iteration_history_entry(
+            request,
+            iteration=attempt,
+            work_item=coord_resp.work_item,
+            selected_specialist=coord_resp.selected_specialist,
+            worker_result=work_result,
+            outcome=f"worker_{work_result.status}",
+        )
+        _ctx_sync_replay(ctx)
+        _ctx_audit(ctx, attempt, AUDIT_ITERATION_END, outcome=f"worker_{work_result.status}", status=work_result.status)
+        ctx.iteration += 1
+        return OrchestratorState.AWAITING_DECISION
+
+    # Worker completed successfully -- publish branch and create PR.
+    try:
+        _publish_branch(repo_path=repo_path, branch=work_result.branch, expected_head_sha=work_result.head_sha)
+    except Exception as exc:  # noqa: BLE001
+        detail = _format_preflight_error(exc)
+        ctx.result = _fail_task(
             record,
             home=base_home,
-            checkpoint=CHECKPOINT_AFTER_REVIEW_RESOLUTION,
-            updates={"review_result": review_result},
+            task_dir=task_dir,
+            detail=f"Failed to publish branch on iteration {attempt}: {detail}",
         )
+        return OrchestratorState.DONE
+
+    if attempt == 1:
+        try:
+            pr = ctx.gh.create_pull_request(
+                owner=ctx.owner,
+                repo=ctx.repo,
+                title=_task_title(ctx.verb, ctx.spec.task, ctx.spec.title),
+                body=_build_pr_body(
+                    repo_path=repo_path,
+                    task_id=task_id,
+                    summary=work_result.summary,
+                    extra_body=ctx.spec.body,
+                ),
+                head=work_result.branch,
+                base=ctx.base_branch,
+            )
+        except Exception as exc:  # noqa: BLE001
+            detail = _format_preflight_error(exc)
+            ctx.result = _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Failed to create PR on iteration {attempt}: {detail}",
+            )
+            return OrchestratorState.DONE
+
+        record["pr_url"] = pr["html_url"]
+        record["pr_number"] = pr["number"]
+        _persist_record_checkpoint(record, home=base_home, checkpoint=CHECKPOINT_AFTER_PR_CREATED)
         _dbg(
             dbg_dir,
-            "run_done",
+            "pr_created",
             {
-                "status": "ready",
+                "iteration": attempt,
                 "pr_url": record.get("pr_url"),
-                "tokens_total": record.get("tokens_used_estimate"),
-                "duration_s": round(time.monotonic() - loop_start, 2),
+                "pr_number": record.get("pr_number"),
+                "base_branch": ctx.base_branch,
             },
         )
-        _audit(attempt, AUDIT_ITERATION_END, outcome="accepted", status="ready")
-        _audit(attempt, AUDIT_RUN_END, status="ready", summary=_objective_snippet(str(record.get("summary") or ""), max_len=240))
-        return {
-            "task_id": task_id,
-            "status": record["status"],
-            "pr_url": record["pr_url"],
-            "summary": record["summary"],
+
+    # Stash work_result for POLLING_CI handler.
+    ctx._work_result = work_result  # type: ignore[attr-defined]
+    return OrchestratorState.POLLING_CI
+
+
+def _state_polling_ci(ctx: RunContext) -> OrchestratorState:
+    """Poll CI, handle failures (including infra retry), run review gate.
+
+    Transitions:
+    - AWAITING_DECISION on CI failure or review failure (next iteration)
+    - DONE on success or fatal error (sets ctx.result)
+    """
+    attempt = ctx.iteration
+    record = ctx.record
+    request = ctx.request
+    base_home = ctx.home
+    task_dir = ctx.task_dir
+    dbg_dir = ctx.dbg_dir
+    coord_resp = ctx.coord_resp
+    repo_path = ctx.repo_path
+    hist = request.setdefault("history", {})
+
+    # Retrieve work_result stashed by DISPATCHING_WORKER.
+    work_result = getattr(ctx, '_work_result', None)
+
+    ci_log = task_dir / f"ci-iter-{attempt}.log"
+    _dbg(
+        dbg_dir,
+        "ci_start",
+        {
+            "iteration": attempt,
+            "head_sha": record.get("head_sha"),
+            "pr_url": record.get("pr_url"),
+        },
+    )
+    ci_t0 = time.monotonic()
+    _append_text(ci_log, f"[{now_iso()}] polling CI for {record.get('head_sha')}")
+    try:
+        ci_state, ci_detail = _poll_ci(ctx.gh, ctx.owner, ctx.repo, str(record.get("head_sha")), ci_log)
+    except Exception as exc:  # noqa: BLE001
+        detail = _format_preflight_error(exc)
+        ctx.result = _fail_task(
+            record,
+            home=base_home,
+            task_dir=task_dir,
+            detail=f"CI polling failed on iteration {attempt}: {detail}",
+        )
+        return OrchestratorState.DONE
+    ci_dt = round(time.monotonic() - ci_t0, 2)
+    _append_text(ci_log, f"[{now_iso()}] final {ci_state}: {ci_detail}")
+    _dbg(
+        dbg_dir,
+        "ci_done",
+        {
+            "iteration": attempt,
+            "duration_s": ci_dt,
             "ci_state": ci_state,
             "ci_detail": ci_detail,
-            "review": review_text,
-        }
+        },
+    )
 
-    record["status"] = "failed"
-    record["updated_at"] = now_iso()
-    record["failure_reason"] = f"Mode A loop exhausted after {max_attempts} iterations"
-    upsert_task(record, home=base_home)
-    _audit(max_attempts, AUDIT_RUN_END, status="failed", summary=record["failure_reason"])
-    return {"task_id": task_id, "status": record["status"], "pr_url": record["pr_url"], "summary": record["failure_reason"]}
+    # Record history entry skeleton.
+    if ci_state != "success":
+        ci_checks: dict[str, Any] = {}
+        ci_class = _classify_ci_failure(ci_state, ci_detail, None)
+        infra_retries = 0
+        while True:
+            if str(record.get("head_sha") or "").strip():
+                try:
+                    payload = ctx.gh.get_check_runs(ctx.owner, ctx.repo, str(record.get("head_sha")))
+                    if isinstance(payload, dict):
+                        ci_checks = payload
+                except Exception as exc:  # noqa: BLE001
+                    _dbg(dbg_dir, "ci_check_runs_error", {"iteration": attempt, "detail": str(exc)})
+            ci_class = _classify_ci_failure(ci_state, ci_detail, ci_checks)
+            _dbg(
+                dbg_dir,
+                "ci_classification",
+                {"iteration": attempt, "ci_detail": ci_detail, **ci_class},
+            )
+            if ci_state == "success" or ci_class["classification"] != "infra_outage" or infra_retries >= 2:
+                break
+            infra_retries += 1
+            backoff = 30 * infra_retries
+            _append_text(ci_log, f"[{now_iso()}] infra-outage suspected; backoff {backoff}s before retry {infra_retries}/2")
+            time.sleep(backoff)
+            ci_state, ci_detail = _poll_ci(
+                ctx.gh,
+                ctx.owner,
+                ctx.repo,
+                str(record["head_sha"]),
+                ci_log,
+                poll_seconds=45,
+                stuck_warn_seconds=20 * 60,
+                stuck_fail_seconds=45 * 60,
+            )
+            _append_text(ci_log, f"[{now_iso()}] infra-retry result {ci_state}: {ci_detail}")
+
+        if ci_state != "success" and ci_class["classification"] == "infra_outage":
+            ctx.result = _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=(
+                    "CI outage suspected after retries; no code/workflow FIRE attempted "
+                    f"(reasons={','.join(ci_class['reason_codes']) or 'none'})"
+                ),
+            )
+            return OrchestratorState.DONE
+
+        failure_sig = f"ci:{ci_detail}"
+        no_prog = int(hist.get("no_progress_streak") or 0)
+        no_prog = no_prog + 1 if ctx.last_failure_sig == failure_sig else 1
+        ctx.last_failure_sig = failure_sig
+        hist["no_progress_streak"] = no_prog
+        hist["last_iteration_seconds"] = round(time.monotonic() - ctx.iter_start, 2)
+
+        sigs = hist.setdefault("failure_signatures", [])
+        sigs.append(failure_sig)
+        del sigs[:-6]
+
+        if _is_oscillating_failure_signatures(sigs):
+            ctx.result = _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+            )
+            return OrchestratorState.DONE
+
+        if no_prog >= ctx.no_progress_max:
+            ctx.result = _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=(
+                    f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={ctx.no_progress_max} "
+                    f"(failure_sig={failure_sig})"
+                ),
+            )
+            return OrchestratorState.DONE
+
+        ci_artifact = {
+            "state": ci_state,
+            "detail": ci_detail,
+            "classification": ci_class,
+        }
+        request.setdefault("state", {})
+        request["state"]["latest_ci"] = ci_artifact
+        _ctx_audit(ctx, attempt, AUDIT_CI_RESULT, status="fail", ci_state=ci_state)
+        _ctx_replay_event(
+            ctx,
+            attempt,
+            "ci_result",
+            {"state": ci_state, "detail": ci_detail, "classification": ci_class},
+        )
+        _set_evaluation_state(
+            request,
+            status="fail",
+            outcome="ci_failure",
+            worker_result=work_result,
+            ci_state=ci_state,
+            ci_detail=ci_detail,
+            failing_checks=[{"name": "ci", "kind": "ci", "url": record.get("pr_url"), "summary": ci_detail}],
+            logs_excerpt=ci_detail,
+        )
+        _ctx_sync_replay(ctx)
+        _append_iteration_history_entry(
+            request,
+            iteration=attempt,
+            work_item=coord_resp.work_item,
+            selected_specialist=coord_resp.selected_specialist,
+            worker_result=work_result,
+            outcome="ci_failure",
+            ci=ci_artifact,
+        )
+        _ctx_audit(ctx, attempt, AUDIT_ITERATION_END, outcome="ci_failure", status="failed")
+        ctx.iteration += 1
+        return OrchestratorState.AWAITING_DECISION
+
+    # CI success -- review gate.
+    request.setdefault("state", {})
+    request["state"]["latest_ci"] = {"state": ci_state, "detail": ci_detail, "classification": None}
+    _ctx_audit(ctx, attempt, AUDIT_CI_RESULT, status="pass", ci_state=ci_state)
+    _ctx_replay_event(
+        ctx,
+        attempt,
+        "ci_result",
+        {"state": ci_state, "detail": ci_detail, "classification": None},
+    )
+    _ctx_sync_replay(ctx)
+    _persist_record_checkpoint(
+        record,
+        home=base_home,
+        checkpoint=CHECKPOINT_AFTER_CI_SUCCESS_BEFORE_REVIEW,
+        updates={"ci_state": ci_state, "ci_detail": ci_detail},
+    )
+
+    diff_text = _read_diff_for_review(repo_path, ctx.base_branch, str(record["head_sha"]))
+    _dbg(
+        dbg_dir,
+        "review_start",
+        {
+            "iteration": attempt,
+            "head_sha": record.get("head_sha"),
+            "diff_chars": len(diff_text or ""),
+        },
+    )
+    review_t0 = time.monotonic()
+    review_result, review_text = _run_review_with_retry(diff_text, debug_task_dir=dbg_dir)
+    review_dt = round(time.monotonic() - review_t0, 2)
+    _ctx_audit(ctx, attempt, AUDIT_REVIEW_RESULT, status=review_result)
+
+    _dbg(
+        dbg_dir,
+        "review_done",
+        {
+            "iteration": attempt,
+            "duration_s": review_dt,
+            "review_result": review_result,
+            "has_blocker": review_result == "blocker",
+            "review_first_line": (review_text.splitlines()[0][:200] if review_text else ""),
+        },
+    )
+
+    review_attempt_path = task_dir / f"review-iter-{attempt}.txt"
+    _write_text(review_attempt_path, review_text)
+
+    if record["pr_number"] is None:
+        raise RuntimeError("PR number missing; cannot post review comment")
+    ctx.gh.post_issue_comment(ctx.owner, ctx.repo, int(record["pr_number"]), review_text)
+
+    if review_result in {"tool-error", "malformed", "blocker"}:
+        if review_result == "tool-error":
+            detail = "review-tool-error"
+        elif review_result == "malformed":
+            detail = "review-malformed"
+        else:
+            detail = "review-blocker"
+
+        failure_sig = f"review:{detail}"
+        no_prog = int(hist.get("no_progress_streak") or 0)
+        no_prog = no_prog + 1 if ctx.last_failure_sig == failure_sig else 1
+        ctx.last_failure_sig = failure_sig
+        hist["no_progress_streak"] = no_prog
+        hist["last_iteration_seconds"] = round(time.monotonic() - ctx.iter_start, 2)
+
+        sigs = hist.setdefault("failure_signatures", [])
+        sigs.append(failure_sig)
+        del sigs[:-6]
+
+        if _is_oscillating_failure_signatures(sigs):
+            ctx.result = _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=f"Oscillation breaker tripped: failure_signatures(last4)={sigs[-4:]}",
+            )
+            return OrchestratorState.DONE
+
+        if no_prog >= ctx.no_progress_max:
+            ctx.result = _fail_task(
+                record,
+                home=base_home,
+                task_dir=task_dir,
+                detail=(
+                    f"No-progress breaker tripped: no_progress_streak={no_prog} >= no_progress_max={ctx.no_progress_max} "
+                    f"(failure_sig={failure_sig})"
+                ),
+            )
+            return OrchestratorState.DONE
+
+        review_artifact = {"result": review_result, "summary": review_text[:2000]}
+        request.setdefault("state", {})
+        request["state"]["latest_review"] = review_artifact
+        _ctx_replay_event(
+            ctx,
+            attempt,
+            "review_result",
+            review_artifact,
+        )
+        _set_evaluation_state(
+            request,
+            status="fail",
+            outcome=detail,
+            worker_result=work_result,
+            ci_state=ci_state,
+            ci_detail=ci_detail,
+            review_result=review_result,
+            failing_checks=[{"name": "review", "kind": "review", "url": record.get("pr_url"), "summary": review_text[:2000]}],
+            logs_excerpt=review_text[:2000],
+        )
+        _ctx_sync_replay(ctx)
+        _append_iteration_history_entry(
+            request,
+            iteration=attempt,
+            work_item=coord_resp.work_item,
+            selected_specialist=coord_resp.selected_specialist,
+            worker_result=work_result,
+            outcome=detail,
+            ci={"state": ci_state, "detail": ci_detail, "classification": None},
+            review=review_artifact,
+        )
+        _ctx_audit(ctx, attempt, AUDIT_ITERATION_END, outcome=detail, status="failed")
+        ctx.iteration += 1
+        return OrchestratorState.AWAITING_DECISION
+
+    # Success.
+    request.setdefault("state", {})
+    request["state"]["latest_review"] = {"result": review_result, "summary": review_text[:2000]}
+    _ctx_replay_event(
+        ctx,
+        attempt,
+        "review_result",
+        {"result": review_result, "summary": review_text[:2000]},
+    )
+    if ctx.review_enabled:
+        _ctx_audit(ctx, attempt, AUDIT_REVIEW_STARTED)
+        review_stage_result = run_review_stage(
+            {
+                "review_result": review_result,
+                "review_text": review_text,
+                "issues_found": _extract_review_issues(review_text, review_result),
+            }
+        )
+        review_stage_payload = _json_compatible(review_stage_result)
+        request["state"]["latest_post_success_review"] = review_stage_payload
+        _ctx_audit(
+            ctx,
+            attempt,
+            AUDIT_REVIEW_COMPLETED,
+            outcome=review_stage_result.outcome,
+            summary=review_stage_result.summary,
+            issues_found=list(review_stage_result.issues_found),
+        )
+        _ctx_replay_event(
+            ctx,
+            attempt,
+            "review_stage_result",
+            review_stage_payload,
+        )
+        if review_stage_result.outcome == "repair":
+            _set_evaluation_state(
+                request,
+                status="fail",
+                outcome="post_success_review_repair",
+                worker_result=work_result,
+                ci_state=ci_state,
+                ci_detail=ci_detail,
+                review_result=review_stage_payload,
+                failing_checks=[
+                    {
+                        "name": "post_success_review",
+                        "kind": "review",
+                        "url": record.get("pr_url"),
+                        "summary": review_stage_result.summary,
+                    }
+                ],
+                logs_excerpt=review_stage_result.summary,
+            )
+        else:
+            _set_evaluation_state(
+                request,
+                status="success",
+                outcome="post_success_review_approve",
+                worker_result=work_result,
+                ci_state=ci_state,
+                ci_detail=ci_detail,
+                review_result=review_stage_payload,
+                failing_checks=[],
+                logs_excerpt="",
+            )
+        _ctx_sync_replay(ctx)
+        hist["no_progress_streak"] = 0
+        hist["last_iteration_seconds"] = round(time.monotonic() - ctx.iter_start, 2)
+        hist.pop("failure_signatures", None)
+        ctx.last_failure_sig = None
+        _append_iteration_history_entry(
+            request,
+            iteration=attempt,
+            work_item=coord_resp.work_item,
+            selected_specialist=coord_resp.selected_specialist,
+            worker_result=work_result,
+            outcome=f"post_success_review_{review_stage_result.outcome}",
+            ci={"state": ci_state, "detail": ci_detail, "classification": None},
+            review={
+                "result": review_result,
+                "summary": review_text[:2000],
+                "post_success": review_stage_payload,
+            },
+        )
+        _ctx_sync_replay(ctx)
+        _ctx_audit(
+            ctx,
+            attempt,
+            AUDIT_ITERATION_END,
+            outcome=f"post_success_review_{review_stage_result.outcome}",
+            status="reviewed",
+        )
+        ctx.iteration += 1
+        return OrchestratorState.AWAITING_DECISION
+
+    _set_evaluation_state(
+        request,
+        status="success",
+        outcome="accepted",
+        worker_result=work_result,
+        ci_state=ci_state,
+        ci_detail=ci_detail,
+        review_result=review_result,
+        failing_checks=[],
+        logs_excerpt="",
+    )
+    _ctx_sync_replay(ctx)
+    hist["no_progress_streak"] = 0
+    hist["last_iteration_seconds"] = round(time.monotonic() - ctx.iter_start, 2)
+    hist.pop("failure_signatures", None)
+    ctx.last_failure_sig = None
+    _append_iteration_history_entry(
+        request,
+        iteration=attempt,
+        work_item=coord_resp.work_item,
+        selected_specialist=coord_resp.selected_specialist,
+        worker_result=work_result,
+        outcome="accepted",
+        ci={"state": ci_state, "detail": ci_detail, "classification": None},
+        review={"result": review_result, "summary": review_text[:2000]},
+    )
+    _ctx_sync_replay(ctx)
+
+    record["status"] = "ready"
+    _persist_record_checkpoint(
+        record,
+        home=base_home,
+        checkpoint=CHECKPOINT_AFTER_REVIEW_RESOLUTION,
+        updates={"review_result": review_result},
+    )
+    _dbg(
+        dbg_dir,
+        "run_done",
+        {
+            "status": "ready",
+            "pr_url": record.get("pr_url"),
+            "tokens_total": record.get("tokens_used_estimate"),
+            "duration_s": round(time.monotonic() - ctx.loop_start, 2),
+        },
+    )
+    _ctx_audit(ctx, attempt, AUDIT_ITERATION_END, outcome="accepted", status="ready")
+    _ctx_audit(ctx, attempt, AUDIT_RUN_END, status="ready", summary=_objective_snippet(str(record.get("summary") or ""), max_len=240))
+    ctx.result = {
+        "task_id": ctx.task_id,
+        "status": record["status"],
+        "pr_url": record["pr_url"],
+        "summary": record["summary"],
+        "ci_state": ci_state,
+        "ci_detail": ci_detail,
+        "review": review_text,
+    }
+    return OrchestratorState.DONE
+
+
+def _state_dispatching_review(ctx: RunContext) -> OrchestratorState:
+    """Handle request_review decisions (structured review protocol).
+
+    Stub -- will be wired in Task 8.
+    """
+    raise RuntimeError("not yet implemented")
+
+
+def _state_processing_dismissal(ctx: RunContext) -> OrchestratorState:
+    """Handle dismiss_finding decisions (structured review protocol).
+
+    Stub -- will be wired in Task 8.
+    """
+    raise RuntimeError("not yet implemented")
+
+
+_STATE_HANDLERS: dict[OrchestratorState, Any] = {
+    OrchestratorState.PREFLIGHT: _state_preflight,
+    OrchestratorState.AWAITING_DECISION: _state_awaiting_decision,
+    OrchestratorState.DISPATCHING_WORKER: _state_dispatching_worker,
+    OrchestratorState.POLLING_CI: _state_polling_ci,
+    OrchestratorState.DISPATCHING_REVIEW: _state_dispatching_review,
+    OrchestratorState.PROCESSING_DISMISSAL: _state_processing_dismissal,
+    OrchestratorState.TERMINAL: _state_terminal,
+}
+
+
+def run_task_mode_a(
+    repo_ref: str,
+    verb: str,
+    spec: RunSpec,
+    home: Path | None = None,
+    base_branch: str | None = None,
+    debug: bool = False,
+) -> dict[str, Any]:
+    """Mode A loop: coordinator -> work_item -> worker -> evaluate -> repeat."""
+
+    base_home = home or velora_home()
+    task_id = build_task_id()
+    cfg = get_config()
+
+    ctx = RunContext(
+        task_id=task_id,
+        run_id=task_id,
+        repo_ref=repo_ref,
+        verb=verb,
+        # Repo fields -- populated by PREFLIGHT after validation
+        owner="",
+        repo="",
+        base_branch=(base_branch or "").strip(),
+        work_branch="",
+        repo_path=Path(),
+        # Config / policy -- some overwritten by PREFLIGHT
+        config=cfg,
+        max_attempts=0,
+        max_tokens=0,
+        max_wall_seconds=0,
+        no_progress_max=0,
+        review_enabled=False,
+        # Mutable state
+        iteration=1,
+        record={},
+        request={},
+        active_review_result=None,
+        # Infrastructure
+        gh=None,
+        home=base_home,
+        task_dir=Path(),
+        debug=debug,
+        loop_start=0.0,
+        # Mutable handler fields
+        spec=spec,
+    )
+
+    state = OrchestratorState.PREFLIGHT
+    while state != OrchestratorState.DONE:
+        handler = _STATE_HANDLERS[state]
+        state = handler(ctx)
+
+    return ctx.result
