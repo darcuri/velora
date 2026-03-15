@@ -89,3 +89,85 @@ def resolve_scoped_path(
                 )
 
     return resolved
+
+
+def _action_result(status: str, result: str) -> dict[str, str]:
+    return {"status": status, "result": result}
+
+
+def execute_read_file(scope: WorkerScope, params: dict[str, Any]) -> dict[str, str]:
+    path_str = params.get("path", "")
+    try:
+        resolved = resolve_scoped_path(scope, path_str, require_allowed_file=False)
+    except ScopeViolation as e:
+        return _action_result("error", f"Scope violation: {e}")
+    if not resolved.is_file():
+        return _action_result("error", f"File not found: {path_str}")
+    try:
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return _action_result("error", f"Read error: {e}")
+    return _action_result("ok", content)
+
+
+def execute_list_files(scope: WorkerScope, params: dict[str, Any]) -> dict[str, str]:
+    path_str = params.get("path", "")
+    try:
+        resolved = resolve_scoped_path(scope, path_str, require_allowed_file=False)
+    except ScopeViolation as e:
+        return _action_result("error", f"Scope violation: {e}")
+    if not resolved.is_dir():
+        return _action_result("error", f"Directory not found: {path_str}")
+    try:
+        entries = sorted(p.name for p in resolved.iterdir() if not p.name.startswith("."))
+    except OSError as e:
+        return _action_result("error", f"List error: {e}")
+    return _action_result("ok", "\n".join(entries))
+
+
+def execute_write_file(scope: WorkerScope, params: dict[str, Any]) -> dict[str, str]:
+    path_str = params.get("path", "")
+    content = params.get("content", "")
+    if not isinstance(content, str):
+        return _action_result("error", "content must be a string")
+    try:
+        resolved = resolve_scoped_path(scope, path_str, require_allowed_file=True)
+    except ScopeViolation as e:
+        return _action_result("error", f"Scope violation: {e}")
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(content, encoding="utf-8")
+    except OSError as e:
+        return _action_result("error", f"Write error: {e}")
+    return _action_result("ok", f"Wrote {len(content)} bytes to {path_str}")
+
+
+def execute_patch_file(scope: WorkerScope, params: dict[str, Any]) -> dict[str, str]:
+    path_str = params.get("path", "")
+    old = params.get("old", "")
+    new = params.get("new", "")
+    if not isinstance(old, str) or not isinstance(new, str):
+        return _action_result("error", "old and new must be strings")
+    if not old:
+        return _action_result("error", "old string must not be empty")
+    try:
+        resolved = resolve_scoped_path(scope, path_str, require_allowed_file=True)
+    except ScopeViolation as e:
+        return _action_result("error", f"Scope violation: {e}")
+    if not resolved.is_file():
+        return _action_result("error", f"File not found: {path_str}")
+    try:
+        content = resolved.read_text(encoding="utf-8")
+    except OSError as e:
+        return _action_result("error", f"Read error: {e}")
+    count = content.count(old)
+    if count == 0:
+        return _action_result("error", f"Old string not found in {path_str}")
+    if count > 1:
+        return _action_result("error", f"Old string not unique in {path_str} ({count} matches)")
+    patched = content.replace(old, new, 1)
+    try:
+        resolved.write_text(patched, encoding="utf-8")
+    except OSError as e:
+        return _action_result("error", f"Write error: {e}")
+    return _action_result("ok", f"Patched {path_str}")
