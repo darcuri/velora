@@ -171,3 +171,73 @@ def execute_patch_file(scope: WorkerScope, params: dict[str, Any]) -> dict[str, 
     except OSError as e:
         return _action_result("error", f"Write error: {e}")
     return _action_result("ok", f"Patched {path_str}")
+
+
+_SEARCH_RESULT_CAP = 50
+_RUN_TESTS_TIMEOUT_S = int(os.environ.get("VELORA_HARNESS_TEST_TIMEOUT", "120"))
+
+
+def execute_search_files(scope: WorkerScope, params: dict[str, Any]) -> dict[str, str]:
+    pattern_str = params.get("pattern", "")
+    if not pattern_str:
+        return _action_result("error", "pattern must be non-empty")
+    try:
+        compiled = re.compile(pattern_str)
+    except re.error as e:
+        return _action_result("error", f"Invalid regex: {e}")
+
+    matches: list[str] = []
+    for dir_name in sorted(scope.allowed_dirs):
+        dir_path = scope.repo_root / dir_name
+        if not dir_path.is_dir():
+            continue
+        for file_path in sorted(dir_path.rglob("*")):
+            if not file_path.is_file():
+                continue
+            if file_path.name.startswith("."):
+                continue
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            rel = str(file_path.relative_to(scope.repo_root))
+            for line_no, line in enumerate(text.splitlines(), 1):
+                if compiled.search(line):
+                    matches.append(f"{rel}:{line_no}: {line.rstrip()}")
+                    if len(matches) >= _SEARCH_RESULT_CAP:
+                        matches.append(f"[capped at {_SEARCH_RESULT_CAP} results]")
+                        return _action_result("ok", "\n".join(matches))
+
+    if not matches:
+        return _action_result("ok", "No matches found.")
+    return _action_result("ok", "\n".join(matches))
+
+
+def execute_run_tests(scope: WorkerScope, params: dict[str, Any]) -> dict[str, str]:
+    command_str = params.get("command", "").strip()
+    if not command_str:
+        return _action_result("error", "command must be non-empty")
+    if command_str not in scope.test_commands:
+        return _action_result(
+            "error",
+            f"Command not in allowlist: {command_str}. "
+            f"Allowed: {', '.join(scope.test_commands)}",
+        )
+    cmd_parts = command_str.split()
+    try:
+        proc = subprocess.run(
+            cmd_parts,
+            cwd=str(scope.repo_root),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=_RUN_TESTS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return _action_result("error", f"Test command timed out after {_RUN_TESTS_TIMEOUT_S}s")
+    except OSError as e:
+        return _action_result("error", f"Failed to execute test command: {e}")
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    status = "ok" if proc.returncode == 0 else "error"
+    return _action_result(status, output)

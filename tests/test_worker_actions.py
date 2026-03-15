@@ -11,6 +11,8 @@ from velora.worker_actions import (
     execute_list_files,
     execute_write_file,
     execute_patch_file,
+    execute_search_files,
+    execute_run_tests,
 )
 
 
@@ -178,6 +180,67 @@ class TestPatchFile(unittest.TestCase):
         })
         self.assertEqual(result["status"], "error")
         self.assertIn("not unique", result["result"].lower())
+
+
+class TestSearchFiles(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = Path(self.tmp)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "main.py").write_text("def hello():\n    return 'hello'\n")
+        (self.repo / "src" / "util.py").write_text("def helper():\n    return hello()\n")
+        self.scope = WorkerScope(
+            repo_root=self.repo,
+            allowed_files={"src/main.py"},
+            allowed_dirs={"src"},
+            test_commands=[],
+            work_branch="velora/wi-001",
+        )
+
+    def test_search_literal_match(self):
+        result = execute_search_files(self.scope, {"pattern": "hello"})
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("main.py", result["result"])
+        self.assertIn("util.py", result["result"])
+
+    def test_search_no_match(self):
+        result = execute_search_files(self.scope, {"pattern": "nonexistent_xyz"})
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("no matches", result["result"].lower())
+
+    def test_search_caps_results(self):
+        # Create a file with >50 matches
+        (self.repo / "src" / "big.py").write_text("\n".join(f"line{i} match" for i in range(100)))
+        result = execute_search_files(self.scope, {"pattern": "match"})
+        self.assertEqual(result["status"], "ok")
+        # Should be capped
+        lines = [l for l in result["result"].strip().split("\n") if l.strip()]
+        self.assertLessEqual(len(lines), 51)  # 50 results + possible cap message
+
+
+class TestRunTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = Path(self.tmp)
+        self.scope = WorkerScope(
+            repo_root=self.repo,
+            allowed_files=set(),
+            allowed_dirs=set(),
+            test_commands=["python -m pytest -q"],
+            work_branch="velora/wi-001",
+        )
+
+    def test_reject_command_not_in_allowlist(self):
+        result = execute_run_tests(self.scope, {"command": "rm -rf /"})
+        self.assertEqual(result["status"], "error")
+        self.assertIn("not in allowlist", result["result"].lower())
+
+    def test_accept_valid_command(self):
+        # python -m pytest -q will fail (no tests) but should not be rejected by allowlist
+        result = execute_run_tests(self.scope, {"command": "python -m pytest -q"})
+        # It ran (returned something), not blocked by allowlist
+        self.assertIn(result["status"], {"ok", "error"})
+        self.assertNotIn("not in allowlist", result["result"].lower())
 
 
 if __name__ == "__main__":
