@@ -1,3 +1,5 @@
+import json
+import subprocess
 import unittest
 
 import tempfile
@@ -91,7 +93,7 @@ class TestAssembleWorkResult(unittest.TestCase):
         self.assertIn("TESTS_EXHAUSTED", validated.blockers)
 
 
-def _make_work_item() -> WorkItem:
+def _make_work_item(*, gates: list[str] | None = None) -> WorkItem:
     return WorkItem.from_dict({
         "id": "WI-001",
         "kind": "implement",
@@ -104,7 +106,7 @@ def _make_work_item() -> WorkItem:
         "acceptance": {
             "must": ["foo() returns 42"],
             "must_not": ["Do not modify existing files"],
-            "gates": ["tests"],
+            "gates": gates if gates is not None else ["tests"],
         },
         "limits": {"max_diff_lines": 100, "max_commits": 1},
         "commit": {
@@ -267,6 +269,88 @@ class TestHarnessLoop(unittest.TestCase):
                 parse_failure_cap=3,
             )
         self.assertEqual(outcome.reason, HarnessReason.PARSE_FAILURES)
+
+
+def _init_git_repo(path: Path) -> None:
+    """Create a minimal git repo with an initial commit."""
+    subprocess.run(["git", "init", str(path)], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "test@test.com"], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], capture_output=True, check=True)
+    (path / "README.md").write_text("init\n")
+    subprocess.run(["git", "-C", str(path), "add", "."], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-m", "init"], capture_output=True, check=True)
+
+
+class TestEndgame(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = Path(self.tmp)
+        _init_git_repo(self.repo)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "main.py").write_text("x = 1\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], capture_output=True, check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "add src"], capture_output=True, check=True)
+        # Create work branch
+        subprocess.run(["git", "-C", str(self.repo), "checkout", "-b", "velora/wi-001"], capture_output=True, check=True)
+
+    def test_diff_audit_detects_no_changes(self):
+        from velora.local_worker import _run_endgame
+        scope = WorkerScope(
+            repo_root=self.repo,
+            allowed_files={"src/main.py"},
+            allowed_dirs={"src"},
+            test_commands=[],
+            work_branch="velora/wi-001",
+        )
+        outcome = _run_endgame(scope=scope, work_item=_make_work_item(), llm_summary="done")
+        self.assertEqual(outcome.reason, HarnessReason.NO_CHANGES)
+
+    def test_diff_audit_detects_scope_violation(self):
+        from velora.local_worker import _run_endgame
+        # Modify a file outside scope
+        (self.repo / "README.md").write_text("modified\n")
+        scope = WorkerScope(
+            repo_root=self.repo,
+            allowed_files={"src/main.py"},
+            allowed_dirs={"src"},
+            test_commands=[],
+            work_branch="velora/wi-001",
+        )
+        outcome = _run_endgame(scope=scope, work_item=_make_work_item(), llm_summary="done")
+        self.assertEqual(outcome.reason, HarnessReason.SCOPE_VIOLATION)
+
+    def test_diff_audit_detects_diff_limit(self):
+        from velora.local_worker import _run_endgame
+        # Create a change that exceeds max_diff_lines (100 in test WorkItem)
+        big_content = "\n".join(f"line{i} = {i}" for i in range(200))
+        (self.repo / "src" / "main.py").write_text(big_content)
+        scope = WorkerScope(
+            repo_root=self.repo,
+            allowed_files={"src/main.py"},
+            allowed_dirs={"src"},
+            test_commands=[],
+            work_branch="velora/wi-001",
+        )
+        outcome = _run_endgame(scope=scope, work_item=_make_work_item(), llm_summary="done")
+        self.assertEqual(outcome.reason, HarnessReason.DIFF_LIMIT)
+
+    def test_successful_endgame_commits(self):
+        from velora.local_worker import _run_endgame
+        # Modify a file in scope
+        (self.repo / "src" / "main.py").write_text("x = 2\n")
+        scope = WorkerScope(
+            repo_root=self.repo,
+            allowed_files={"src/main.py"},
+            allowed_dirs={"src"},
+            test_commands=[],
+            work_branch="velora/wi-001",
+        )
+        wi = _make_work_item(gates=[])
+        outcome = _run_endgame(scope=scope, work_item=wi, llm_summary="changed x")
+        self.assertEqual(outcome.reason, HarnessReason.SUCCESS)
+        self.assertTrue(outcome.success)
+        self.assertTrue(outcome.head_sha)  # should have a commit SHA
+        self.assertIn("src/main.py", outcome.files_touched)
 
 
 if __name__ == "__main__":

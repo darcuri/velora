@@ -399,6 +399,152 @@ def run_local_worker_loop(
             )
 
 
+# -- Endgame --
+
+@dataclass
+class EndgameOutcome:
+    """Outcome from the endgame phase."""
+    success: bool
+    reason: HarnessReason
+    evidence: list[str]
+    head_sha: str
+    files_touched: list[str]
+    tests_run: list[dict[str, str]]
+
+
+# Gate name -> command list
+GATE_COMMANDS: dict[str, list[str]] = {
+    "tests":    ["python", "-m", "pytest", "-q"],
+    "lint":     ["python", "-m", "flake8"],
+    "security": ["python", "-m", "bandit", "-r", ".", "-q"],
+}
+
+_SKIPPED_GATES = {"ci", "docs"}
+_TEST_TIMEOUT_S = int(os.environ.get("VELORA_HARNESS_TEST_TIMEOUT", "120"))
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo)] + list(args),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _run_endgame(
+    *,
+    scope: WorkerScope,
+    work_item: WorkItem,
+    llm_summary: str,
+) -> EndgameOutcome:
+    """Mechanical endgame: diff audit, test gates, commit."""
+    repo = scope.repo_root
+
+    # -- Step 1: Diff audit --
+    diff_stat = _git(repo, "diff", "--stat", "HEAD")
+    diff_full = _git(repo, "diff", "HEAD")
+    diff_name = _git(repo, "diff", "--name-only", "HEAD")
+
+    changed_files = [f.strip() for f in diff_name.stdout.splitlines() if f.strip()]
+
+    if not changed_files:
+        return EndgameOutcome(
+            success=False, reason=HarnessReason.NO_CHANGES,
+            evidence=["worker signaled complete but no files were modified"],
+            head_sha="", files_touched=[], tests_run=[],
+        )
+
+    # Scope check
+    for f in changed_files:
+        if f not in scope.allowed_files:
+            return EndgameOutcome(
+                success=False, reason=HarnessReason.SCOPE_VIOLATION,
+                evidence=[f"modified {f} which is not in allowed_files"],
+                head_sha="", files_touched=changed_files, tests_run=[],
+            )
+
+    # Binary file check
+    binary_check = _git(repo, "diff", "--numstat", "HEAD")
+    for line in binary_check.stdout.splitlines():
+        if line.startswith("-\t-\t"):
+            bin_file = line.split("\t", 2)[2].strip()
+            return EndgameOutcome(
+                success=False, reason=HarnessReason.SCOPE_VIOLATION,
+                evidence=[f"binary file modification not allowed: {bin_file}"],
+                head_sha="", files_touched=changed_files, tests_run=[],
+            )
+
+    # Diff line count
+    diff_lines = len(diff_full.stdout.splitlines())
+    max_lines = work_item.limits.max_diff_lines
+    if diff_lines > max_lines:
+        return EndgameOutcome(
+            success=False, reason=HarnessReason.DIFF_LIMIT,
+            evidence=[f"{diff_lines} lines exceeds limit of {max_lines}"],
+            head_sha="", files_touched=changed_files, tests_run=[],
+        )
+
+    # -- Step 2: Run test gates --
+    tests_run: list[dict[str, str]] = []
+    for gate in work_item.acceptance.gates:
+        if gate in _SKIPPED_GATES:
+            tests_run.append({"command": gate, "status": "not_run", "details": f"gate '{gate}' skipped by harness"})
+            continue
+        cmd_list = GATE_COMMANDS.get(gate)
+        if cmd_list is None:
+            tests_run.append({"command": gate, "status": "not_run", "details": f"unknown gate '{gate}'"})
+            continue
+        try:
+            proc = subprocess.run(
+                cmd_list, cwd=str(repo), text=True, capture_output=True,
+                check=False, timeout=_TEST_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return EndgameOutcome(
+                success=False, reason=HarnessReason.GATE_TIMEOUT,
+                evidence=[f"gate '{gate}' timed out after {_TEST_TIMEOUT_S}s"],
+                head_sha="", files_touched=changed_files, tests_run=tests_run,
+            )
+        output = (proc.stdout or "") + (proc.stderr or "")
+        status = "pass" if proc.returncode == 0 else "fail"
+        tests_run.append({"command": " ".join(cmd_list), "status": status, "details": output[:2000]})
+        if status == "fail":
+            return EndgameOutcome(
+                success=False, reason=HarnessReason.TESTS_EXHAUSTED,
+                evidence=[output[:2000]],
+                head_sha="", files_touched=changed_files, tests_run=tests_run,
+            )
+
+    # -- Step 3: Commit --
+    for f in changed_files:
+        add_result = _git(repo, "add", f)
+        if add_result.returncode != 0:
+            return EndgameOutcome(
+                success=False, reason=HarnessReason.COMMIT_FAILED,
+                evidence=[f"git add failed for {f}: {add_result.stderr}"],
+                head_sha="", files_touched=changed_files, tests_run=tests_run,
+            )
+
+    footer_lines = "\n".join(f"{k}: {v}" for k, v in work_item.commit.footer.items())
+    commit_msg = f"{work_item.commit.message}\n\n{footer_lines}"
+    commit_result = _git(repo, "commit", "-m", commit_msg)
+    if commit_result.returncode != 0:
+        return EndgameOutcome(
+            success=False, reason=HarnessReason.COMMIT_FAILED,
+            evidence=[f"git commit failed: {commit_result.stderr}"],
+            head_sha="", files_touched=changed_files, tests_run=tests_run,
+        )
+
+    head_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    return EndgameOutcome(
+        success=True, reason=HarnessReason.SUCCESS,
+        evidence=[], head_sha=head_sha,
+        files_touched=changed_files, tests_run=tests_run,
+    )
+
+
 def _call_local_llm_chat(messages: list[dict[str, str]], cwd: Path) -> CmdResult:
     """Call the local LLM with the full chat message list.
 
