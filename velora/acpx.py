@@ -430,7 +430,7 @@ def run_local_llm(prompt: str, *, cwd: Path | None = None) -> CmdResult:
 
     base_url = os.environ.get("VELORA_LOCAL_BASE_URL", "http://localhost:1234").rstrip("/")
     model = os.environ.get("VELORA_LOCAL_MODEL", "")
-    timeout_s = int(os.environ.get("VELORA_LOCAL_TIMEOUT", "300"))
+    timeout_s = int(os.environ.get("VELORA_LOCAL_TIMEOUT", "600"))
 
     body: dict[str, Any] = {
         "messages": [{"role": "user", "content": prompt}],
@@ -455,6 +455,8 @@ def run_local_llm(prompt: str, *, cwd: Path | None = None) -> CmdResult:
         return CmdResult(returncode=1, stdout="", stderr=f"Local LLM HTTP {exc.code}: {detail}")
     except urllib.error.URLError as exc:
         return CmdResult(returncode=1, stdout="", stderr=f"Local LLM connection failed: {exc.reason}")
+    except TimeoutError:
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM timed out after {timeout_s}s")
 
     try:
         payload = json.loads(raw)
