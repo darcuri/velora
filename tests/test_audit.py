@@ -251,3 +251,13 @@ def test_append_event_schema_and_redaction(tmp_path):
     assert set(payload.keys()) == {"event_type", "iteration", "payload", "run_id", "timestamp"}
     assert payload["payload"]["api_key"] == "[REDACTED]"
     assert payload["payload"]["auth_header"] == "[REDACTED]"
+
+
+def test_review_requested_event_constant():
+    from velora.audit import REVIEW_REQUESTED
+    assert REVIEW_REQUESTED == "review_requested"
+
+
+def test_finding_dismissed_event_constant():
+    from velora.audit import FINDING_DISMISSED
+    assert FINDING_DISMISSED == "finding_dismissed"

@@ -173,5 +173,154 @@ class TestAcpxDiscovery(unittest.TestCase):
         self.assertEqual(usage.model_id, "gpt-5.3-codex/medium")
 
 
+def _make_review_brief(*, reviewer="gemini", model=None):
+    """Helper: build a minimal ReviewBrief for testing."""
+    from velora.protocol import ReviewBrief, ReviewScope
+
+    return ReviewBrief(
+        id="RB-0001",
+        reviewer=reviewer,
+        model=model,
+        objective="Verify the diff is correct and safe",
+        acceptance_criteria=["All tests pass", "No security regressions"],
+        rejection_criteria=["Introduces a crash", "Breaks existing API"],
+        areas_of_concern=["error handling in run.py", "protocol validation"],
+        scope=ReviewScope(
+            kind="full_diff",
+            base_ref="main",
+            head_sha="abc1234",
+            files=["velora/run.py"],
+        ),
+    )
+
+
+class TestRunStructuredReview(unittest.TestCase):
+    def test_builds_prompt_with_brief_fields(self):
+        """Verify the prompt includes objective, acceptance_criteria, areas_of_concern."""
+        seen: dict[str, str] = {}
+
+        def fake_generate_content(*, api_key, model, prompt, max_output_tokens):
+            seen["prompt"] = prompt
+            return '{"review_brief_id":"RB-0001","verdict":"approve","findings":[],"summary":"ok"}'
+
+        brief = _make_review_brief()
+
+        with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
+            "velora.acpx._gemini_generate_content", side_effect=fake_generate_content
+        ):
+            from velora.acpx import run_structured_review
+
+            res = run_structured_review(brief, "diff text here")
+
+        self.assertEqual(res.returncode, 0)
+        prompt = seen["prompt"]
+
+        # Objective
+        self.assertIn("Verify the diff is correct and safe", prompt)
+        # Acceptance criteria
+        self.assertIn("All tests pass", prompt)
+        self.assertIn("No security regressions", prompt)
+        # Areas of concern
+        self.assertIn("error handling in run.py", prompt)
+        self.assertIn("protocol validation", prompt)
+        # Rejection criteria
+        self.assertIn("Introduces a crash", prompt)
+        self.assertIn("Breaks existing API", prompt)
+        # Diff
+        self.assertIn("diff text here", prompt)
+
+    def test_includes_schema_instructions(self):
+        """Verify the prompt tells the reviewer to output JSON with ReviewResult structure."""
+        seen: dict[str, str] = {}
+
+        def fake_generate_content(*, api_key, model, prompt, max_output_tokens):
+            seen["prompt"] = prompt
+            return '{"review_brief_id":"RB-0001","verdict":"approve","findings":[],"summary":"ok"}'
+
+        brief = _make_review_brief()
+
+        with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
+            "velora.acpx._gemini_generate_content", side_effect=fake_generate_content
+        ):
+            from velora.acpx import run_structured_review
+
+            run_structured_review(brief, "some diff")
+
+        prompt = seen["prompt"]
+
+        # Must instruct JSON output
+        self.assertIn("review_brief_id", prompt)
+        self.assertIn('"verdict"', prompt)
+        self.assertIn('"findings"', prompt)
+        self.assertIn('"severity"', prompt)
+        self.assertIn('"category"', prompt)
+        self.assertIn('"approve"', prompt)
+        self.assertIn('"reject"', prompt)
+        self.assertIn('"blocker"', prompt)
+        self.assertIn('"nit"', prompt)
+        self.assertIn("summary", prompt)
+        self.assertIn("JSON", prompt)
+
+    def test_dispatches_to_gemini(self):
+        """Verify Gemini is called when reviewer='gemini'."""
+        gemini_called = {"count": 0}
+
+        def fake_generate_content(*, api_key, model, prompt, max_output_tokens):
+            gemini_called["count"] += 1
+            return '{"review_brief_id":"RB-0001","verdict":"approve","findings":[],"summary":"ok"}'
+
+        brief = _make_review_brief(reviewer="gemini")
+
+        with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
+            "velora.acpx._gemini_generate_content", side_effect=fake_generate_content
+        ):
+            from velora.acpx import run_structured_review
+
+            res = run_structured_review(brief, "diff")
+
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(gemini_called["count"], 1)
+
+    def test_dispatches_to_claude(self):
+        """Verify Claude is called when reviewer='claude'."""
+        from velora.acpx import CmdResult, run_structured_review
+
+        brief = _make_review_brief(reviewer="claude")
+
+        with patch("velora.acpx.run_claude", return_value=CmdResult(returncode=0, stdout="ok\n", stderr="")) as mock_claude:
+            res = run_structured_review(brief, "diff")
+
+        self.assertEqual(res.returncode, 0)
+        mock_claude.assert_called_once()
+        call_kwargs = mock_claude.call_args
+        # Verify the session name includes the brief ID
+        self.assertIn("RB-0001", call_kwargs[1]["session_name"])
+
+    def test_rejects_non_review_brief(self):
+        """Verify TypeError if brief is not a ReviewBrief."""
+        from velora.acpx import run_structured_review
+
+        with self.assertRaises(TypeError):
+            run_structured_review({"not": "a brief"}, "diff")
+
+    def test_gemini_error_returns_failure(self):
+        """Verify Gemini API errors are caught and returned as rc=1."""
+
+        def fake_generate_content(*, api_key, model, prompt, max_output_tokens):
+            raise RuntimeError("API is down")
+
+        brief = _make_review_brief(reviewer="gemini")
+
+        with patch("velora.acpx.get_vault_key", return_value="dummy"), patch(
+            "velora.acpx._gemini_generate_content", side_effect=fake_generate_content
+        ):
+            from velora.acpx import run_structured_review
+
+            res = run_structured_review(brief, "diff")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("API is down", res.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

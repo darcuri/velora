@@ -46,6 +46,35 @@ A task is considered ready only when the task record is marked `ready` with the 
 
 That artifact matters more than conversational claims like “done” or “looks good.”
 
+## Structured review protocol
+
+Review in Mode A is protocol-driven. The coordinator owns all review decisions; the orchestrator validates and routes but never interprets review content.
+
+### Flow
+
+1. **Coordinator requests review** -- emits a `request_review` decision with a `ReviewBrief` that specifies the reviewer backend, objective, acceptance/rejection criteria, areas of concern, and diff scope.
+2. **Orchestrator dispatches review** -- sends the `ReviewBrief` to the specified reviewer and receives a `ReviewResult` containing a verdict (`approve` or `reject`), structured findings, and a summary.
+3. **Orchestrator validates** -- the `ReviewResult` must pass protocol validation, including verdict/findings coherence (e.g., `approve` is not allowed with blocker-severity findings; `reject` requires at least one blocker).
+4. **Coordinator decides** -- the review result is fed back to the coordinator, which chooses one of:
+   - `finalize_success` -- accept the work
+   - `execute_work_item` -- issue a repair WorkItem to address findings
+   - `dismiss_finding` -- explicitly dismiss specific findings with a justification
+   - `stop_failure` -- abandon the task
+
+### Protocol objects
+
+- `ReviewBrief` -- coordinator-authored request specifying what to review and how to judge it
+- `ReviewResult` -- reviewer output with verdict, findings, and summary
+- `ReviewFinding` -- individual finding with severity, category, location, and description
+- `FindingDismissal` -- coordinator-authored dismissal referencing specific finding IDs with a required justification
+
+### Key invariants
+
+- The orchestrator never decides whether findings are blocking; that is the coordinator's job.
+- Finding dismissal requires explicit `finding_ids` and a non-empty `justification`.
+- `ReviewResult` coherence is enforced at parse time: an `approve` verdict with blocker findings, or a `reject` verdict without blockers, is a protocol error.
+- When `review_enabled=true`, the coordinator must issue at least one `request_review` before `finalize_success` is allowed.
+
 ## Mild testing doctrine
 
 Velora prefers:

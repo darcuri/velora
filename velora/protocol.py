@@ -21,14 +21,19 @@ class ProtocolError(ValueError):
     pass
 
 
-_DECISIONS = {"execute_work_item", "finalize_success", "stop_failure"}
-_SPECIALIST_ROLES = {"implementer", "docs", "refactor", "investigator"}
+_DECISIONS = {"execute_work_item", "request_review", "dismiss_finding", "finalize_success", "stop_failure"}
+_SPECIALIST_ROLES = {"implementer", "docs", "refactor", "investigator", "reviewer"}
 _WORK_ITEM_KINDS = {"implement", "repair", "refactor", "docs", "test_only", "investigate"}
 _ACCEPTANCE_GATES = {"tests", "lint", "security", "ci", "docs"}
 _WORK_RESULT_STATUS = {"completed", "blocked", "failed"}
 _WORK_RESULT_TEST_STATUS = {"pass", "fail", "not_run"}
-_ALLOWED_RUNNERS = {"codex", "claude"}  # Gemini is review-only; never a code-writing WorkItem runner.
+_ALLOWED_RUNNERS = {"codex", "claude", "gemini"}  # Gemini is valid for reviewer role; specialist matrix prevents it for code-writing roles.
 _ALLOWED_MAX_DIFF_LINES = {50, 100, 200, 400}
+_REVIEWER_BACKENDS = {"gemini", "claude"}
+_REVIEW_SCOPE_KINDS = {"full_diff", "files"}
+_REVIEW_VERDICTS = {"approve", "reject"}
+_FINDING_SEVERITIES = {"blocker", "nit"}
+_FINDING_CATEGORIES = {"correctness", "security", "regression", "style", "docs"}
 
 
 def _expect_dict(value: object, *, ctx: str) -> dict[str, Any]:
@@ -168,6 +173,182 @@ class WorkItemCommit:
 
 
 @dataclass(frozen=True)
+class ReviewScope:
+    kind: str
+    base_ref: str
+    head_sha: str
+    files: list[str]
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "review_scope") -> ReviewScope:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(obj, ctx=ctx, allowed_keys={"kind", "base_ref", "head_sha", "files"})
+
+        kind = _expect_enum(obj.get("kind"), ctx=f"{ctx}.kind", allowed=_REVIEW_SCOPE_KINDS)
+        base_ref = _expect_str(obj.get("base_ref"), ctx=f"{ctx}.base_ref")
+        head_sha = _expect_str(obj.get("head_sha"), ctx=f"{ctx}.head_sha")
+
+        files_raw = _expect_list(obj.get("files"), ctx=f"{ctx}.files")
+        files = [_expect_str(x, ctx=f"{ctx}.files[]") for x in files_raw]
+
+        return ReviewScope(kind=kind, base_ref=base_ref, head_sha=head_sha, files=files)
+
+
+@dataclass(frozen=True)
+class ReviewBrief:
+    id: str
+    reviewer: str
+    model: str | None
+    objective: str
+    acceptance_criteria: list[str]
+    rejection_criteria: list[str]
+    areas_of_concern: list[str]
+    scope: ReviewScope
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "ReviewBrief") -> ReviewBrief:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(
+            obj,
+            ctx=ctx,
+            allowed_keys={
+                "id",
+                "reviewer",
+                "model",
+                "objective",
+                "acceptance_criteria",
+                "rejection_criteria",
+                "areas_of_concern",
+                "scope",
+            },
+        )
+
+        bid = _expect_str(obj.get("id"), ctx=f"{ctx}.id")
+        reviewer = _expect_enum(obj.get("reviewer"), ctx=f"{ctx}.reviewer", allowed=_REVIEWER_BACKENDS)
+        model = obj.get("model")
+        if model is not None:
+            model = _expect_str(model, ctx=f"{ctx}.model")
+        objective = _expect_str(obj.get("objective"), ctx=f"{ctx}.objective")
+
+        acceptance_raw = _expect_list(obj.get("acceptance_criteria"), ctx=f"{ctx}.acceptance_criteria")
+        acceptance_criteria = [_expect_str(x, ctx=f"{ctx}.acceptance_criteria[]") for x in acceptance_raw]
+
+        rejection_raw = _expect_list(obj.get("rejection_criteria"), ctx=f"{ctx}.rejection_criteria")
+        rejection_criteria = [_expect_str(x, ctx=f"{ctx}.rejection_criteria[]") for x in rejection_raw]
+
+        areas_raw = _expect_list(obj.get("areas_of_concern"), ctx=f"{ctx}.areas_of_concern")
+        areas_of_concern = [_expect_str(x, ctx=f"{ctx}.areas_of_concern[]") for x in areas_raw]
+
+        scope = ReviewScope.from_dict(obj.get("scope"), ctx=f"{ctx}.scope")
+
+        return ReviewBrief(
+            id=bid,
+            reviewer=reviewer,
+            model=model,
+            objective=objective,
+            acceptance_criteria=acceptance_criteria,
+            rejection_criteria=rejection_criteria,
+            areas_of_concern=areas_of_concern,
+            scope=scope,
+        )
+
+
+@dataclass(frozen=True)
+class ReviewFinding:
+    id: str
+    severity: str
+    category: str
+    location: str
+    description: str
+    criterion_id: int | None
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "ReviewFinding") -> ReviewFinding:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(
+            obj,
+            ctx=ctx,
+            allowed_keys={"id", "severity", "category", "location", "description", "criterion_id"},
+        )
+
+        fid = _expect_str(obj.get("id"), ctx=f"{ctx}.id")
+        severity = _expect_enum(obj.get("severity"), ctx=f"{ctx}.severity", allowed=_FINDING_SEVERITIES)
+        category = _expect_enum(obj.get("category"), ctx=f"{ctx}.category", allowed=_FINDING_CATEGORIES)
+        location = _expect_str(obj.get("location"), ctx=f"{ctx}.location", non_empty=False)
+        description = _expect_str(obj.get("description"), ctx=f"{ctx}.description")
+        criterion_id = obj.get("criterion_id")
+        if criterion_id is not None:
+            criterion_id = _expect_int(criterion_id, ctx=f"{ctx}.criterion_id")
+
+        return ReviewFinding(
+            id=fid,
+            severity=severity,
+            category=category,
+            location=location,
+            description=description,
+            criterion_id=criterion_id,
+        )
+
+
+@dataclass(frozen=True)
+class ReviewResult:
+    review_brief_id: str
+    verdict: str
+    findings: list[ReviewFinding]
+    summary: str
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "ReviewResult") -> ReviewResult:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(
+            obj,
+            ctx=ctx,
+            allowed_keys={"review_brief_id", "verdict", "findings", "summary"},
+        )
+
+        review_brief_id = _expect_str(obj.get("review_brief_id"), ctx=f"{ctx}.review_brief_id")
+        verdict = _expect_enum(obj.get("verdict"), ctx=f"{ctx}.verdict", allowed=_REVIEW_VERDICTS)
+        summary = _expect_str(obj.get("summary"), ctx=f"{ctx}.summary")
+
+        findings_raw = _expect_list(obj.get("findings"), ctx=f"{ctx}.findings")
+        findings = [ReviewFinding.from_dict(x, ctx=f"{ctx}.findings[]") for x in findings_raw]
+
+        # Coherence checks.
+        has_blocker = any(f.severity == "blocker" for f in findings)
+        if verdict == "approve" and has_blocker:
+            raise ProtocolError(f"{ctx}: verdict=approve is not allowed with blocker-severity findings")
+        if verdict == "reject" and not has_blocker:
+            raise ProtocolError(f"{ctx}: verdict=reject requires at least one blocker-severity finding")
+
+        return ReviewResult(
+            review_brief_id=review_brief_id,
+            verdict=verdict,
+            findings=findings,
+            summary=summary,
+        )
+
+
+@dataclass(frozen=True)
+class FindingDismissal:
+    finding_ids: list[str]
+    justification: str
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "FindingDismissal") -> FindingDismissal:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(obj, ctx=ctx, allowed_keys={"finding_ids", "justification"})
+
+        finding_ids_raw = _expect_list(obj.get("finding_ids"), ctx=f"{ctx}.finding_ids")
+        finding_ids = [_expect_str(x, ctx=f"{ctx}.finding_ids[]") for x in finding_ids_raw]
+        if not finding_ids:
+            raise ProtocolError(f"{ctx}.finding_ids must contain at least one finding ID")
+
+        justification = _expect_str(obj.get("justification"), ctx=f"{ctx}.justification")
+
+        return FindingDismissal(finding_ids=finding_ids, justification=justification)
+
+
+@dataclass(frozen=True)
 class WorkItemScopeHints:
     likely_files: list[str]
     search_terms: list[str]
@@ -252,11 +433,25 @@ class CoordinatorResponse:
     reason: str
     selected_specialist: SelectedSpecialist
     work_item: WorkItem | None = None
+    review_brief: ReviewBrief | None = None
+    finding_dismissal: FindingDismissal | None = None
 
     @staticmethod
     def from_dict(raw: object, *, ctx: str = "CoordinatorResponse") -> CoordinatorResponse:
         obj = _expect_dict(raw, ctx=ctx)
-        _no_extra_keys(obj, ctx=ctx, allowed_keys={"protocol_version", "decision", "reason", "selected_specialist", "work_item"})
+        _no_extra_keys(
+            obj,
+            ctx=ctx,
+            allowed_keys={
+                "protocol_version",
+                "decision",
+                "reason",
+                "selected_specialist",
+                "work_item",
+                "review_brief",
+                "finding_dismissal",
+            },
+        )
 
         protocol_version = _expect_int(obj.get("protocol_version"), ctx=f"{ctx}.protocol_version")
         if protocol_version != 1:
@@ -267,15 +462,45 @@ class CoordinatorResponse:
 
         selected_specialist = SelectedSpecialist.from_dict(obj.get("selected_specialist"), ctx=f"{ctx}.selected_specialist")
 
-        work_item_raw = obj.get("work_item")
-        if decision == "execute_work_item":
-            if work_item_raw is None:
-                raise ProtocolError(f"{ctx}.work_item is required when decision=execute_work_item")
-            work_item = WorkItem.from_dict(work_item_raw, ctx=f"{ctx}.work_item")
-        else:
-            if work_item_raw is not None:
-                raise ProtocolError(f"{ctx}.work_item must be omitted when decision={decision}")
-            work_item = None
+        # Decision → required-payload mapping.  Each decision requires exactly one
+        # payload field (or none for terminal decisions).  All non-matched payload
+        # fields must be absent.
+        _DECISION_PAYLOAD = {
+            "execute_work_item": "work_item",
+            "request_review": "review_brief",
+            "dismiss_finding": "finding_dismissal",
+        }
+        _PAYLOAD_FIELDS = {"work_item", "review_brief", "finding_dismissal"}
+
+        required_field = _DECISION_PAYLOAD.get(decision)
+
+        # Parse the payload field that matches this decision (if any).
+        work_item: WorkItem | None = None
+        review_brief: ReviewBrief | None = None
+        finding_dismissal: FindingDismissal | None = None
+
+        if required_field == "work_item":
+            raw_val = obj.get("work_item")
+            if raw_val is None:
+                raise ProtocolError(f"{ctx}.work_item is required when decision={decision}")
+            work_item = WorkItem.from_dict(raw_val, ctx=f"{ctx}.work_item")
+        elif required_field == "review_brief":
+            raw_val = obj.get("review_brief")
+            if raw_val is None:
+                raise ProtocolError(f"{ctx}.review_brief is required when decision={decision}")
+            review_brief = ReviewBrief.from_dict(raw_val, ctx=f"{ctx}.review_brief")
+        elif required_field == "finding_dismissal":
+            raw_val = obj.get("finding_dismissal")
+            if raw_val is None:
+                raise ProtocolError(f"{ctx}.finding_dismissal is required when decision={decision}")
+            finding_dismissal = FindingDismissal.from_dict(raw_val, ctx=f"{ctx}.finding_dismissal")
+
+        # Reject payload fields that do not belong to this decision.
+        for field in _PAYLOAD_FIELDS:
+            if field == required_field:
+                continue
+            if obj.get(field) is not None:
+                raise ProtocolError(f"{ctx}.{field} must be omitted when decision={decision}")
 
         return CoordinatorResponse(
             protocol_version=protocol_version,
@@ -283,6 +508,8 @@ class CoordinatorResponse:
             reason=reason,
             selected_specialist=selected_specialist,
             work_item=work_item,
+            review_brief=review_brief,
+            finding_dismissal=finding_dismissal,
         )
 
 
@@ -407,6 +634,24 @@ def validate_work_result(payload: object) -> WorkResult:
     """Validate and parse a worker work-result payload."""
 
     return WorkResult.from_dict(payload)
+
+
+def validate_review_brief(payload: object) -> ReviewBrief:
+    """Validate and parse a review brief payload."""
+
+    return ReviewBrief.from_dict(payload)
+
+
+def validate_review_result(payload: object) -> ReviewResult:
+    """Validate and parse a review result payload."""
+
+    return ReviewResult.from_dict(payload)
+
+
+def validate_finding_dismissal(payload: object) -> FindingDismissal:
+    """Validate and parse a finding dismissal payload."""
+
+    return FindingDismissal.from_dict(payload)
 
 
 def enforce_specialist_matrix(resp: CoordinatorResponse, matrix: object) -> None:

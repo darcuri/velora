@@ -1,6 +1,12 @@
 import unittest
 
-from velora.protocol import ProtocolError, validate_coordinator_response
+from velora.protocol import (
+    ProtocolError,
+    validate_coordinator_response,
+    validate_finding_dismissal,
+    validate_review_brief,
+    validate_review_result,
+)
 
 
 def _valid_execute_payload() -> dict:
@@ -90,17 +96,311 @@ class TestProtocol(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             validate_coordinator_response(payload)
 
-    def test_gemini_runner_is_rejected(self) -> None:
+    def test_gemini_runner_is_accepted_at_protocol_level(self) -> None:
+        """Gemini is now a valid protocol-level runner (for reviewer role).
+
+        Specialist matrix enforcement (policy layer) restricts it from
+        code-writing roles; that is tested in test_specialist_matrix.py.
+        """
         payload = _valid_execute_payload()
         payload["selected_specialist"]["runner"] = "gemini"
-        with self.assertRaises(ProtocolError):
-            validate_coordinator_response(payload)
+        resp = validate_coordinator_response(payload)
+        self.assertEqual(resp.selected_specialist.runner, "gemini")
 
     def test_unknown_keys_are_rejected(self) -> None:
         payload = _valid_execute_payload()
         payload["extra"] = 123
         with self.assertRaises(ProtocolError):
             validate_coordinator_response(payload)
+
+
+def _valid_finding_dismissal_payload() -> dict:
+    return {
+        "finding_ids": ["RF-001"],
+        "justification": "False positive confirmed by manual inspection.",
+    }
+
+
+class TestExpandedCoordinatorDecisions(unittest.TestCase):
+    """Tests for the request_review and dismiss_finding coordinator decisions."""
+
+    def _base(self, decision: str, **extras: object) -> dict:
+        return {
+            "protocol_version": 1,
+            "decision": decision,
+            "reason": "Coordinator reason.",
+            "selected_specialist": {"role": "reviewer", "runner": "gemini"},
+            **extras,
+        }
+
+    def test_request_review_valid(self) -> None:
+        payload = self._base("request_review", review_brief=_valid_review_brief_payload())
+        resp = validate_coordinator_response(payload)
+        self.assertEqual(resp.decision, "request_review")
+        self.assertIsNotNone(resp.review_brief)
+        assert resp.review_brief is not None
+        self.assertEqual(resp.review_brief.id, "RB-0001")
+        self.assertIsNone(resp.work_item)
+        self.assertIsNone(resp.finding_dismissal)
+
+    def test_request_review_missing_brief_is_protocol_error(self) -> None:
+        payload = self._base("request_review")
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_request_review_with_work_item_is_protocol_error(self) -> None:
+        payload = self._base("request_review", review_brief=_valid_review_brief_payload())
+        payload["work_item"] = _valid_execute_payload()["work_item"]
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_dismiss_finding_valid(self) -> None:
+        payload = self._base("dismiss_finding", finding_dismissal=_valid_finding_dismissal_payload())
+        resp = validate_coordinator_response(payload)
+        self.assertEqual(resp.decision, "dismiss_finding")
+        self.assertIsNotNone(resp.finding_dismissal)
+        assert resp.finding_dismissal is not None
+        self.assertEqual(resp.finding_dismissal.finding_ids, ["RF-001"])
+        self.assertIsNone(resp.work_item)
+        self.assertIsNone(resp.review_brief)
+
+    def test_dismiss_finding_missing_dismissal_is_protocol_error(self) -> None:
+        payload = self._base("dismiss_finding")
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_execute_work_item_with_review_brief_is_protocol_error(self) -> None:
+        payload = _valid_execute_payload()
+        payload["review_brief"] = _valid_review_brief_payload()
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_finalize_with_review_brief_is_protocol_error(self) -> None:
+        payload = {
+            "protocol_version": 1,
+            "decision": "finalize_success",
+            "reason": "Done.",
+            "selected_specialist": {"role": "investigator", "runner": "claude"},
+            "review_brief": _valid_review_brief_payload(),
+        }
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_reviewer_role_accepted(self) -> None:
+        payload = {
+            "protocol_version": 1,
+            "decision": "finalize_success",
+            "reason": "Done.",
+            "selected_specialist": {"role": "reviewer", "runner": "gemini"},
+        }
+        resp = validate_coordinator_response(payload)
+        self.assertEqual(resp.selected_specialist.role, "reviewer")
+        self.assertEqual(resp.selected_specialist.runner, "gemini")
+
+
+def _valid_review_brief_payload() -> dict:
+    return {
+        "id": "RB-0001",
+        "reviewer": "gemini",
+        "model": None,
+        "objective": "Verify correctness of footer parsing changes",
+        "acceptance_criteria": ["All tests pass", "No regressions"],
+        "rejection_criteria": ["New security issues"],
+        "areas_of_concern": ["Error handling"],
+        "scope": {
+            "kind": "full_diff",
+            "base_ref": "main",
+            "head_sha": "abc123",
+            "files": [],
+        },
+    }
+
+
+class TestReviewBriefProtocol(unittest.TestCase):
+    def test_valid_brief(self) -> None:
+        brief = validate_review_brief(_valid_review_brief_payload())
+        self.assertEqual(brief.id, "RB-0001")
+        self.assertEqual(brief.reviewer, "gemini")
+        self.assertIsNone(brief.model)
+        self.assertEqual(brief.objective, "Verify correctness of footer parsing changes")
+        self.assertEqual(brief.scope.kind, "full_diff")
+        self.assertEqual(brief.scope.base_ref, "main")
+        self.assertEqual(brief.scope.head_sha, "abc123")
+        self.assertEqual(brief.scope.files, [])
+
+    def test_model_override(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["model"] = "gemini-2.5-pro"
+        brief = validate_review_brief(payload)
+        self.assertEqual(brief.model, "gemini-2.5-pro")
+
+    def test_files_scope(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["scope"]["kind"] = "files"
+        payload["scope"]["files"] = ["velora/protocol.py", "tests/test_protocol.py"]
+        brief = validate_review_brief(payload)
+        self.assertEqual(brief.scope.kind, "files")
+        self.assertEqual(brief.scope.files, ["velora/protocol.py", "tests/test_protocol.py"])
+
+    def test_invalid_reviewer(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["reviewer"] = "codex"
+        with self.assertRaises(ProtocolError):
+            validate_review_brief(payload)
+
+    def test_invalid_scope_kind(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["scope"]["kind"] = "partial"
+        with self.assertRaises(ProtocolError):
+            validate_review_brief(payload)
+
+    def test_missing_objective(self) -> None:
+        payload = _valid_review_brief_payload()
+        del payload["objective"]
+        with self.assertRaises(ProtocolError):
+            validate_review_brief(payload)
+
+    def test_unknown_keys_on_brief(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["extra"] = "nope"
+        with self.assertRaises(ProtocolError):
+            validate_review_brief(payload)
+
+    def test_unknown_keys_on_scope(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["scope"]["extra"] = "nope"
+        with self.assertRaises(ProtocolError):
+            validate_review_brief(payload)
+
+    def test_empty_acceptance_criteria_allowed(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["acceptance_criteria"] = []
+        brief = validate_review_brief(payload)
+        self.assertEqual(brief.acceptance_criteria, [])
+
+
+def _valid_review_finding(*, severity: str = "blocker", **overrides: object) -> dict:
+    base: dict = {
+        "id": "RF-001",
+        "severity": severity,
+        "category": "correctness",
+        "location": "velora/protocol.py:42",
+        "description": "Missing validation for edge case",
+        "criterion_id": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+def _valid_review_result_payload(*, verdict: str = "reject", findings: list[dict] | None = None) -> dict:
+    if findings is None:
+        if verdict == "reject":
+            findings = [_valid_review_finding(severity="blocker")]
+        else:
+            findings = []
+    return {
+        "review_brief_id": "RB-0001",
+        "verdict": verdict,
+        "findings": findings,
+        "summary": "Review complete.",
+    }
+
+
+class TestReviewResultProtocol(unittest.TestCase):
+    def test_valid_reject_result(self) -> None:
+        result = validate_review_result(_valid_review_result_payload(verdict="reject"))
+        self.assertEqual(result.review_brief_id, "RB-0001")
+        self.assertEqual(result.verdict, "reject")
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(result.findings[0].severity, "blocker")
+        self.assertEqual(result.summary, "Review complete.")
+
+    def test_valid_approve_result(self) -> None:
+        result = validate_review_result(_valid_review_result_payload(verdict="approve", findings=[]))
+        self.assertEqual(result.verdict, "approve")
+        self.assertEqual(result.findings, [])
+
+    def test_approve_with_nits_allowed(self) -> None:
+        nit = _valid_review_finding(severity="nit")
+        result = validate_review_result(_valid_review_result_payload(verdict="approve", findings=[nit]))
+        self.assertEqual(result.verdict, "approve")
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(result.findings[0].severity, "nit")
+
+    def test_approve_with_blocker_is_error(self) -> None:
+        blocker = _valid_review_finding(severity="blocker")
+        with self.assertRaises(ProtocolError):
+            validate_review_result(_valid_review_result_payload(verdict="approve", findings=[blocker]))
+
+    def test_reject_without_blocker_is_error(self) -> None:
+        nit = _valid_review_finding(severity="nit")
+        with self.assertRaises(ProtocolError):
+            validate_review_result(_valid_review_result_payload(verdict="reject", findings=[nit]))
+
+    def test_invalid_verdict(self) -> None:
+        payload = _valid_review_result_payload()
+        payload["verdict"] = "maybe"
+        with self.assertRaises(ProtocolError):
+            validate_review_result(payload)
+
+    def test_invalid_severity(self) -> None:
+        bad_finding = _valid_review_finding(severity="critical")
+        bad_finding["severity"] = "critical"
+        with self.assertRaises(ProtocolError):
+            validate_review_result(_valid_review_result_payload(verdict="reject", findings=[bad_finding]))
+
+    def test_invalid_category(self) -> None:
+        bad_finding = _valid_review_finding()
+        bad_finding["category"] = "performance"
+        with self.assertRaises(ProtocolError):
+            validate_review_result(_valid_review_result_payload(verdict="reject", findings=[bad_finding]))
+
+    def test_unknown_keys_in_finding(self) -> None:
+        bad_finding = _valid_review_finding()
+        bad_finding["extra"] = "nope"
+        with self.assertRaises(ProtocolError):
+            validate_review_result(_valid_review_result_payload(verdict="reject", findings=[bad_finding]))
+
+    def test_unknown_keys_in_result(self) -> None:
+        payload = _valid_review_result_payload()
+        payload["extra"] = "nope"
+        with self.assertRaises(ProtocolError):
+            validate_review_result(payload)
+
+    def test_finding_with_no_criterion_id(self) -> None:
+        finding = _valid_review_finding()
+        finding["criterion_id"] = None
+        result = validate_review_result(_valid_review_result_payload(verdict="reject", findings=[finding]))
+        self.assertIsNone(result.findings[0].criterion_id)
+
+    def test_finding_with_empty_location(self) -> None:
+        finding = _valid_review_finding()
+        finding["location"] = ""
+        result = validate_review_result(_valid_review_result_payload(verdict="reject", findings=[finding]))
+        self.assertEqual(result.findings[0].location, "")
+
+
+class TestFindingDismissalProtocol(unittest.TestCase):
+    def test_valid_dismissal(self) -> None:
+        payload = {"finding_ids": ["RF-001", "RF-002"], "justification": "False positives after manual review."}
+        dismissal = validate_finding_dismissal(payload)
+        self.assertEqual(dismissal.finding_ids, ["RF-001", "RF-002"])
+        self.assertEqual(dismissal.justification, "False positives after manual review.")
+
+    def test_empty_finding_ids_is_error(self) -> None:
+        payload = {"finding_ids": [], "justification": "Some reason."}
+        with self.assertRaises(ProtocolError):
+            validate_finding_dismissal(payload)
+
+    def test_empty_justification_is_error(self) -> None:
+        payload = {"finding_ids": ["RF-001"], "justification": ""}
+        with self.assertRaises(ProtocolError):
+            validate_finding_dismissal(payload)
+
+    def test_unknown_keys_rejected(self) -> None:
+        payload = {"finding_ids": ["RF-001"], "justification": "Reason.", "extra": "nope"}
+        with self.assertRaises(ProtocolError):
+            validate_finding_dismissal(payload)
 
 
 if __name__ == "__main__":

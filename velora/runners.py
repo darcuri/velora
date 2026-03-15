@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .acpx import CmdResult, _ensure_anthropic_auth, get_vault_key, run_claude, run_cmd, run_codex
+from .acpx import CmdResult, _ensure_anthropic_auth, get_vault_key, run_claude, run_cmd, run_codex, run_local_llm
 from .coordinator import (
     CoordinatorRunResult,
     render_coordinator_prompt_v1,
@@ -24,8 +24,8 @@ from .coordinator import (
 from .run_memory import coordinator_replay_paths
 
 
-SUPPORTED_COORDINATOR_BACKENDS = {"acp-claude", "acp-codex", "direct-claude"}
-SUPPORTED_WORKER_BACKENDS = {"acp-claude", "acp-codex", "direct-claude", "direct-codex"}
+SUPPORTED_COORDINATOR_BACKENDS = {"acp-claude", "acp-codex", "direct-claude", "direct-local"}
+SUPPORTED_WORKER_BACKENDS = {"acp-claude", "acp-codex", "direct-claude", "direct-codex", "direct-local"}
 
 
 def normalize_coordinator_backend(*, backend: str | None = None, runner: str = "claude") -> str:
@@ -123,8 +123,18 @@ def run_coordinator(
         )
     if backend_key == "direct-claude":
         return _run_direct_claude_coordinator(cwd=cwd, request=request)
+    if backend_key == "direct-local":
+        return _run_direct_local_coordinator(cwd=cwd, request=request)
 
     raise AssertionError(f"unreachable coordinator backend: {backend_key}")
+
+
+def _run_direct_local_coordinator(*, cwd: Path, request: dict[str, Any]) -> CoordinatorRunResult:
+    replay_memory = _load_replay_memory(cwd, request)
+    replay_brief = _load_replay_brief(cwd, request)
+    prompt = render_coordinator_prompt_v1(request, replay_memory=replay_memory, brief=replay_brief)
+    result = run_local_llm(prompt, cwd=cwd)
+    return validate_coordinator_cmd_result(result=result, request=request)
 
 
 def normalize_worker_backend(*, backend: str | None = None, runner: str = "codex") -> str:
@@ -150,6 +160,10 @@ def normalize_worker_backend(*, backend: str | None = None, runner: str = "codex
     if key not in SUPPORTED_WORKER_BACKENDS:
         allowed = ", ".join(sorted(SUPPORTED_WORKER_BACKENDS))
         raise ValueError(f"unsupported worker backend: {key} (expected one of: {allowed})")
+
+    # direct-local is runner-agnostic — skip runner-matching check.
+    if key == "direct-local":
+        return key
 
     backend_runner = key.removeprefix("acp-").removeprefix("direct-")
     if backend_runner not in {"claude", "codex"}:
@@ -218,5 +232,7 @@ def run_worker(
         return _run_direct_claude_worker(cwd=cwd, prompt=prompt)
     if backend_key == "direct-codex":
         return _run_direct_codex_worker(cwd=cwd, prompt=prompt)
+    if backend_key == "direct-local":
+        return run_local_llm(prompt, cwd=cwd)
 
     raise AssertionError(f"unreachable worker backend: {backend_key}")

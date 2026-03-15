@@ -94,6 +94,8 @@ velora audit inspect
 velora audit inspect --run 20260309041214-fa55112b
 ```
 
+When the structured review protocol is active, audit output will include `review_requested` and `finding_dismissed` events where present.
+
 ## Useful environment variables (v0)
 
 Velora also supports a JSON config file; see [Configuration](./config.md).

@@ -421,6 +421,52 @@ def _gemini_generate_content(
         raise RuntimeError(f"Gemini API response missing expected text field: {payload}") from exc
 
 
+def run_local_llm(prompt: str, *, cwd: Path | None = None) -> CmdResult:
+    """Call a local OpenAI-compatible LLM endpoint (e.g., LM Studio).
+
+    Defaults to http://localhost:1234/v1/chat/completions.
+    Override with VELORA_LOCAL_BASE_URL and VELORA_LOCAL_MODEL.
+    """
+
+    base_url = os.environ.get("VELORA_LOCAL_BASE_URL", "http://localhost:1234").rstrip("/")
+    model = os.environ.get("VELORA_LOCAL_MODEL", "")
+    timeout_s = int(os.environ.get("VELORA_LOCAL_TIMEOUT", "600"))
+
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+    }
+    if model:
+        body["model"] = model
+
+    url = f"{base_url}/v1/chat/completions"
+    req = urllib.request.Request(
+        url=url,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(body).encode("utf-8"),
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310 (controlled URL from env/config)
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM HTTP {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM connection failed: {exc.reason}")
+    except TimeoutError:
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM timed out after {timeout_s}s")
+
+    try:
+        payload = json.loads(raw)
+        text = payload["choices"][0]["message"]["content"]
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM response parse error: {exc}")
+
+    return CmdResult(returncode=0, stdout=text, stderr="")
+
+
 def _strip_bullet_prefix(line: str) -> str:
     s = line.strip()
     # Common markdown bullet prefixes.
@@ -531,6 +577,116 @@ def run_gemini_review(diff_text: str) -> CmdResult:
         )
 
     return CmdResult(returncode=1, stdout="", stderr=last_err or "Gemini review failed")
+
+
+def _build_structured_review_prompt(brief: Any, diff_text: str) -> str:
+    """Build a structured review prompt from a ReviewBrief and diff text.
+
+    The prompt instructs the reviewer to output JSON matching the ReviewResult schema.
+    """
+
+    sections: list[str] = []
+
+    sections.append("You are a strict code reviewer. Review the following diff against the criteria below.")
+    sections.append("")
+
+    sections.append(f"## Objective\n{brief.objective}")
+    sections.append("")
+
+    if brief.acceptance_criteria:
+        lines = "\n".join(f"  {i}. {c}" for i, c in enumerate(brief.acceptance_criteria, 1))
+        sections.append(f"## Acceptance Criteria\n{lines}")
+        sections.append("")
+
+    if brief.rejection_criteria:
+        lines = "\n".join(f"  {i}. {c}" for i, c in enumerate(brief.rejection_criteria, 1))
+        sections.append(f"## Rejection Criteria\n{lines}")
+        sections.append("")
+
+    if brief.areas_of_concern:
+        lines = "\n".join(f"  - {a}" for a in brief.areas_of_concern)
+        sections.append(f"## Areas of Concern\n{lines}")
+        sections.append("")
+
+    sections.append(
+        "## Output Format\n"
+        "Output ONLY a single JSON object (no markdown fences, no commentary) matching this schema:\n"
+        "{\n"
+        f'  "review_brief_id": "{brief.id}",\n'
+        '  "verdict": "approve" or "reject",\n'
+        '  "findings": [\n'
+        '    {\n'
+        '      "id": "RF-001",\n'
+        '      "severity": "blocker" or "nit",\n'
+        '      "category": "correctness" or "security" or "regression" or "style" or "docs",\n'
+        '      "location": "file:line or empty string",\n'
+        '      "description": "what the issue is",\n'
+        '      "criterion_id": null or integer index into acceptance/rejection criteria\n'
+        '    }\n'
+        '  ],\n'
+        '  "summary": "one-line summary"\n'
+        "}\n"
+        "\n"
+        "Rules:\n"
+        '- Use verdict "reject" ONLY if there is at least one finding with severity "blocker".\n'
+        '- Use verdict "approve" if there are no blocker findings (nits are OK).\n'
+        "- If the diff looks correct, output approve with an empty findings list.\n"
+        "- Do not speculate beyond the diff."
+    )
+    sections.append("")
+
+    sections.append(f"## Diff\n{diff_text}")
+
+    return "\n".join(sections)
+
+
+def run_structured_review(brief: Any, diff_text: str) -> CmdResult:
+    """Dispatch a structured review using a ReviewBrief.
+
+    Builds a prompt from the brief's fields, dispatches to the appropriate
+    reviewer backend (Gemini or Claude), and returns a CmdResult with the
+    raw reviewer output in stdout.
+
+    The caller is responsible for parsing the JSON output into a ReviewResult.
+    """
+
+    from .protocol import ReviewBrief as _ReviewBrief  # noqa: F811 — runtime type check only
+
+    if not isinstance(brief, _ReviewBrief):
+        raise TypeError(f"brief must be a ReviewBrief, got {type(brief).__name__}")
+
+    env = os.environ.copy()
+
+    max_diff_chars = int(env.get("VELORA_GEMINI_MAX_DIFF_CHARS", "120000"))
+    diff_trimmed = diff_text
+    if len(diff_trimmed) > max_diff_chars:
+        diff_trimmed = diff_trimmed[:max_diff_chars] + "\n\n[diff truncated]\n"
+
+    prompt = _build_structured_review_prompt(brief, diff_trimmed)
+
+    if brief.reviewer == "gemini":
+        api_key = get_vault_key("GEMINI_API_KEY", env=env)
+        model = brief.model or env.get("VELORA_GEMINI_MODEL", "gemini-3-flash-preview")
+        max_output_tokens = int(env.get("VELORA_GEMINI_MAX_OUTPUT_TOKENS", "2048"))
+
+        try:
+            text = _gemini_generate_content(
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                max_output_tokens=max_output_tokens,
+            ).strip()
+            return CmdResult(returncode=0, stdout=text + "\n", stderr="")
+        except Exception as exc:  # noqa: BLE001
+            return CmdResult(returncode=1, stdout="", stderr=f"Structured review failed (gemini): {exc}")
+
+    elif brief.reviewer == "claude":
+        session_name = f"velora-review-{brief.id}"
+        cwd = Path.cwd()
+        return run_claude(session_name=session_name, cwd=cwd, prompt=prompt)
+
+    else:
+        return CmdResult(returncode=1, stdout="", stderr=f"Unsupported reviewer backend: {brief.reviewer}")
 
 
 def _read_file(path: Path) -> str:

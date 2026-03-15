@@ -206,5 +206,44 @@ class TestRunners(unittest.TestCase):
         )
 
 
+class TestLocalBackend(unittest.TestCase):
+    def test_normalize_coordinator_backend_accepts_direct_local(self) -> None:
+        self.assertEqual(normalize_coordinator_backend(backend="direct-local"), "direct-local")
+
+    def test_normalize_worker_backend_accepts_direct_local(self) -> None:
+        self.assertEqual(normalize_worker_backend(backend="direct-local", runner="codex"), "direct-local")
+        self.assertEqual(normalize_worker_backend(backend="direct-local", runner="claude"), "direct-local")
+
+    def test_run_local_llm_parses_openai_response(self) -> None:
+        from velora.acpx import run_local_llm
+        import json
+
+        fake_response = json.dumps({
+            "choices": [{"message": {"content": "hello world"}}],
+        }).encode("utf-8")
+
+        with patch("velora.acpx.urllib.request.urlopen") as mock_urlopen:
+            from unittest.mock import MagicMock
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = fake_response
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = lambda s, *a: None
+            mock_urlopen.return_value = mock_resp
+            result = run_local_llm("test prompt")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "hello world")
+
+    def test_run_local_llm_returns_error_on_connection_failure(self) -> None:
+        from velora.acpx import run_local_llm
+        import urllib.error
+
+        with patch("velora.acpx.urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+            result = run_local_llm("test prompt")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("connection failed", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
