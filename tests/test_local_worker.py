@@ -93,14 +93,18 @@ class TestAssembleWorkResult(unittest.TestCase):
         self.assertIn("TESTS_EXHAUSTED", validated.blockers)
 
 
-def _make_work_item(*, gates: list[str] | None = None) -> WorkItem:
+def _make_work_item(
+    *,
+    gates: list[str] | None = None,
+    likely_files: list[str] | None = None,
+) -> WorkItem:
     return WorkItem.from_dict({
         "id": "WI-001",
         "kind": "implement",
         "rationale": "Add the foo feature",
         "instructions": ["Create foo.py", "Add a foo() function that returns 42"],
         "scope_hints": {
-            "likely_files": ["src/foo.py", "tests/test_foo.py"],
+            "likely_files": likely_files if likely_files is not None else ["src/foo.py", "tests/test_foo.py"],
             "search_terms": ["foo"],
         },
         "acceptance": {
@@ -351,6 +355,117 @@ class TestEndgame(unittest.TestCase):
         self.assertTrue(outcome.success)
         self.assertTrue(outcome.head_sha)  # should have a commit SHA
         self.assertIn("src/main.py", outcome.files_touched)
+
+
+class TestRunLocalWorker(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.repo = Path(self.tmp)
+        _init_git_repo(self.repo)
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "main.py").write_text("x = 1\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], capture_output=True, check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-m", "add src"], capture_output=True, check=True)
+        self.exchange_dir = Path(tempfile.mkdtemp())
+
+    def test_blocked_outcome_writes_block_json(self):
+        from velora.local_worker import run_local_worker
+        responses = [
+            CmdResult(0, '{"action": "work_blocked", "params": {"reason": "SCOPE_INSUFFICIENT", "blockers": ["need config"]}}', ""),
+        ]
+        wi = _make_work_item()
+        with patch("velora.local_worker._call_local_llm_chat", side_effect=responses):
+            cmd_result = run_local_worker(
+                work_item=wi,
+                repo_root=self.repo,
+                work_branch="velora/wi-001",
+                exchange_dir=self.exchange_dir,
+                repo_ref="owner/repo",
+                run_id="run-001",
+                verb="fix",
+                objective="fix the thing",
+                iteration=1,
+            )
+        self.assertEqual(cmd_result.returncode, 0)
+        block_file = self.exchange_dir / "block.json"
+        self.assertTrue(block_file.exists())
+        payload = json.loads(block_file.read_text())
+        self.assertEqual(payload["status"], "blocked")
+        self.assertIn("SCOPE_INSUFFICIENT", payload["blockers"])
+
+    def test_success_outcome_writes_result_json(self):
+        from velora.local_worker import run_local_worker
+        responses = [
+            CmdResult(0, '{"action": "patch_file", "params": {"path": "src/main.py", "old": "x = 1", "new": "x = 2"}}', ""),
+            CmdResult(0, '{"action": "work_complete", "params": {"summary": "changed x to 2"}}', ""),
+        ]
+        wi = _make_work_item(gates=[], likely_files=["src/main.py"])
+        with patch("velora.local_worker._call_local_llm_chat", side_effect=responses):
+            cmd_result = run_local_worker(
+                work_item=wi,
+                repo_root=self.repo,
+                work_branch="velora/wi-001",
+                exchange_dir=self.exchange_dir,
+                repo_ref="owner/repo",
+                run_id="run-001",
+                verb="fix",
+                objective="fix the thing",
+                iteration=1,
+            )
+        self.assertEqual(cmd_result.returncode, 0)
+        result_file = self.exchange_dir / "result.json"
+        self.assertTrue(result_file.exists())
+        payload = json.loads(result_file.read_text())
+        self.assertEqual(payload["status"], "completed")
+        self.assertIn("src/main.py", payload["files_touched"])
+
+    def test_dirty_tree_writes_block_json(self):
+        from velora.local_worker import run_local_worker
+        # Make the tree dirty
+        (self.repo / "src" / "main.py").write_text("x = dirty\n")
+        wi = _make_work_item(gates=[])
+        cmd_result = run_local_worker(
+            work_item=wi,
+            repo_root=self.repo,
+            work_branch="velora/wi-001",
+            exchange_dir=self.exchange_dir,
+            repo_ref="owner/repo",
+            run_id="run-001",
+            verb="fix",
+            objective="fix the thing",
+            iteration=1,
+        )
+        self.assertEqual(cmd_result.returncode, 0)
+        block_file = self.exchange_dir / "block.json"
+        self.assertTrue(block_file.exists())
+        payload = json.loads(block_file.read_text())
+        self.assertIn("COMMIT_FAILED", payload["blockers"])
+
+    def test_no_changes_writes_block_json(self):
+        from velora.local_worker import run_local_worker
+        # Worker completes without making changes
+        responses = [
+            CmdResult(0, '{"action": "work_complete", "params": {"summary": "nothing to do"}}', ""),
+        ]
+        wi = _make_work_item(gates=[])
+        with patch("velora.local_worker._call_local_llm_chat", side_effect=responses):
+            cmd_result = run_local_worker(
+                work_item=wi,
+                repo_root=self.repo,
+                work_branch="velora/wi-001",
+                exchange_dir=self.exchange_dir,
+                repo_ref="owner/repo",
+                run_id="run-001",
+                verb="fix",
+                objective="fix the thing",
+                iteration=1,
+            )
+        self.assertEqual(cmd_result.returncode, 0)
+        block_file = self.exchange_dir / "block.json"
+        self.assertTrue(block_file.exists())
+        payload = json.loads(block_file.read_text())
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("NO_CHANGES", payload["blockers"])
 
 
 if __name__ == "__main__":

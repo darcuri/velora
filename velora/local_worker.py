@@ -590,3 +590,190 @@ def _call_local_llm_chat(messages: list[dict[str, str]], cwd: Path) -> CmdResult
         return CmdResult(returncode=1, stdout="", stderr=f"Local LLM response parse error: {exc}")
 
     return CmdResult(returncode=0, stdout=text, stderr="")
+
+
+# -- Entry point --
+
+_TEST_RETRY_CAP = int(os.environ.get("VELORA_HARNESS_TEST_RETRY_CAP", "3"))
+
+
+def _build_scope(work_item: WorkItem, repo_root: Path, work_branch: str) -> WorkerScope:
+    likely_files = set(work_item.scope_hints.likely_files)
+    allowed_dirs: set[str] = set()
+    for f in likely_files:
+        parts = Path(f).parts
+        for i in range(len(parts) - 1):
+            allowed_dirs.add(str(Path(*parts[: i + 1])))
+    # Map gates to command strings
+    test_commands: list[str] = []
+    for gate in work_item.acceptance.gates:
+        cmd_list = GATE_COMMANDS.get(gate)
+        if cmd_list is not None:
+            test_commands.append(" ".join(cmd_list))
+    return WorkerScope(
+        repo_root=repo_root,
+        allowed_files=likely_files,
+        allowed_dirs=allowed_dirs,
+        test_commands=test_commands,
+        work_branch=work_branch,
+    )
+
+
+def _write_outcome(
+    exchange_dir: Path,
+    work_item: WorkItem,
+    outcome: HarnessOutcome,
+    *,
+    summary: str,
+    files_touched: list[str] | None = None,
+    tests_run: list[dict[str, str]] | None = None,
+) -> None:
+    """Write a blocked/failed WorkResult to the exchange dir."""
+    wr = assemble_work_result(
+        outcome=outcome,
+        work_item_id=work_item.id,
+        summary=summary,
+        branch="",
+        head_sha="",
+        files_touched=files_touched or [],
+        tests_run=tests_run or [],
+    )
+    # All non-success outcomes write to block.json -- the orchestrator checks
+    # result.json, handoff.json, and block.json and picks whichever exists.
+    filename = "block.json"
+    exchange_dir.mkdir(parents=True, exist_ok=True)
+    (exchange_dir / filename).write_text(
+        json.dumps(wr, sort_keys=True) + "\n", encoding="utf-8",
+    )
+
+
+def run_local_worker(
+    *,
+    work_item: WorkItem,
+    repo_root: Path,
+    work_branch: str,
+    exchange_dir: Path,
+    repo_ref: str,
+    run_id: str,
+    verb: str,
+    objective: str,
+    iteration: int,
+) -> CmdResult:
+    """Full local worker harness entry point.
+
+    Runs the action loop, endgame, and writes the WorkResult to exchange_dir.
+    Returns CmdResult with returncode=0 on completion (success or failure --
+    the WorkResult file carries the actual outcome).
+    """
+    scope = _build_scope(work_item, repo_root, work_branch)
+
+    # Phase 0: Pre-flight
+    status = _git(repo_root, "status", "--porcelain")
+    if status.stdout.strip():
+        # Dirty tree -- abort
+        outcome = HarnessOutcome(
+            success=False,
+            reason=HarnessReason.COMMIT_FAILED,
+            evidence=["working tree not clean at harness start"],
+        )
+        _write_outcome(exchange_dir, work_item, outcome, summary="pre-flight failed")
+        return CmdResult(returncode=0, stdout="", stderr="dirty working tree")
+
+    # Checkout work branch
+    checkout = _git(repo_root, "checkout", "-B", work_branch)
+    if checkout.returncode != 0:
+        outcome = HarnessOutcome(
+            success=False,
+            reason=HarnessReason.COMMIT_FAILED,
+            evidence=[f"branch checkout failed: {checkout.stderr}"],
+        )
+        _write_outcome(exchange_dir, work_item, outcome, summary="checkout failed")
+        return CmdResult(returncode=0, stdout="", stderr=checkout.stderr)
+
+    # Build prompt
+    prompt = build_local_worker_prompt(
+        work_item=work_item,
+        repo_ref=repo_ref,
+        work_branch=work_branch,
+        test_commands=scope.test_commands,
+    )
+
+    test_retry = 0
+    conversation: ConversationManager | None = None
+
+    while True:
+        # Phase 2: Action loop
+        loop_outcome = run_local_worker_loop(
+            scope=scope,
+            system_prompt=prompt,
+            conversation=conversation,
+        )
+
+        if not loop_outcome.success:
+            # Loop terminated with a failure -- write outcome and return
+            harness_outcome = HarnessOutcome(
+                success=False,
+                reason=loop_outcome.reason,
+                evidence=loop_outcome.evidence,
+            )
+            _write_outcome(
+                exchange_dir, work_item, harness_outcome,
+                summary=loop_outcome.llm_summary or f"loop terminated: {loop_outcome.reason.value}",
+            )
+            return CmdResult(returncode=0, stdout="", stderr="")
+
+        # Phase 3: Endgame
+        endgame = _run_endgame(
+            scope=scope,
+            work_item=work_item,
+            llm_summary=loop_outcome.llm_summary,
+        )
+
+        if endgame.success:
+            harness_outcome = HarnessOutcome(
+                success=True,
+                reason=HarnessReason.SUCCESS,
+                evidence=endgame.evidence,
+            )
+            wr = assemble_work_result(
+                outcome=harness_outcome,
+                work_item_id=work_item.id,
+                summary=loop_outcome.llm_summary,
+                branch=work_branch,
+                head_sha=endgame.head_sha,
+                files_touched=endgame.files_touched,
+                tests_run=endgame.tests_run,
+            )
+            (exchange_dir / "result.json").write_text(
+                json.dumps(wr, sort_keys=True) + "\n", encoding="utf-8",
+            )
+            return CmdResult(returncode=0, stdout="", stderr="")
+
+        # Endgame failed -- is it a test failure we can retry?
+        if endgame.reason == HarnessReason.TESTS_EXHAUSTED and test_retry < _TEST_RETRY_CAP:
+            test_retry += 1
+            # Feed failure back into the existing conversation so the LLM
+            # retains context of what it already tried.
+            conversation = loop_outcome.conversation
+            if conversation is not None:
+                test_output = endgame.evidence[0] if endgame.evidence else "tests failed"
+                failure_msg = json.dumps({
+                    "status": "error",
+                    "result": f"Tests failed. Fix the issue.\n\n{test_output}",
+                })
+                conversation.append_user(failure_msg)
+            continue
+
+        # Non-retryable endgame failure
+        harness_outcome = HarnessOutcome(
+            success=False,
+            reason=endgame.reason,
+            evidence=endgame.evidence,
+        )
+        _write_outcome(
+            exchange_dir, work_item, harness_outcome,
+            summary=loop_outcome.llm_summary or f"endgame failed: {endgame.reason.value}",
+            files_touched=endgame.files_touched,
+            tests_run=endgame.tests_run,
+        )
+        return CmdResult(returncode=0, stdout="", stderr="")
