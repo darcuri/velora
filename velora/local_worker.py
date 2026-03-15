@@ -94,3 +94,78 @@ def assemble_work_result(
     # Self-validate — catches harness bugs.
     validate_work_result(payload)
     return payload
+
+
+# -- System prompt builder --
+
+def build_local_worker_prompt(
+    *,
+    work_item: WorkItem,
+    repo_ref: str,
+    work_branch: str,
+    test_commands: list[str],
+) -> str:
+    lines: list[str] = []
+
+    lines.append("You are a code execution tool. You receive a task, you execute it, you return the result.")
+    lines.append("")
+    lines.append("Do not ask questions. Do not propose alternatives. Do not explain your reasoning.")
+    lines.append("Do not narrate what you are about to do. Do not summarize what you did.")
+    lines.append("Emit one action per response. JSON only. No markdown. No prose.")
+    lines.append("")
+    lines.append("If you cannot complete the task, emit work_blocked. Otherwise, execute and emit work_complete.")
+    lines.append("")
+
+    lines.append("## Your task")
+    lines.append(f"Repo: {repo_ref}")
+    lines.append(f"Branch: {work_branch}")
+    lines.append(f"Work item: {work_item.id} ({work_item.kind})")
+    lines.append(f"Rationale: {work_item.rationale}")
+    lines.append("")
+
+    lines.append("## Instructions")
+    for i, ins in enumerate(work_item.instructions, 1):
+        lines.append(f"{i}. {ins}")
+    lines.append("")
+
+    lines.append("## Files in scope")
+    for f in work_item.scope_hints.likely_files:
+        lines.append(f)
+    lines.append("")
+
+    if test_commands:
+        lines.append("## Test commands available")
+        for cmd in test_commands:
+            lines.append(cmd)
+        lines.append("")
+
+    lines.append("## Acceptance criteria")
+    if work_item.acceptance.must:
+        lines.append("Must:")
+        for item in work_item.acceptance.must:
+            lines.append(f"- {item}")
+    if work_item.acceptance.must_not:
+        lines.append("Must not:")
+        for item in work_item.acceptance.must_not:
+            lines.append(f"- {item}")
+    lines.append("")
+
+    lines.append("## Available actions")
+    lines.append('{"action": "read_file", "params": {"path": "relative/path"}}')
+    lines.append('{"action": "list_files", "params": {"path": "relative/dir"}}')
+    lines.append('{"action": "write_file", "params": {"path": "relative/path", "content": "..."}}')
+    lines.append('{"action": "patch_file", "params": {"path": "relative/path", "old": "...", "new": "..."}}')
+    lines.append('{"action": "search_files", "params": {"pattern": "search term"}}')
+    lines.append('{"action": "run_tests", "params": {"command": "python -m pytest -q"}}')
+    lines.append('{"action": "work_complete", "params": {"summary": "what you did"}}')
+    lines.append('{"action": "work_blocked", "params": {"reason": "SCOPE_INSUFFICIENT|TASK_UNCLEAR|CANNOT_RESOLVE", "blockers": ["..."]}}')
+    lines.append("")
+
+    lines.append("## Rules")
+    lines.append("- You may only read/write files listed in scope.")
+    lines.append("- You may only run test commands listed above.")
+    lines.append("- Emit one action per response. JSON only.")
+    lines.append("- Start by reading the files you need, then make changes, then signal completion.")
+    lines.append("- If you cannot complete the task with the files in scope, use work_blocked.")
+
+    return "\n".join(lines) + "\n"
