@@ -17,9 +17,11 @@ from .acpx import GEMINI_REVIEW_PROMPT_PREFIX, parse_codex_footer, run_codex, ru
 from .audit import (
     CI_RESULT as AUDIT_CI_RESULT,
     DECISION_MADE as AUDIT_DECISION_MADE,
+    FINDING_DISMISSED as AUDIT_FINDING_DISMISSED,
     ITERATION_END as AUDIT_ITERATION_END,
     ITERATION_START as AUDIT_ITERATION_START,
     REVIEW_COMPLETED as AUDIT_REVIEW_COMPLETED,
+    REVIEW_REQUESTED as AUDIT_REVIEW_REQUESTED,
     REVIEW_STARTED as AUDIT_REVIEW_STARTED,
     REVIEW_RESULT as AUDIT_REVIEW_RESULT,
     RUN_END as AUDIT_RUN_END,
@@ -36,7 +38,14 @@ from .run_memory import append_run_replay_event, seed_run_replay, sync_run_repla
 from .exchange import append_event as append_exchange_event, work_item_exchange_paths, write_json
 from .github import GitHubClient
 from .orchestrator import coordinator_session_name, worker_session_name
-from .protocol import ProtocolError, WorkResult, validate_work_result
+from .protocol import (
+    FindingDismissal,
+    ProtocolError,
+    ReviewFinding,
+    ReviewResult as ProtocolReviewResult,
+    WorkResult,
+    validate_work_result,
+)
 from .repo import ensure_repo_checkout, validate_repo_allowed
 from .spec import RunSpec
 from .state import get_task, upsert_task
@@ -1481,6 +1490,9 @@ class RunContext:
     result: dict[str, Any] | None = None  # final result dict, set by TERMINAL
     dbg_dir: Path | None = None  # task_dir if debug else None
 
+    # Review tracking (set by _state_dispatching_review)
+    review_has_occurred: bool = False
+
     # Per-iteration timing (set at the start of each AWAITING_DECISION)
     iter_start: float = 0.0
 
@@ -1899,6 +1911,12 @@ def _state_terminal(ctx: RunContext) -> OrchestratorState:
     request = ctx.request
     coord_resp = ctx.coord_resp
     base_home = ctx.home
+
+    # Policy gate: review_enabled requires at least one request_review before finalize_success.
+    if coord_resp.decision == "finalize_success" and ctx.review_enabled and not ctx.review_has_occurred:
+        raise ProtocolError(
+            "finalize_success is not allowed when review_enabled=True and no request_review has occurred during this run"
+        )
 
     record["status"] = _mode_a_status_for_terminal_decision(coord_resp.decision)
     if record["status"] == "failed":
@@ -2604,6 +2622,7 @@ def _state_polling_ci(ctx: RunContext) -> OrchestratorState:
     review_t0 = time.monotonic()
     review_result, review_text = _run_review_with_retry(diff_text, debug_task_dir=dbg_dir)
     review_dt = round(time.monotonic() - review_t0, 2)
+    ctx.review_has_occurred = True
     _ctx_audit(ctx, attempt, AUDIT_REVIEW_RESULT, status=review_result)
 
     _dbg(
@@ -2857,17 +2876,218 @@ def _state_polling_ci(ctx: RunContext) -> OrchestratorState:
 def _state_dispatching_review(ctx: RunContext) -> OrchestratorState:
     """Handle request_review decisions (structured review protocol).
 
-    Stub -- will be wired in Task 8.
+    Dispatches the review using the existing reviewer mechanism, converts the
+    result into a structured ReviewResult, stores it on ctx, and returns to
+    AWAITING_DECISION so the coordinator can act on the findings.
     """
-    raise RuntimeError("not yet implemented")
+    attempt = ctx.iteration
+    record = ctx.record
+    request = ctx.request
+    coord_resp = ctx.coord_resp
+
+    brief = coord_resp.review_brief
+    if brief is None:
+        raise ProtocolError("request_review decision requires a review_brief")
+
+    # Protocol guard: cannot review without prior work (need a head_sha for diff).
+    head_sha = str(record.get("head_sha") or "").strip()
+    if not head_sha:
+        raise ProtocolError("request_review requires prior work with a head_sha; no work has been done yet")
+
+    # Read diff for review.
+    diff_text = _read_diff_for_review(ctx.repo_path, ctx.base_branch, head_sha)
+
+    # Dispatch to existing reviewer.
+    review_result_str, review_text = _run_review_with_retry(diff_text, debug_task_dir=ctx.dbg_dir)
+
+    # Convert legacy review classification into structured ReviewResult.
+    findings: list[ReviewFinding] = []
+    if review_result_str == "approved":
+        verdict = "approve"
+    elif review_result_str == "blocker":
+        # Create blocker findings from review text.
+        finding_idx = 0
+        for raw_line in review_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = _FINDING_LINE_RE.match(line)
+            if match:
+                label = next((g for g in match.groups() if g), "")
+                severity = "blocker" if label.upper().startswith("BLOCKER") else "nit"
+                # Extract description after the label.
+                desc = re.sub(r"^(?:[-*+]\s+|\d+\.\s+)?(?:\*\*(?:BLOCKER|NIT):\*\*|\*\*(?:BLOCKER|NIT)\*\*:|(?:BLOCKER|NIT):)\s*", "", line, flags=re.IGNORECASE).strip()
+                findings.append(ReviewFinding(
+                    id=f"{brief.id}-f{finding_idx}",
+                    severity=severity,
+                    category="correctness",
+                    location="",
+                    description=desc or line,
+                    criterion_id=None,
+                ))
+                finding_idx += 1
+        # Ensure at least one blocker finding for reject verdict.
+        if not any(f.severity == "blocker" for f in findings):
+            findings.append(ReviewFinding(
+                id=f"{brief.id}-f{finding_idx}",
+                severity="blocker",
+                category="correctness",
+                location="",
+                description=review_text[:500],
+                criterion_id=None,
+            ))
+        verdict = "reject"
+    elif review_result_str == "nits":
+        nit_issues = _extract_review_issues(review_text, review_result_str)
+        for idx, issue_text in enumerate(nit_issues):
+            findings.append(ReviewFinding(
+                id=f"{brief.id}-f{idx}",
+                severity="nit",
+                category="style",
+                location="",
+                description=issue_text,
+                criterion_id=None,
+            ))
+        verdict = "approve"
+    else:
+        # malformed or tool-error: create a single blocker finding.
+        findings.append(ReviewFinding(
+            id=f"{brief.id}-f0",
+            severity="blocker",
+            category="correctness",
+            location="",
+            description=f"Review {review_result_str}: {review_text[:500]}",
+            criterion_id=None,
+        ))
+        verdict = "reject"
+
+    protocol_review_result = ProtocolReviewResult(
+        review_brief_id=brief.id,
+        verdict=verdict,
+        findings=findings,
+        summary=review_text[:200],
+    )
+
+    # Store on context.
+    ctx.active_review_result = protocol_review_result
+    ctx.review_has_occurred = True
+
+    # Update request state for coordinator visibility.
+    request.setdefault("state", {})
+    request["state"]["latest_review_result"] = {
+        "review_brief_id": protocol_review_result.review_brief_id,
+        "verdict": protocol_review_result.verdict,
+        "findings": [
+            {
+                "id": f.id,
+                "severity": f.severity,
+                "category": f.category,
+                "location": f.location,
+                "description": f.description,
+                "criterion_id": f.criterion_id,
+            }
+            for f in protocol_review_result.findings
+        ],
+        "summary": protocol_review_result.summary,
+    }
+
+    # Audit event.
+    _ctx_audit(
+        ctx,
+        attempt,
+        AUDIT_REVIEW_REQUESTED,
+        review_brief_id=brief.id,
+        reviewer=brief.reviewer,
+        verdict=verdict,
+        finding_count=len(findings),
+    )
+
+    # Post review text as PR comment (same as current behavior).
+    pr_number = record.get("pr_number")
+    if pr_number is not None:
+        ctx.gh.post_issue_comment(ctx.owner, ctx.repo, int(pr_number), review_text)
+
+    # Update evaluation state.
+    _set_evaluation_state(
+        request,
+        status="reviewed",
+        outcome=f"review_{verdict}",
+        worker_result=None,
+        review_result={
+            "verdict": verdict,
+            "finding_count": len(findings),
+            "review_brief_id": brief.id,
+        },
+    )
+
+    return OrchestratorState.AWAITING_DECISION
 
 
 def _state_processing_dismissal(ctx: RunContext) -> OrchestratorState:
     """Handle dismiss_finding decisions (structured review protocol).
 
-    Stub -- will be wired in Task 8.
+    Validates the dismissal against the active review result and records it
+    in the audit trail, then returns to AWAITING_DECISION.
     """
-    raise RuntimeError("not yet implemented")
+    attempt = ctx.iteration
+    request = ctx.request
+    coord_resp = ctx.coord_resp
+
+    dismissal = coord_resp.finding_dismissal
+    if dismissal is None:
+        raise ProtocolError("dismiss_finding decision requires a finding_dismissal")
+
+    # Validate that there is an active review result to dismiss findings from.
+    if ctx.active_review_result is None:
+        raise ProtocolError("dismiss_finding requires a prior review result (no active_review_result)")
+
+    # Validate that all finding_ids exist in the active review result.
+    active_finding_ids = {f.id for f in ctx.active_review_result.findings}
+    unknown_ids = [fid for fid in dismissal.finding_ids if fid not in active_finding_ids]
+    if unknown_ids:
+        raise ProtocolError(
+            f"dismiss_finding references unknown finding IDs: {unknown_ids} "
+            f"(valid: {sorted(active_finding_ids)})"
+        )
+
+    # Record dismissal in audit trail.
+    _ctx_audit(
+        ctx,
+        attempt,
+        AUDIT_FINDING_DISMISSED,
+        finding_ids=list(dismissal.finding_ids),
+        justification=dismissal.justification,
+        review_brief_id=ctx.active_review_result.review_brief_id,
+    )
+
+    # Update evaluation state to reflect the dismissal.
+    dismissed_set = set(dismissal.finding_ids)
+    remaining_findings = [f for f in ctx.active_review_result.findings if f.id not in dismissed_set]
+    remaining_blockers = [f for f in remaining_findings if f.severity == "blocker"]
+
+    # Update the active review result state for coordinator visibility.
+    request.setdefault("state", {})
+    request["state"]["latest_dismissal"] = {
+        "finding_ids": list(dismissal.finding_ids),
+        "justification": dismissal.justification,
+        "remaining_finding_count": len(remaining_findings),
+        "remaining_blocker_count": len(remaining_blockers),
+    }
+
+    _set_evaluation_state(
+        request,
+        status="reviewed",
+        outcome="finding_dismissed",
+        worker_result=None,
+        review_result={
+            "verdict": ctx.active_review_result.verdict,
+            "finding_count": len(ctx.active_review_result.findings),
+            "dismissed_count": len(dismissal.finding_ids),
+            "remaining_blocker_count": len(remaining_blockers),
+        },
+    )
+
+    return OrchestratorState.AWAITING_DECISION
 
 
 _STATE_HANDLERS: dict[OrchestratorState, Any] = {
