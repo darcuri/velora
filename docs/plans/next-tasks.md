@@ -28,26 +28,53 @@ Add first-class visibility for schema-retry behavior in audit/debug artifacts.
 - no fuzzy parsing fallback
 - no weakening of validation rules
 
-## 2) Make post-success review less flaky
+## 2) ~~Make post-success review less flaky~~ (addressed)
+
+Replaced by the structured review protocol. Review is now protocol-driven via typed objects (`ReviewBrief`, `ReviewResult`, `ReviewFinding`, `FindingDismissal`) with verdict/findings coherence enforced at parse time. The coordinator owns review decisions (`request_review`, `dismiss_finding`) instead of the orchestrator interpreting prose.
+
+## 2a) Tune reviewer prompt for structured JSON output quality
 
 ### Why
-The review stage currently depends too much on prose and parsing.
-A false nit already created a pointless repair path during dogfooding.
+The reviewer backend now needs to produce structured JSON (`ReviewResult` with typed findings). Prompt quality directly affects false-positive and malformed-response rates.
 
 ### Goal
-Make review outcomes more structured and less hallucination-prone.
+Iterate on the reviewer prompt so that structured output is reliable across common review scenarios.
 
 ### Good directions
-- structured review output shape instead of loose prose where practical
-- stronger validation of review outputs before they trigger repair
-- clearer distinction between:
-  - approve
-  - repair-worthy issue
-  - malformed review response
+- test the prompt against representative diffs (clean code, obvious bugs, style-only nits)
+- measure parse success rate and false-positive rate
+- tighten the prompt to reduce hallucinated findings
 
 ### Anti-goals
-- do not add a sprawling new review subsystem
-- do not make the review path “smart” in a way that is hard to reason about
+- do not build a prompt-tuning framework
+- do not weaken protocol validation to compensate for bad prompts
+
+## 2b) Add reviewer role to specialist matrix configuration
+
+### Why
+The reviewer backend is currently implicit. It should be a first-class entry in the specialist matrix so that model selection and configuration are consistent with other roles.
+
+### Goal
+Add a `reviewer` role alongside `coordinator` and `worker` in the specialist matrix config.
+
+## 2c) Dogfood the structured review protocol on a real task
+
+### Why
+The protocol objects and state machine wiring exist, but the full structured review path has not been exercised end-to-end in a real dogfood run.
+
+### Goal
+Run a medium-scope task with the structured review protocol active and verify the full flow: `request_review` -> reviewer produces `ReviewResult` -> coordinator acts on findings.
+
+## 2d) Wire run_structured_review into _state_dispatching_review
+
+### Why
+The `DISPATCHING_REVIEW` state handler currently bridges to the legacy review path. `run_structured_review` exists as a dispatcher but is not yet called from the state machine.
+
+### Goal
+Replace the legacy bridge in `_state_dispatching_review` with a call to `run_structured_review`, completing the structured review wiring.
+
+### Anti-goals
+- do not remove the legacy review path until the structured path is proven in dogfood
 
 ## 3) Add deterministic proof for the schema-retry path
 
@@ -91,6 +118,9 @@ These are real but less urgent:
 
 If choosing only the next few tasks, do them in this order:
 1. schema-retry observability
-2. review-stage robustness
-3. deterministic retry-path proof
-4. another medium-scope dogfood
+2. wire run_structured_review into _state_dispatching_review (2d)
+3. tune reviewer prompt for structured JSON output (2a)
+4. dogfood the structured review protocol on a real task (2c)
+5. deterministic retry-path proof
+6. add reviewer role to specialist matrix (2b)
+7. another medium-scope dogfood

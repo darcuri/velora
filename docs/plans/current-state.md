@@ -11,6 +11,10 @@ Main things proven / landed:
 - **Coordinator schema resilience** now exists via a bounded one-shot retry path.
 - **Blocked worker outcomes** are sanitized so blocked / no-op paths do not fail protocol validation on stale refs.
 - **Audit inspection** now has a JSON output mode for machine-readable summaries.
+- **State machine refactor** -- the Mode A orchestrator (`run_task_mode_a`) has been refactored from a procedural monolith into an explicit state machine (`OrchestratorState` enum + `RunContext` dataclass + per-state handler functions).
+- **Structured review protocol** -- review is now protocol-driven via typed objects (`ReviewBrief`, `ReviewResult`, `ReviewFinding`, `FindingDismissal`) with full protocol validation.
+- **Coordinator decision vocabulary expanded** -- the coordinator now has 5 decisions: `execute_work_item`, `request_review`, `dismiss_finding`, `finalize_success`, `stop_failure`.
+- **Review gate is coordinator-controlled** -- the coordinator decides when to request review and how to act on review results, replacing the previous orchestrator-hardcoded review gate.
 
 ## What landed today
 
@@ -78,8 +82,9 @@ During the 2026-03-14 session, real runs showed:
 
 Important gaps still open:
 - **schema-retry visibility is weak** — retry behavior is not surfaced clearly enough in audit/debug artifacts
-- **review stage is still too prose-shaped** — false review nits are possible and can trigger unnecessary repair loops
+- **structured review not yet wired into live dispatching** — `run_structured_review` exists but the `DISPATCHING_REVIEW` state still bridges to the legacy review path
 - **deterministic retry-path proof is still missing** — we have the feature, but not a guaranteed end-to-end fault-injection path that proves it fires when expected
+- **reviewer prompt tuning needed** — the reviewer needs prompt work to produce reliable structured JSON output
 
 ## High-value files right now
 
