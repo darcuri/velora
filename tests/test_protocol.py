@@ -1,6 +1,6 @@
 import unittest
 
-from velora.protocol import ProtocolError, validate_coordinator_response
+from velora.protocol import ProtocolError, validate_coordinator_response, validate_review_brief
 
 
 def _valid_execute_payload() -> dict:
@@ -101,6 +101,87 @@ class TestProtocol(unittest.TestCase):
         payload["extra"] = 123
         with self.assertRaises(ProtocolError):
             validate_coordinator_response(payload)
+
+
+def _valid_review_brief_payload() -> dict:
+    return {
+        "id": "RB-0001",
+        "reviewer": "gemini",
+        "model": None,
+        "objective": "Verify correctness of footer parsing changes",
+        "acceptance_criteria": ["All tests pass", "No regressions"],
+        "rejection_criteria": ["New security issues"],
+        "areas_of_concern": ["Error handling"],
+        "scope": {
+            "kind": "full_diff",
+            "base_ref": "main",
+            "head_sha": "abc123",
+            "files": [],
+        },
+    }
+
+
+class TestReviewBriefProtocol(unittest.TestCase):
+    def test_valid_brief(self) -> None:
+        brief = validate_review_brief(_valid_review_brief_payload())
+        self.assertEqual(brief.id, "RB-0001")
+        self.assertEqual(brief.reviewer, "gemini")
+        self.assertIsNone(brief.model)
+        self.assertEqual(brief.objective, "Verify correctness of footer parsing changes")
+        self.assertEqual(brief.scope.kind, "full_diff")
+        self.assertEqual(brief.scope.base_ref, "main")
+        self.assertEqual(brief.scope.head_sha, "abc123")
+        self.assertEqual(brief.scope.files, [])
+
+    def test_model_override(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["model"] = "gemini-2.5-pro"
+        brief = validate_review_brief(payload)
+        self.assertEqual(brief.model, "gemini-2.5-pro")
+
+    def test_files_scope(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["scope"]["kind"] = "files"
+        payload["scope"]["files"] = ["velora/protocol.py", "tests/test_protocol.py"]
+        brief = validate_review_brief(payload)
+        self.assertEqual(brief.scope.kind, "files")
+        self.assertEqual(brief.scope.files, ["velora/protocol.py", "tests/test_protocol.py"])
+
+    def test_invalid_reviewer(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["reviewer"] = "codex"
+        with self.assertRaises(ProtocolError):
+            validate_review_brief(payload)
+
+    def test_invalid_scope_kind(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["scope"]["kind"] = "partial"
+        with self.assertRaises(ProtocolError):
+            validate_review_brief(payload)
+
+    def test_missing_objective(self) -> None:
+        payload = _valid_review_brief_payload()
+        del payload["objective"]
+        with self.assertRaises(ProtocolError):
+            validate_review_brief(payload)
+
+    def test_unknown_keys_on_brief(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["extra"] = "nope"
+        with self.assertRaises(ProtocolError):
+            validate_review_brief(payload)
+
+    def test_unknown_keys_on_scope(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["scope"]["extra"] = "nope"
+        with self.assertRaises(ProtocolError):
+            validate_review_brief(payload)
+
+    def test_empty_acceptance_criteria_allowed(self) -> None:
+        payload = _valid_review_brief_payload()
+        payload["acceptance_criteria"] = []
+        brief = validate_review_brief(payload)
+        self.assertEqual(brief.acceptance_criteria, [])
 
 
 if __name__ == "__main__":

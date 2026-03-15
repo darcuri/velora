@@ -29,6 +29,8 @@ _WORK_RESULT_STATUS = {"completed", "blocked", "failed"}
 _WORK_RESULT_TEST_STATUS = {"pass", "fail", "not_run"}
 _ALLOWED_RUNNERS = {"codex", "claude"}  # Gemini is review-only; never a code-writing WorkItem runner.
 _ALLOWED_MAX_DIFF_LINES = {50, 100, 200, 400}
+_REVIEWER_BACKENDS = {"gemini", "claude"}
+_REVIEW_SCOPE_KINDS = {"full_diff", "files"}
 
 
 def _expect_dict(value: object, *, ctx: str) -> dict[str, Any]:
@@ -165,6 +167,87 @@ class WorkItemCommit:
         footer["WORK_ITEM_ID"] = work_item_id
 
         return WorkItemCommit(message=message, footer=footer)
+
+
+@dataclass(frozen=True)
+class ReviewScope:
+    kind: str
+    base_ref: str
+    head_sha: str
+    files: list[str]
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "review_scope") -> ReviewScope:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(obj, ctx=ctx, allowed_keys={"kind", "base_ref", "head_sha", "files"})
+
+        kind = _expect_enum(obj.get("kind"), ctx=f"{ctx}.kind", allowed=_REVIEW_SCOPE_KINDS)
+        base_ref = _expect_str(obj.get("base_ref"), ctx=f"{ctx}.base_ref")
+        head_sha = _expect_str(obj.get("head_sha"), ctx=f"{ctx}.head_sha")
+
+        files_raw = _expect_list(obj.get("files"), ctx=f"{ctx}.files")
+        files = [_expect_str(x, ctx=f"{ctx}.files[]") for x in files_raw]
+
+        return ReviewScope(kind=kind, base_ref=base_ref, head_sha=head_sha, files=files)
+
+
+@dataclass(frozen=True)
+class ReviewBrief:
+    id: str
+    reviewer: str
+    model: str | None
+    objective: str
+    acceptance_criteria: list[str]
+    rejection_criteria: list[str]
+    areas_of_concern: list[str]
+    scope: ReviewScope
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "ReviewBrief") -> ReviewBrief:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(
+            obj,
+            ctx=ctx,
+            allowed_keys={
+                "id",
+                "reviewer",
+                "model",
+                "objective",
+                "acceptance_criteria",
+                "rejection_criteria",
+                "areas_of_concern",
+                "scope",
+            },
+        )
+
+        bid = _expect_str(obj.get("id"), ctx=f"{ctx}.id")
+        reviewer = _expect_enum(obj.get("reviewer"), ctx=f"{ctx}.reviewer", allowed=_REVIEWER_BACKENDS)
+        model = obj.get("model")
+        if model is not None:
+            model = _expect_str(model, ctx=f"{ctx}.model")
+        objective = _expect_str(obj.get("objective"), ctx=f"{ctx}.objective")
+
+        acceptance_raw = _expect_list(obj.get("acceptance_criteria"), ctx=f"{ctx}.acceptance_criteria")
+        acceptance_criteria = [_expect_str(x, ctx=f"{ctx}.acceptance_criteria[]") for x in acceptance_raw]
+
+        rejection_raw = _expect_list(obj.get("rejection_criteria"), ctx=f"{ctx}.rejection_criteria")
+        rejection_criteria = [_expect_str(x, ctx=f"{ctx}.rejection_criteria[]") for x in rejection_raw]
+
+        areas_raw = _expect_list(obj.get("areas_of_concern"), ctx=f"{ctx}.areas_of_concern")
+        areas_of_concern = [_expect_str(x, ctx=f"{ctx}.areas_of_concern[]") for x in areas_raw]
+
+        scope = ReviewScope.from_dict(obj.get("scope"), ctx=f"{ctx}.scope")
+
+        return ReviewBrief(
+            id=bid,
+            reviewer=reviewer,
+            model=model,
+            objective=objective,
+            acceptance_criteria=acceptance_criteria,
+            rejection_criteria=rejection_criteria,
+            areas_of_concern=areas_of_concern,
+            scope=scope,
+        )
 
 
 @dataclass(frozen=True)
@@ -407,6 +490,12 @@ def validate_work_result(payload: object) -> WorkResult:
     """Validate and parse a worker work-result payload."""
 
     return WorkResult.from_dict(payload)
+
+
+def validate_review_brief(payload: object) -> ReviewBrief:
+    """Validate and parse a review brief payload."""
+
+    return ReviewBrief.from_dict(payload)
 
 
 def enforce_specialist_matrix(resp: CoordinatorResponse, matrix: object) -> None:
