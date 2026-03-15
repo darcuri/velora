@@ -20,6 +20,8 @@ REVIEW_RESULT = "review_result"
 REVIEW_STARTED = "review_started"
 REVIEW_COMPLETED = "review_completed"
 RUN_TERMINAL = "run_terminal"
+REVIEW_REQUESTED = "review_requested"
+FINDING_DISMISSED = "finding_dismissed"
 
 # Back-compat aliases from the initial audit helper naming.
 RUN_STARTED = RUN_START
