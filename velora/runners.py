@@ -21,6 +21,7 @@ from .coordinator import (
     run_coordinator_v1_with_cmd,
     validate_coordinator_cmd_result,
 )
+from .local_worker import run_local_worker
 from .run_memory import coordinator_replay_paths
 
 
@@ -219,6 +220,15 @@ def run_worker(
     prompt: str,
     runner: str = "codex",
     backend: str | None = None,
+    # Local harness params (only used when backend=direct-local)
+    work_item: Any | None = None,
+    work_branch: str = "",
+    exchange_dir: Path | None = None,
+    repo_ref: str = "",
+    run_id: str = "",
+    verb: str = "",
+    objective: str = "",
+    iteration: int = 0,
 ) -> CmdResult:
     """Run the worker through the selected backend."""
 
@@ -233,6 +243,18 @@ def run_worker(
     if backend_key == "direct-codex":
         return _run_direct_codex_worker(cwd=cwd, prompt=prompt)
     if backend_key == "direct-local":
-        return run_local_llm(prompt, cwd=cwd)
+        if work_item is None or exchange_dir is None:
+            raise ValueError("direct-local worker backend requires work_item and exchange_dir")
+        return run_local_worker(
+            work_item=work_item,
+            repo_root=cwd,
+            work_branch=work_branch,
+            exchange_dir=exchange_dir,
+            repo_ref=repo_ref,
+            run_id=run_id,
+            verb=verb,
+            objective=objective,
+            iteration=iteration,
+        )
 
     raise AssertionError(f"unreachable worker backend: {backend_key}")
