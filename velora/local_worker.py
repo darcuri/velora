@@ -573,7 +573,7 @@ def _call_local_llm_chat(messages: list[dict[str, str]], cwd: Path) -> CmdResult
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310 (controlled URL from env/config)
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
