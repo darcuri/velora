@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import os
 import json
 import hashlib
@@ -7,7 +8,7 @@ import re
 import shutil
 import subprocess
 import time
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -1412,6 +1413,80 @@ def run_task_legacy(
     record["failure_reason"] = "FIRE exhausted"
     upsert_task(record, home=base_home)
     return {"task_id": task_id, "status": record["status"], "pr_url": record["pr_url"], "summary": record["failure_reason"]}
+
+
+class OrchestratorState(enum.Enum):
+    PREFLIGHT = "PREFLIGHT"
+    AWAITING_DECISION = "AWAITING_DECISION"
+    DISPATCHING_WORKER = "DISPATCHING_WORKER"
+    POLLING_CI = "POLLING_CI"
+    DISPATCHING_REVIEW = "DISPATCHING_REVIEW"
+    PROCESSING_DISMISSAL = "PROCESSING_DISMISSAL"
+    TERMINAL = "TERMINAL"
+    DONE = "DONE"
+
+
+@dataclass
+class RunContext:
+    """Mutable context object threaded through state-machine handlers.
+
+    Groups every piece of data that was previously a local variable inside
+    ``run_task_mode_a``.  Fields are organised into *identity*, *repo*,
+    *config/policy*, *mutable iteration state*, and *infrastructure*
+    sections.
+    """
+
+    # Identity
+    task_id: str
+    run_id: str
+    repo_ref: str
+    verb: str
+
+    # Repo
+    owner: str
+    repo: str
+    base_branch: str
+    work_branch: str
+    repo_path: Path
+
+    # Config / policy
+    config: Any
+    max_attempts: int
+    max_tokens: int
+    max_wall_seconds: int
+    no_progress_max: int
+    review_enabled: bool
+
+    # Mutable state
+    iteration: int
+    record: dict[str, Any]
+    request: dict[str, Any]
+    active_review_result: Any  # ReviewResult | None
+
+    # Infrastructure
+    gh: Any  # GitHubClient
+    home: Path
+    task_dir: Path
+    debug: bool
+    loop_start: float
+
+    # Mutable fields needed by state handlers
+    coord_resp: Any = None  # CoordinatorResponse | None - set by AWAITING_DECISION
+    spec: Any = None  # RunSpec
+    coord_session: str = ""
+    coord_runner: str = ""
+    coord_backend: str | None = None
+    worker_backend: str | None = None
+    last_failure_sig: str | None = None
+    result: dict[str, Any] | None = None  # final result dict, set by TERMINAL
+    dbg_dir: Path | None = None  # task_dir if debug else None
+
+    # Per-iteration timing (set at the start of each AWAITING_DECISION)
+    iter_start: float = 0.0
+
+    # Internal paths
+    coord_output_path: Path | None = None
+    agent_output_path: Path | None = None
 
 
 def run_task_mode_a(
