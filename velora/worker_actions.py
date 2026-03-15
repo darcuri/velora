@@ -27,6 +27,7 @@ class WorkerScope:
     allowed_dirs: set[str]    # parent dirs of allowed_files
     test_commands: list[str]  # joined allowlist strings
     work_branch: str
+    unrestricted_read: bool = False  # investigate items can read any file
 
 
 def resolve_scoped_path(
@@ -73,7 +74,7 @@ def resolve_scoped_path(
             raise ScopeViolation(
                 f"path not in allowed_files: {repo_relative}"
             )
-    else:
+    elif not scope.unrestricted_read:
         # Must be in allowed_files OR within an allowed_dir
         if repo_relative not in scope.allowed_files:
             parts = Path(repo_relative).parts
@@ -187,7 +188,8 @@ def execute_search_files(scope: WorkerScope, params: dict[str, Any]) -> dict[str
         return _action_result("error", f"Invalid regex: {e}")
 
     matches: list[str] = []
-    for dir_name in sorted(scope.allowed_dirs):
+    search_dirs = sorted(scope.allowed_dirs) if not scope.unrestricted_read else ["."]
+    for dir_name in search_dirs:
         dir_path = scope.repo_root / dir_name
         if not dir_path.is_dir():
             continue

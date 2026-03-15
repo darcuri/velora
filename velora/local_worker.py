@@ -166,8 +166,13 @@ def build_local_worker_prompt(
         lines.append("## Investigate mode")
         lines.append("This is a READ-ONLY investigation. Do NOT modify any files.")
         lines.append("Your goal: discover the repo's test infrastructure and build system.")
-        lines.append("Look for: pyproject.toml, setup.cfg, tox.ini, Makefile, package.json, pytest.ini, .github/workflows/")
+        lines.append("Start by listing the repo root directory, then read config files you find.")
+        lines.append("Look for: pyproject.toml, setup.cfg, tox.ini, Makefile, package.json, pytest.ini, requirements*.txt")
         lines.append("Determine: test framework (pytest/unittest/nose/etc), test command, test file locations.")
+        lines.append("")
+        lines.append("CRITICAL: test_command must be the EXACT shell command to run tests. No annotations, no comments, no parenthetical notes.")
+        lines.append("Good: \"python -m pytest -q\"")
+        lines.append("Bad: \"python -m pytest -q (inferred)\"")
         lines.append("")
         lines.append("When done, use work_complete with a findings dict:")
         lines.append('{"action": "work_complete", "params": {"summary": "...", "findings": {"test_command": "python -m pytest -q", "test_framework": "pytest", "test_dirs": ["tests/"]}}}')
@@ -743,6 +748,7 @@ def _build_scope(
         allowed_dirs=allowed_dirs,
         test_commands=test_commands,
         work_branch=work_branch,
+        unrestricted_read=work_item.kind == "investigate",
     )
 
 

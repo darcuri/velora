@@ -2321,9 +2321,12 @@ def _state_dispatching_worker(ctx: RunContext) -> OrchestratorState:
                     if isinstance(discovery, dict):
                         test_cmd = discovery.get("test_command")
                         if isinstance(test_cmd, str) and test_cmd.strip():
-                            discovered = request["state"].setdefault("discovered_test_commands", [])
-                            if test_cmd.strip() not in discovered:
-                                discovered.append(test_cmd.strip())
+                            # Sanitize: strip parenthetical annotations LLMs may add
+                            clean_cmd = re.sub(r"\s*\(.*?\)\s*$", "", test_cmd).strip()
+                            if clean_cmd:
+                                discovered = request["state"].setdefault("discovered_test_commands", [])
+                                if clean_cmd not in discovered:
+                                    discovered.append(clean_cmd)
                 except json.JSONDecodeError:
                     pass
         hist["no_progress_streak"] = 0
