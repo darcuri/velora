@@ -165,17 +165,11 @@ def build_local_worker_prompt(
     if is_investigate:
         lines.append("## Investigate mode")
         lines.append("This is a READ-ONLY investigation. Do NOT modify any files.")
-        lines.append("Your goal: discover the repo's test infrastructure and build system.")
-        lines.append("Start by listing the repo root directory, then read config files you find.")
-        lines.append("Look for: pyproject.toml, setup.cfg, tox.ini, Makefile, package.json, pytest.ini, requirements*.txt")
-        lines.append("Determine: test framework (pytest/unittest/nose/etc), test command, test file locations.")
-        lines.append("")
-        lines.append("CRITICAL: test_command must be the EXACT shell command to run tests. No annotations, no comments, no parenthetical notes.")
-        lines.append("Good: \"python -m pytest -q\"")
-        lines.append("Bad: \"python -m pytest -q (inferred)\"")
+        lines.append("Figure out how to run tests in this repo. List the root directory, read whatever config files actually exist, and determine the test command.")
+        lines.append("Report the exact shell command to run tests — no annotations or comments, just the command.")
         lines.append("")
         lines.append("When done, use work_complete with a findings dict:")
-        lines.append('{"action": "work_complete", "params": {"summary": "...", "findings": {"test_command": "python -m pytest -q", "test_framework": "pytest", "test_dirs": ["tests/"]}}}')
+        lines.append('{"action": "work_complete", "params": {"summary": "...", "findings": {"test_command": "python -m pytest -q"}}}')
         lines.append("")
 
     lines.append("## Available actions")
@@ -195,7 +189,6 @@ def build_local_worker_prompt(
     if is_investigate:
         lines.append("- This is read-only. Do NOT use write_file or patch_file.")
         lines.append("- You may read any file in the repo, not just files listed in scope.")
-        lines.append("- Start by listing the repo root, then read config files (pyproject.toml, setup.cfg, Makefile, tox.ini, etc).")
         lines.append("- Report your findings in the work_complete findings dict.")
     else:
         lines.append("- You may only read/write files listed in scope.")
