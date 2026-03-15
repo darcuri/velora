@@ -97,15 +97,14 @@ class TestRunners(unittest.TestCase):
             request = {"run_id": "task123", "policy": {}}
             with (
                 patch("velora.runners.render_coordinator_prompt_v1", return_value="PROMPT") as mock_render,
-                patch("velora.runners._ensure_anthropic_auth") as mock_auth,
                 patch(
-                    "velora.runners.run_cmd",
+                    "velora.runners._call_anthropic_api",
                     return_value=CmdResult(
                         0,
                         '{"protocol_version":1,"decision":"finalize_success","reason":"done","selected_specialist":{"role":"implementer","runner":"claude"}}',
                         "",
                     ),
-                ) as mock_run_cmd,
+                ) as mock_api,
             ):
                 result = run_coordinator(
                     session_name="coord-session",
@@ -120,14 +119,7 @@ class TestRunners(unittest.TestCase):
             replay_memory="# Coordinator Replay\n\nhello",
             brief={"run_id": "task123", "status": {"state": "running"}},
         )
-        mock_auth.assert_called_once()
-        env = mock_run_cmd.call_args.kwargs["env"]
-        self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
-        mock_run_cmd.assert_called_once_with(
-            ["claude", "--print", "--permission-mode", "bypassPermissions", "-p", "PROMPT"],
-            cwd=repo_path,
-            env=env,
-        )
+        mock_api.assert_called_once_with("PROMPT")
 
     def test_run_worker_routes_to_acp_claude(self) -> None:
         fake = CmdResult(0, "ok", "")
@@ -213,6 +205,53 @@ class TestLocalBackend(unittest.TestCase):
     def test_normalize_worker_backend_accepts_direct_local(self) -> None:
         self.assertEqual(normalize_worker_backend(backend="direct-local", runner="codex"), "direct-local")
         self.assertEqual(normalize_worker_backend(backend="direct-local", runner="claude"), "direct-local")
+
+    def test_run_worker_routes_direct_local_to_harness(self) -> None:
+        """Verify direct-local calls run_local_worker instead of run_local_llm."""
+        from unittest.mock import MagicMock
+        fake = CmdResult(0, "", "")
+        wi = MagicMock(name="WorkItem")
+        with patch("velora.runners.run_local_worker", return_value=fake) as mock_harness:
+            result = run_worker(
+                session_name="test",
+                cwd=Path("/tmp/repo"),
+                prompt="ignored for local harness",
+                runner="codex",
+                backend="direct-local",
+                work_item=wi,
+                work_branch="fix/test",
+                exchange_dir=Path("/tmp/exchange"),
+                repo_ref="owner/repo",
+                run_id="run-1",
+                verb="fix",
+                objective="fix the bug",
+                iteration=1,
+            )
+        self.assertIs(result, fake)
+        mock_harness.assert_called_once_with(
+            work_item=wi,
+            repo_root=Path("/tmp/repo"),
+            work_branch="fix/test",
+            exchange_dir=Path("/tmp/exchange"),
+            repo_ref="owner/repo",
+            run_id="run-1",
+            verb="fix",
+            objective="fix the bug",
+            iteration=1,
+        )
+
+    def test_run_worker_direct_local_requires_work_item(self) -> None:
+        """Verify direct-local raises ValueError without required params."""
+        with self.assertRaises(ValueError) as cm:
+            run_worker(
+                session_name="test",
+                cwd=Path("/tmp/repo"),
+                prompt="ignored",
+                runner="codex",
+                backend="direct-local",
+                # work_item and exchange_dir omitted
+            )
+        self.assertIn("work_item", str(cm.exception))
 
     def test_run_local_llm_parses_openai_response(self) -> None:
         from velora.acpx import run_local_llm

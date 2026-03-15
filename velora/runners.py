@@ -21,6 +21,7 @@ from .coordinator import (
     run_coordinator_v1_with_cmd,
     validate_coordinator_cmd_result,
 )
+from .local_worker import run_local_worker
 from .run_memory import coordinator_replay_paths
 
 
@@ -77,22 +78,62 @@ def _run_direct_claude_coordinator(*, cwd: Path, request: dict[str, Any]) -> Coo
     replay_memory = _load_replay_memory(cwd, request)
     replay_brief = _load_replay_brief(cwd, request)
     prompt = render_coordinator_prompt_v1(request, replay_memory=replay_memory, brief=replay_brief)
-    env = os.environ.copy()
-    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    _ensure_anthropic_auth(env)
-    result = run_cmd(
-        [
-            "claude",
-            "--print",
-            "--permission-mode",
-            "bypassPermissions",
-            "-p",
-            prompt,
-        ],
-        cwd=cwd,
-        env=env,
-    )
+    result = _call_anthropic_api(prompt)
     return validate_coordinator_cmd_result(result=result, request=request)
+
+
+def _call_anthropic_api(prompt: str) -> CmdResult:
+    """Call the Anthropic Messages API directly via urllib."""
+    import urllib.request
+    import urllib.error
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
+    if not api_key:
+        return CmdResult(
+            returncode=1, stdout="",
+            stderr="Neither ANTHROPIC_API_KEY nor ANTHROPIC_AUTH_TOKEN is set",
+        )
+
+    model = os.environ.get("VELORA_COORDINATOR_MODEL", "claude-sonnet-4-6")
+    timeout_s = int(os.environ.get("VELORA_COORDINATOR_TIMEOUT", "120"))
+
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url="https://api.anthropic.com/v1/messages",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        data=body,
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310 (Anthropic API)
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic API HTTP {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic API connection failed: {exc.reason}")
+    except TimeoutError:
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic API timed out after {timeout_s}s")
+
+    try:
+        payload = json.loads(raw)
+        text = payload["content"][0]["text"]
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic API response parse error: {exc}")
+
+    return CmdResult(returncode=0, stdout=text, stderr="")
 
 
 def run_coordinator(
@@ -219,6 +260,15 @@ def run_worker(
     prompt: str,
     runner: str = "codex",
     backend: str | None = None,
+    # Local harness params (only used when backend=direct-local)
+    work_item: Any | None = None,
+    work_branch: str = "",
+    exchange_dir: Path | None = None,
+    repo_ref: str = "",
+    run_id: str = "",
+    verb: str = "",
+    objective: str = "",
+    iteration: int = 0,
 ) -> CmdResult:
     """Run the worker through the selected backend."""
 
@@ -233,6 +283,18 @@ def run_worker(
     if backend_key == "direct-codex":
         return _run_direct_codex_worker(cwd=cwd, prompt=prompt)
     if backend_key == "direct-local":
-        return run_local_llm(prompt, cwd=cwd)
+        if work_item is None or exchange_dir is None:
+            raise ValueError("direct-local worker backend requires work_item and exchange_dir")
+        return run_local_worker(
+            work_item=work_item,
+            repo_root=cwd,
+            work_branch=work_branch,
+            exchange_dir=exchange_dir,
+            repo_ref=repo_ref,
+            run_id=run_id,
+            verb=verb,
+            objective=objective,
+            iteration=iteration,
+        )
 
     raise AssertionError(f"unreachable worker backend: {backend_key}")

@@ -1976,8 +1976,6 @@ def _state_dispatching_worker(ctx: RunContext) -> OrchestratorState:
         raise RuntimeError("CoordinatorResponse missing work_item")
 
     worker_runner = coord_resp.selected_specialist.runner
-    if worker_runner not in {"codex", "claude"}:
-        raise RuntimeError(f"Unsupported worker runner: {worker_runner}")
     try:
         worker_backend_key = normalize_worker_backend(backend=ctx.worker_backend, runner=worker_runner)
     except Exception as exc:  # noqa: BLE001
@@ -1989,6 +1987,10 @@ def _state_dispatching_worker(ctx: RunContext) -> OrchestratorState:
             detail=f"Invalid worker backend selection on iteration {attempt}: {detail}",
         )
         return OrchestratorState.DONE
+
+    # Runner validation — skip for direct-local (runner-agnostic)
+    if worker_backend_key != "direct-local" and worker_runner not in {"codex", "claude"}:
+        raise RuntimeError(f"Unsupported worker runner: {worker_runner}")
 
     # ACP workers should be stateless across iterations, so session names are iteration-scoped.
     worker_session = worker_session_name(ctx.owner, ctx.repo, task_id, worker_runner, iteration=attempt)
@@ -2064,6 +2066,15 @@ def _state_dispatching_worker(ctx: RunContext) -> OrchestratorState:
             prompt=prompt,
             runner=worker_runner,
             backend=worker_backend_key,
+            # Local harness params (only used when backend=direct-local)
+            work_item=coord_resp.work_item if worker_backend_key == "direct-local" else None,
+            work_branch=work_branch if worker_backend_key == "direct-local" else "",
+            exchange_dir=exchange_paths["dir"] if worker_backend_key == "direct-local" else None,
+            repo_ref=ctx.repo_ref if worker_backend_key == "direct-local" else "",
+            run_id=task_id if worker_backend_key == "direct-local" else "",
+            verb=ctx.verb if worker_backend_key == "direct-local" else "",
+            objective=str(request["objective"]) if worker_backend_key == "direct-local" else "",
+            iteration=attempt if worker_backend_key == "direct-local" else 0,
         )
     except Exception as exc:  # noqa: BLE001
         detail = _format_preflight_error(exc)
