@@ -329,6 +329,26 @@ class ReviewResult:
 
 
 @dataclass(frozen=True)
+class FindingDismissal:
+    finding_ids: list[str]
+    justification: str
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "FindingDismissal") -> FindingDismissal:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(obj, ctx=ctx, allowed_keys={"finding_ids", "justification"})
+
+        finding_ids_raw = _expect_list(obj.get("finding_ids"), ctx=f"{ctx}.finding_ids")
+        finding_ids = [_expect_str(x, ctx=f"{ctx}.finding_ids[]") for x in finding_ids_raw]
+        if not finding_ids:
+            raise ProtocolError(f"{ctx}.finding_ids must contain at least one finding ID")
+
+        justification = _expect_str(obj.get("justification"), ctx=f"{ctx}.justification")
+
+        return FindingDismissal(finding_ids=finding_ids, justification=justification)
+
+
+@dataclass(frozen=True)
 class WorkItemScopeHints:
     likely_files: list[str]
     search_terms: list[str]
@@ -580,6 +600,12 @@ def validate_review_result(payload: object) -> ReviewResult:
     """Validate and parse a review result payload."""
 
     return ReviewResult.from_dict(payload)
+
+
+def validate_finding_dismissal(payload: object) -> FindingDismissal:
+    """Validate and parse a finding dismissal payload."""
+
+    return FindingDismissal.from_dict(payload)
 
 
 def enforce_specialist_matrix(resp: CoordinatorResponse, matrix: object) -> None:

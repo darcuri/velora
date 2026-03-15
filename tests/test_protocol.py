@@ -3,6 +3,7 @@ import unittest
 from velora.protocol import (
     ProtocolError,
     validate_coordinator_response,
+    validate_finding_dismissal,
     validate_review_brief,
     validate_review_result,
 )
@@ -288,6 +289,29 @@ class TestReviewResultProtocol(unittest.TestCase):
         finding["location"] = ""
         result = validate_review_result(_valid_review_result_payload(verdict="reject", findings=[finding]))
         self.assertEqual(result.findings[0].location, "")
+
+
+class TestFindingDismissalProtocol(unittest.TestCase):
+    def test_valid_dismissal(self) -> None:
+        payload = {"finding_ids": ["RF-001", "RF-002"], "justification": "False positives after manual review."}
+        dismissal = validate_finding_dismissal(payload)
+        self.assertEqual(dismissal.finding_ids, ["RF-001", "RF-002"])
+        self.assertEqual(dismissal.justification, "False positives after manual review.")
+
+    def test_empty_finding_ids_is_error(self) -> None:
+        payload = {"finding_ids": [], "justification": "Some reason."}
+        with self.assertRaises(ProtocolError):
+            validate_finding_dismissal(payload)
+
+    def test_empty_justification_is_error(self) -> None:
+        payload = {"finding_ids": ["RF-001"], "justification": ""}
+        with self.assertRaises(ProtocolError):
+            validate_finding_dismissal(payload)
+
+    def test_unknown_keys_rejected(self) -> None:
+        payload = {"finding_ids": ["RF-001"], "justification": "Reason.", "extra": "nope"}
+        with self.assertRaises(ProtocolError):
+            validate_finding_dismissal(payload)
 
 
 if __name__ == "__main__":
