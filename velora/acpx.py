@@ -421,6 +421,50 @@ def _gemini_generate_content(
         raise RuntimeError(f"Gemini API response missing expected text field: {payload}") from exc
 
 
+def run_local_llm(prompt: str, *, cwd: Path | None = None) -> CmdResult:
+    """Call a local OpenAI-compatible LLM endpoint (e.g., LM Studio).
+
+    Defaults to http://localhost:1234/v1/chat/completions.
+    Override with VELORA_LOCAL_BASE_URL and VELORA_LOCAL_MODEL.
+    """
+
+    base_url = os.environ.get("VELORA_LOCAL_BASE_URL", "http://localhost:1234").rstrip("/")
+    model = os.environ.get("VELORA_LOCAL_MODEL", "")
+    timeout_s = int(os.environ.get("VELORA_LOCAL_TIMEOUT", "300"))
+
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+    }
+    if model:
+        body["model"] = model
+
+    url = f"{base_url}/v1/chat/completions"
+    req = urllib.request.Request(
+        url=url,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(body).encode("utf-8"),
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM HTTP {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM connection failed: {exc.reason}")
+
+    try:
+        payload = json.loads(raw)
+        text = payload["choices"][0]["message"]["content"]
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Local LLM response parse error: {exc}")
+
+    return CmdResult(returncode=0, stdout=text, stderr="")
+
+
 def _strip_bullet_prefix(line: str) -> str:
     s = line.strip()
     # Common markdown bullet prefixes.
