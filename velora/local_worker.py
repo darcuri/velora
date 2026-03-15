@@ -290,7 +290,13 @@ def run_local_worker_loop(
     If `conversation` is provided, resumes from an existing conversation
     (used for test failure re-entry). Otherwise starts fresh.
     """
-    conv = conversation if conversation is not None else ConversationManager(system_prompt)
+    if conversation is not None:
+        conv = conversation
+    else:
+        conv = ConversationManager(system_prompt)
+        # Seed with a user message — many local models require at least one
+        # "user" turn in the conversation to produce a response.
+        conv.append_user("Begin. Emit your first action.")
     iteration = 0
     parse_failures = 0
 
