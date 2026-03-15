@@ -31,6 +31,9 @@ _ALLOWED_RUNNERS = {"codex", "claude"}  # Gemini is review-only; never a code-wr
 _ALLOWED_MAX_DIFF_LINES = {50, 100, 200, 400}
 _REVIEWER_BACKENDS = {"gemini", "claude"}
 _REVIEW_SCOPE_KINDS = {"full_diff", "files"}
+_REVIEW_VERDICTS = {"approve", "reject"}
+_FINDING_SEVERITIES = {"blocker", "nit"}
+_FINDING_CATEGORIES = {"correctness", "security", "regression", "style", "docs"}
 
 
 def _expect_dict(value: object, *, ctx: str) -> dict[str, Any]:
@@ -247,6 +250,81 @@ class ReviewBrief:
             rejection_criteria=rejection_criteria,
             areas_of_concern=areas_of_concern,
             scope=scope,
+        )
+
+
+@dataclass(frozen=True)
+class ReviewFinding:
+    id: str
+    severity: str
+    category: str
+    location: str
+    description: str
+    criterion_id: int | None
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "ReviewFinding") -> ReviewFinding:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(
+            obj,
+            ctx=ctx,
+            allowed_keys={"id", "severity", "category", "location", "description", "criterion_id"},
+        )
+
+        fid = _expect_str(obj.get("id"), ctx=f"{ctx}.id")
+        severity = _expect_enum(obj.get("severity"), ctx=f"{ctx}.severity", allowed=_FINDING_SEVERITIES)
+        category = _expect_enum(obj.get("category"), ctx=f"{ctx}.category", allowed=_FINDING_CATEGORIES)
+        location = _expect_str(obj.get("location"), ctx=f"{ctx}.location", non_empty=False)
+        description = _expect_str(obj.get("description"), ctx=f"{ctx}.description")
+        criterion_id = obj.get("criterion_id")
+        if criterion_id is not None:
+            criterion_id = _expect_int(criterion_id, ctx=f"{ctx}.criterion_id")
+
+        return ReviewFinding(
+            id=fid,
+            severity=severity,
+            category=category,
+            location=location,
+            description=description,
+            criterion_id=criterion_id,
+        )
+
+
+@dataclass(frozen=True)
+class ReviewResult:
+    review_brief_id: str
+    verdict: str
+    findings: list[ReviewFinding]
+    summary: str
+
+    @staticmethod
+    def from_dict(raw: object, *, ctx: str = "ReviewResult") -> ReviewResult:
+        obj = _expect_dict(raw, ctx=ctx)
+        _no_extra_keys(
+            obj,
+            ctx=ctx,
+            allowed_keys={"review_brief_id", "verdict", "findings", "summary"},
+        )
+
+        review_brief_id = _expect_str(obj.get("review_brief_id"), ctx=f"{ctx}.review_brief_id")
+        verdict = _expect_enum(obj.get("verdict"), ctx=f"{ctx}.verdict", allowed=_REVIEW_VERDICTS)
+        summary = _expect_str(obj.get("summary"), ctx=f"{ctx}.summary")
+
+        findings_raw = _expect_list(obj.get("findings"), ctx=f"{ctx}.findings")
+        findings = [ReviewFinding.from_dict(x, ctx=f"{ctx}.findings[]") for x in findings_raw]
+
+        # Coherence checks.
+        has_blocker = any(f.severity == "blocker" for f in findings)
+        if verdict == "approve" and has_blocker:
+            raise ProtocolError(f"{ctx}: verdict=approve is not allowed with blocker-severity findings")
+        if verdict == "reject" and not has_blocker:
+            raise ProtocolError(f"{ctx}: verdict=reject requires at least one blocker-severity finding")
+
+        return ReviewResult(
+            review_brief_id=review_brief_id,
+            verdict=verdict,
+            findings=findings,
+            summary=summary,
         )
 
 
@@ -496,6 +574,12 @@ def validate_review_brief(payload: object) -> ReviewBrief:
     """Validate and parse a review brief payload."""
 
     return ReviewBrief.from_dict(payload)
+
+
+def validate_review_result(payload: object) -> ReviewResult:
+    """Validate and parse a review result payload."""
+
+    return ReviewResult.from_dict(payload)
 
 
 def enforce_specialist_matrix(resp: CoordinatorResponse, matrix: object) -> None:

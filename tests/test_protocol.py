@@ -1,6 +1,11 @@
 import unittest
 
-from velora.protocol import ProtocolError, validate_coordinator_response, validate_review_brief
+from velora.protocol import (
+    ProtocolError,
+    validate_coordinator_response,
+    validate_review_brief,
+    validate_review_result,
+)
 
 
 def _valid_execute_payload() -> dict:
@@ -182,6 +187,107 @@ class TestReviewBriefProtocol(unittest.TestCase):
         payload["acceptance_criteria"] = []
         brief = validate_review_brief(payload)
         self.assertEqual(brief.acceptance_criteria, [])
+
+
+def _valid_review_finding(*, severity: str = "blocker", **overrides: object) -> dict:
+    base: dict = {
+        "id": "RF-001",
+        "severity": severity,
+        "category": "correctness",
+        "location": "velora/protocol.py:42",
+        "description": "Missing validation for edge case",
+        "criterion_id": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+def _valid_review_result_payload(*, verdict: str = "reject", findings: list[dict] | None = None) -> dict:
+    if findings is None:
+        if verdict == "reject":
+            findings = [_valid_review_finding(severity="blocker")]
+        else:
+            findings = []
+    return {
+        "review_brief_id": "RB-0001",
+        "verdict": verdict,
+        "findings": findings,
+        "summary": "Review complete.",
+    }
+
+
+class TestReviewResultProtocol(unittest.TestCase):
+    def test_valid_reject_result(self) -> None:
+        result = validate_review_result(_valid_review_result_payload(verdict="reject"))
+        self.assertEqual(result.review_brief_id, "RB-0001")
+        self.assertEqual(result.verdict, "reject")
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(result.findings[0].severity, "blocker")
+        self.assertEqual(result.summary, "Review complete.")
+
+    def test_valid_approve_result(self) -> None:
+        result = validate_review_result(_valid_review_result_payload(verdict="approve", findings=[]))
+        self.assertEqual(result.verdict, "approve")
+        self.assertEqual(result.findings, [])
+
+    def test_approve_with_nits_allowed(self) -> None:
+        nit = _valid_review_finding(severity="nit")
+        result = validate_review_result(_valid_review_result_payload(verdict="approve", findings=[nit]))
+        self.assertEqual(result.verdict, "approve")
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(result.findings[0].severity, "nit")
+
+    def test_approve_with_blocker_is_error(self) -> None:
+        blocker = _valid_review_finding(severity="blocker")
+        with self.assertRaises(ProtocolError):
+            validate_review_result(_valid_review_result_payload(verdict="approve", findings=[blocker]))
+
+    def test_reject_without_blocker_is_error(self) -> None:
+        nit = _valid_review_finding(severity="nit")
+        with self.assertRaises(ProtocolError):
+            validate_review_result(_valid_review_result_payload(verdict="reject", findings=[nit]))
+
+    def test_invalid_verdict(self) -> None:
+        payload = _valid_review_result_payload()
+        payload["verdict"] = "maybe"
+        with self.assertRaises(ProtocolError):
+            validate_review_result(payload)
+
+    def test_invalid_severity(self) -> None:
+        bad_finding = _valid_review_finding(severity="critical")
+        bad_finding["severity"] = "critical"
+        with self.assertRaises(ProtocolError):
+            validate_review_result(_valid_review_result_payload(verdict="reject", findings=[bad_finding]))
+
+    def test_invalid_category(self) -> None:
+        bad_finding = _valid_review_finding()
+        bad_finding["category"] = "performance"
+        with self.assertRaises(ProtocolError):
+            validate_review_result(_valid_review_result_payload(verdict="reject", findings=[bad_finding]))
+
+    def test_unknown_keys_in_finding(self) -> None:
+        bad_finding = _valid_review_finding()
+        bad_finding["extra"] = "nope"
+        with self.assertRaises(ProtocolError):
+            validate_review_result(_valid_review_result_payload(verdict="reject", findings=[bad_finding]))
+
+    def test_unknown_keys_in_result(self) -> None:
+        payload = _valid_review_result_payload()
+        payload["extra"] = "nope"
+        with self.assertRaises(ProtocolError):
+            validate_review_result(payload)
+
+    def test_finding_with_no_criterion_id(self) -> None:
+        finding = _valid_review_finding()
+        finding["criterion_id"] = None
+        result = validate_review_result(_valid_review_result_payload(verdict="reject", findings=[finding]))
+        self.assertIsNone(result.findings[0].criterion_id)
+
+    def test_finding_with_empty_location(self) -> None:
+        finding = _valid_review_finding()
+        finding["location"] = ""
+        result = validate_review_result(_valid_review_result_payload(verdict="reject", findings=[finding]))
+        self.assertEqual(result.findings[0].location, "")
 
 
 if __name__ == "__main__":
