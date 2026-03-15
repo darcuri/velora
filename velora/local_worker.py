@@ -418,9 +418,11 @@ class EndgameOutcome:
     tests_run: list[dict[str, str]]
 
 
-# Gate name -> command list
+# Gate name -> command list.
+# VELORA_HARNESS_TEST_COMMAND overrides the "tests" gate command.
+_test_cmd_override = os.environ.get("VELORA_HARNESS_TEST_COMMAND", "").strip()
 GATE_COMMANDS: dict[str, list[str]] = {
-    "tests":    ["python", "-m", "pytest", "-q"],
+    "tests":    _test_cmd_override.split() if _test_cmd_override else ["python", "-m", "pytest", "-q"],
     "lint":     ["python", "-m", "flake8"],
     "security": ["python", "-m", "bandit", "-r", ".", "-q"],
 }
