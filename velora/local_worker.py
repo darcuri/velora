@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -245,6 +246,7 @@ class ConversationManager:
 _ITERATION_CAP = int(os.environ.get("VELORA_HARNESS_ITERATION_CAP", "20"))
 _CONTEXT_CAP_BYTES = int(os.environ.get("VELORA_HARNESS_CONTEXT_CAP", str(128 * 1024)))
 _PARSE_FAILURE_CAP = int(os.environ.get("VELORA_HARNESS_PARSE_FAILURE_CAP", "3"))
+_TOTAL_PARSE_FAILURE_CAP = int(os.environ.get("VELORA_HARNESS_TOTAL_PARSE_FAILURE_CAP", "10"))
 
 # LLM blocked reasons the worker can emit
 _LLM_BLOCKED_REASONS = {"SCOPE_INSUFFICIENT", "TASK_UNCLEAR", "CANNOT_RESOLVE"}
@@ -269,6 +271,8 @@ def _parse_action(raw: str) -> tuple[str, dict[str, Any]] | None:
         lines = text.splitlines()
         lines = [l for l in lines if not l.strip().startswith("```")]
         text = "\n".join(lines).strip()
+    # Strip XML-like tool tags some models emit (e.g. </tool_call>)
+    text = re.sub(r"</?tool_call\s*/?>", "", text).strip()
     try:
         obj = json.loads(text)
     except json.JSONDecodeError:
@@ -308,6 +312,7 @@ def run_local_worker_loop(
         conv.append_user("Begin. Emit your first action.")
     iteration = 0
     parse_failures = 0
+    total_parse_failures = 0
 
     while True:
         # -- Context cap --
@@ -344,8 +349,9 @@ def run_local_worker_loop(
         parsed = _parse_action(raw_response)
         if parsed is None:
             parse_failures += 1
-            _log(f"turn {iteration}: parse failure #{parse_failures}")
-            if parse_failures >= parse_failure_cap:
+            total_parse_failures += 1
+            _log(f"turn {iteration}: parse failure #{parse_failures} (total: {total_parse_failures})")
+            if parse_failures >= parse_failure_cap or total_parse_failures >= _TOTAL_PARSE_FAILURE_CAP:
                 return LoopOutcome(
                     success=False,
                     reason=HarnessReason.PARSE_FAILURES,
