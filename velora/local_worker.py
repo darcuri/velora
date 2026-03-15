@@ -4,6 +4,7 @@ import enum
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,14 @@ from .worker_actions import (
     WorkerScope,
     dispatch_action,
 )
+
+_HARNESS_DEBUG = os.environ.get("VELORA_HARNESS_DEBUG", "") == "1"
+
+
+def _log(msg: str) -> None:
+    """Log to stderr when VELORA_HARNESS_DEBUG=1."""
+    if _HARNESS_DEBUG:
+        print(f"[harness] {msg}", file=sys.stderr, flush=True)
 
 
 # -- Outcome model --
@@ -313,9 +322,11 @@ def run_local_worker_loop(
             )
 
         # -- Call LLM --
+        _log(f"turn {iteration}: calling LLM ({conv.context_bytes} context bytes, {len(conv.messages())} messages)")
         llm_result = _call_local_llm_chat(conv.messages(), scope.repo_root)
 
         if llm_result.returncode != 0:
+            _log(f"turn {iteration}: LLM call failed: {llm_result.stderr[:200]}")
             return LoopOutcome(
                 success=False,
                 reason=HarnessReason.PARSE_FAILURES,
@@ -327,11 +338,13 @@ def run_local_worker_loop(
 
         raw_response = llm_result.stdout
         conv.append_assistant(raw_response)
+        _log(f"turn {iteration}: LLM response ({len(raw_response)} chars): {raw_response[:200]}")
 
         # -- Parse --
         parsed = _parse_action(raw_response)
         if parsed is None:
             parse_failures += 1
+            _log(f"turn {iteration}: parse failure #{parse_failures}")
             if parse_failures >= parse_failure_cap:
                 return LoopOutcome(
                     success=False,
@@ -351,9 +364,11 @@ def run_local_worker_loop(
 
         parse_failures = 0
         action, params = parsed
+        _log(f"turn {iteration}: action={action} params_keys={list(params.keys())}")
 
         # -- Terminal actions --
         if action == "work_complete":
+            _log(f"turn {iteration}: work_complete — entering endgame")
             summary = params.get("summary", "")
             return LoopOutcome(
                 success=True,
@@ -365,6 +380,7 @@ def run_local_worker_loop(
             )
 
         if action == "work_blocked":
+            _log(f"turn {iteration}: work_blocked — reason={params.get('reason')}")
             reason_str = params.get("reason", "CANNOT_RESOLVE")
             if reason_str not in _LLM_BLOCKED_REASONS:
                 reason_str = "CANNOT_RESOLVE"
@@ -390,11 +406,13 @@ def run_local_worker_loop(
         # -- Execute action --
         result = dispatch_action(scope, action, params)
         result_json = json.dumps(result)
+        _log(f"turn {iteration}: result status={result['status']} ({len(result_json)} chars)")
         conv.append_user(result_json)
         conv.summarize()
 
         iteration += 1
         if iteration >= iteration_cap:
+            _log(f"iteration cap hit: {iteration} >= {iteration_cap}")
             return LoopOutcome(
                 success=False,
                 reason=HarnessReason.ITERATION_LIMIT,
@@ -447,6 +465,7 @@ def _run_endgame(
     llm_summary: str,
 ) -> EndgameOutcome:
     """Mechanical endgame: diff audit, test gates, commit."""
+    _log("endgame: starting")
     repo = scope.repo_root
 
     # -- Step 1: Diff audit --
@@ -455,8 +474,10 @@ def _run_endgame(
     diff_name = _git(repo, "diff", "--name-only", "HEAD")
 
     changed_files = [f.strip() for f in diff_name.stdout.splitlines() if f.strip()]
+    _log(f"endgame: diff audit — {len(changed_files)} files changed: {changed_files}")
 
     if not changed_files:
+        _log("endgame: NO_CHANGES")
         return EndgameOutcome(
             success=False, reason=HarnessReason.NO_CHANGES,
             evidence=["worker signaled complete but no files were modified"],
@@ -486,6 +507,7 @@ def _run_endgame(
     # Diff line count
     diff_lines = len(diff_full.stdout.splitlines())
     max_lines = work_item.limits.max_diff_lines
+    _log(f"endgame: diff lines={diff_lines}, limit={max_lines}")
     if diff_lines > max_lines:
         return EndgameOutcome(
             success=False, reason=HarnessReason.DIFF_LIMIT,
@@ -494,6 +516,7 @@ def _run_endgame(
         )
 
     # -- Step 2: Run test gates --
+    _log(f"endgame: running {len(work_item.acceptance.gates)} test gates: {work_item.acceptance.gates}")
     tests_run: list[dict[str, str]] = []
     for gate in work_item.acceptance.gates:
         if gate in _SKIPPED_GATES:
@@ -516,6 +539,7 @@ def _run_endgame(
             )
         output = (proc.stdout or "") + (proc.stderr or "")
         status = "pass" if proc.returncode == 0 else "fail"
+        _log(f"endgame: gate '{gate}' → {status} (rc={proc.returncode})")
         tests_run.append({"command": " ".join(cmd_list), "status": status, "details": output[:2000]})
         if status == "fail":
             return EndgameOutcome(
@@ -545,6 +569,7 @@ def _run_endgame(
         )
 
     head_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _log(f"endgame: SUCCESS — committed {head_sha}")
 
     return EndgameOutcome(
         success=True, reason=HarnessReason.SUCCESS,
@@ -673,9 +698,12 @@ def run_local_worker(
     Returns CmdResult with returncode=0 on completion (success or failure --
     the WorkResult file carries the actual outcome).
     """
+    _log(f"run_local_worker: work_item={work_item.id} branch={work_branch} repo={repo_root}")
+    _log(f"  scope: files={list(work_item.scope_hints.likely_files)} gates={work_item.acceptance.gates}")
     scope = _build_scope(work_item, repo_root, work_branch)
 
     # Phase 0: Pre-flight
+    _log("pre-flight: checking working tree")
     status = _git(repo_root, "status", "--porcelain")
     if status.stdout.strip():
         # Dirty tree -- abort
@@ -760,6 +788,7 @@ def run_local_worker(
         # Endgame failed -- is it a test failure we can retry?
         if endgame.reason == HarnessReason.TESTS_EXHAUSTED and test_retry < _TEST_RETRY_CAP:
             test_retry += 1
+            _log(f"test retry {test_retry}/{_TEST_RETRY_CAP}: feeding failure back to LLM")
             # Feed failure back into the existing conversation so the LLM
             # retains context of what it already tried.
             conversation = loop_outcome.conversation
