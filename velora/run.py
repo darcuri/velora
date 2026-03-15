@@ -1648,6 +1648,7 @@ def _state_preflight(ctx: RunContext) -> OrchestratorState:
             "latest_ci": None,
             "latest_review": None,
             "discovered_test_commands": [],
+            "investigate_count": 0,
             "latest_post_success_review": None,
         },
         "evaluation": {
@@ -1975,6 +1976,28 @@ def _state_dispatching_worker(ctx: RunContext) -> OrchestratorState:
 
     if coord_resp.work_item is None:
         raise RuntimeError("CoordinatorResponse missing work_item")
+
+    # Soft cap: allow a bounded number of investigate work items per run.
+    # The coordinator may legitimately re-investigate (e.g., first attempt
+    # had insufficient scope), but cannot loop forever.
+    _INVESTIGATE_CAP = int(os.environ.get("VELORA_INVESTIGATE_CAP", "2"))
+    if coord_resp.work_item.kind == "investigate":
+        prior_count = int(request.get("state", {}).get("investigate_count", 0))
+        if prior_count >= _INVESTIGATE_CAP:
+            _dbg(ctx.dbg_dir, "investigate_cap_reached", {"prior_count": prior_count, "cap": _INVESTIGATE_CAP})
+            request["state"].setdefault("notes", []).append(
+                f"investigate_cap_reached: {prior_count}/{_INVESTIGATE_CAP} investigates exhausted, proceed to implement"
+            )
+            _set_evaluation_state(
+                request,
+                status="fail",
+                outcome="investigate_cap_reached",
+                failing_checks=[],
+                logs_excerpt=f"Investigate budget exhausted ({prior_count}/{_INVESTIGATE_CAP}). Use any discovered_test_commands and proceed to implement.",
+            )
+            ctx.iteration += 1
+            return OrchestratorState.AWAITING_DECISION
+        request["state"]["investigate_count"] = prior_count + 1
 
     worker_runner = coord_resp.selected_specialist.runner
     try:
