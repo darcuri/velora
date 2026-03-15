@@ -21,13 +21,13 @@ class ProtocolError(ValueError):
     pass
 
 
-_DECISIONS = {"execute_work_item", "finalize_success", "stop_failure"}
-_SPECIALIST_ROLES = {"implementer", "docs", "refactor", "investigator"}
+_DECISIONS = {"execute_work_item", "request_review", "dismiss_finding", "finalize_success", "stop_failure"}
+_SPECIALIST_ROLES = {"implementer", "docs", "refactor", "investigator", "reviewer"}
 _WORK_ITEM_KINDS = {"implement", "repair", "refactor", "docs", "test_only", "investigate"}
 _ACCEPTANCE_GATES = {"tests", "lint", "security", "ci", "docs"}
 _WORK_RESULT_STATUS = {"completed", "blocked", "failed"}
 _WORK_RESULT_TEST_STATUS = {"pass", "fail", "not_run"}
-_ALLOWED_RUNNERS = {"codex", "claude"}  # Gemini is review-only; never a code-writing WorkItem runner.
+_ALLOWED_RUNNERS = {"codex", "claude", "gemini"}  # Gemini is valid for reviewer role; specialist matrix prevents it for code-writing roles.
 _ALLOWED_MAX_DIFF_LINES = {50, 100, 200, 400}
 _REVIEWER_BACKENDS = {"gemini", "claude"}
 _REVIEW_SCOPE_KINDS = {"full_diff", "files"}
@@ -433,11 +433,25 @@ class CoordinatorResponse:
     reason: str
     selected_specialist: SelectedSpecialist
     work_item: WorkItem | None = None
+    review_brief: ReviewBrief | None = None
+    finding_dismissal: FindingDismissal | None = None
 
     @staticmethod
     def from_dict(raw: object, *, ctx: str = "CoordinatorResponse") -> CoordinatorResponse:
         obj = _expect_dict(raw, ctx=ctx)
-        _no_extra_keys(obj, ctx=ctx, allowed_keys={"protocol_version", "decision", "reason", "selected_specialist", "work_item"})
+        _no_extra_keys(
+            obj,
+            ctx=ctx,
+            allowed_keys={
+                "protocol_version",
+                "decision",
+                "reason",
+                "selected_specialist",
+                "work_item",
+                "review_brief",
+                "finding_dismissal",
+            },
+        )
 
         protocol_version = _expect_int(obj.get("protocol_version"), ctx=f"{ctx}.protocol_version")
         if protocol_version != 1:
@@ -448,15 +462,45 @@ class CoordinatorResponse:
 
         selected_specialist = SelectedSpecialist.from_dict(obj.get("selected_specialist"), ctx=f"{ctx}.selected_specialist")
 
-        work_item_raw = obj.get("work_item")
-        if decision == "execute_work_item":
-            if work_item_raw is None:
-                raise ProtocolError(f"{ctx}.work_item is required when decision=execute_work_item")
-            work_item = WorkItem.from_dict(work_item_raw, ctx=f"{ctx}.work_item")
-        else:
-            if work_item_raw is not None:
-                raise ProtocolError(f"{ctx}.work_item must be omitted when decision={decision}")
-            work_item = None
+        # Decision → required-payload mapping.  Each decision requires exactly one
+        # payload field (or none for terminal decisions).  All non-matched payload
+        # fields must be absent.
+        _DECISION_PAYLOAD = {
+            "execute_work_item": "work_item",
+            "request_review": "review_brief",
+            "dismiss_finding": "finding_dismissal",
+        }
+        _PAYLOAD_FIELDS = {"work_item", "review_brief", "finding_dismissal"}
+
+        required_field = _DECISION_PAYLOAD.get(decision)
+
+        # Parse the payload field that matches this decision (if any).
+        work_item: WorkItem | None = None
+        review_brief: ReviewBrief | None = None
+        finding_dismissal: FindingDismissal | None = None
+
+        if required_field == "work_item":
+            raw_val = obj.get("work_item")
+            if raw_val is None:
+                raise ProtocolError(f"{ctx}.work_item is required when decision={decision}")
+            work_item = WorkItem.from_dict(raw_val, ctx=f"{ctx}.work_item")
+        elif required_field == "review_brief":
+            raw_val = obj.get("review_brief")
+            if raw_val is None:
+                raise ProtocolError(f"{ctx}.review_brief is required when decision={decision}")
+            review_brief = ReviewBrief.from_dict(raw_val, ctx=f"{ctx}.review_brief")
+        elif required_field == "finding_dismissal":
+            raw_val = obj.get("finding_dismissal")
+            if raw_val is None:
+                raise ProtocolError(f"{ctx}.finding_dismissal is required when decision={decision}")
+            finding_dismissal = FindingDismissal.from_dict(raw_val, ctx=f"{ctx}.finding_dismissal")
+
+        # Reject payload fields that do not belong to this decision.
+        for field in _PAYLOAD_FIELDS:
+            if field == required_field:
+                continue
+            if obj.get(field) is not None:
+                raise ProtocolError(f"{ctx}.{field} must be omitted when decision={decision}")
 
         return CoordinatorResponse(
             protocol_version=protocol_version,
@@ -464,6 +508,8 @@ class CoordinatorResponse:
             reason=reason,
             selected_specialist=selected_specialist,
             work_item=work_item,
+            review_brief=review_brief,
+            finding_dismissal=finding_dismissal,
         )
 
 

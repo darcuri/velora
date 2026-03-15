@@ -96,17 +96,106 @@ class TestProtocol(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             validate_coordinator_response(payload)
 
-    def test_gemini_runner_is_rejected(self) -> None:
+    def test_gemini_runner_is_accepted_at_protocol_level(self) -> None:
+        """Gemini is now a valid protocol-level runner (for reviewer role).
+
+        Specialist matrix enforcement (policy layer) restricts it from
+        code-writing roles; that is tested in test_specialist_matrix.py.
+        """
         payload = _valid_execute_payload()
         payload["selected_specialist"]["runner"] = "gemini"
-        with self.assertRaises(ProtocolError):
-            validate_coordinator_response(payload)
+        resp = validate_coordinator_response(payload)
+        self.assertEqual(resp.selected_specialist.runner, "gemini")
 
     def test_unknown_keys_are_rejected(self) -> None:
         payload = _valid_execute_payload()
         payload["extra"] = 123
         with self.assertRaises(ProtocolError):
             validate_coordinator_response(payload)
+
+
+def _valid_finding_dismissal_payload() -> dict:
+    return {
+        "finding_ids": ["RF-001"],
+        "justification": "False positive confirmed by manual inspection.",
+    }
+
+
+class TestExpandedCoordinatorDecisions(unittest.TestCase):
+    """Tests for the request_review and dismiss_finding coordinator decisions."""
+
+    def _base(self, decision: str, **extras: object) -> dict:
+        return {
+            "protocol_version": 1,
+            "decision": decision,
+            "reason": "Coordinator reason.",
+            "selected_specialist": {"role": "reviewer", "runner": "gemini"},
+            **extras,
+        }
+
+    def test_request_review_valid(self) -> None:
+        payload = self._base("request_review", review_brief=_valid_review_brief_payload())
+        resp = validate_coordinator_response(payload)
+        self.assertEqual(resp.decision, "request_review")
+        self.assertIsNotNone(resp.review_brief)
+        assert resp.review_brief is not None
+        self.assertEqual(resp.review_brief.id, "RB-0001")
+        self.assertIsNone(resp.work_item)
+        self.assertIsNone(resp.finding_dismissal)
+
+    def test_request_review_missing_brief_is_protocol_error(self) -> None:
+        payload = self._base("request_review")
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_request_review_with_work_item_is_protocol_error(self) -> None:
+        payload = self._base("request_review", review_brief=_valid_review_brief_payload())
+        payload["work_item"] = _valid_execute_payload()["work_item"]
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_dismiss_finding_valid(self) -> None:
+        payload = self._base("dismiss_finding", finding_dismissal=_valid_finding_dismissal_payload())
+        resp = validate_coordinator_response(payload)
+        self.assertEqual(resp.decision, "dismiss_finding")
+        self.assertIsNotNone(resp.finding_dismissal)
+        assert resp.finding_dismissal is not None
+        self.assertEqual(resp.finding_dismissal.finding_ids, ["RF-001"])
+        self.assertIsNone(resp.work_item)
+        self.assertIsNone(resp.review_brief)
+
+    def test_dismiss_finding_missing_dismissal_is_protocol_error(self) -> None:
+        payload = self._base("dismiss_finding")
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_execute_work_item_with_review_brief_is_protocol_error(self) -> None:
+        payload = _valid_execute_payload()
+        payload["review_brief"] = _valid_review_brief_payload()
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_finalize_with_review_brief_is_protocol_error(self) -> None:
+        payload = {
+            "protocol_version": 1,
+            "decision": "finalize_success",
+            "reason": "Done.",
+            "selected_specialist": {"role": "investigator", "runner": "claude"},
+            "review_brief": _valid_review_brief_payload(),
+        }
+        with self.assertRaises(ProtocolError):
+            validate_coordinator_response(payload)
+
+    def test_reviewer_role_accepted(self) -> None:
+        payload = {
+            "protocol_version": 1,
+            "decision": "finalize_success",
+            "reason": "Done.",
+            "selected_specialist": {"role": "reviewer", "runner": "gemini"},
+        }
+        resp = validate_coordinator_response(payload)
+        self.assertEqual(resp.selected_specialist.role, "reviewer")
+        self.assertEqual(resp.selected_specialist.runner, "gemini")
 
 
 def _valid_review_brief_payload() -> dict:
