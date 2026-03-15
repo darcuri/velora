@@ -276,7 +276,12 @@ def _parse_action(raw: str) -> tuple[str, dict[str, Any]] | None:
     try:
         obj = json.loads(text)
     except json.JSONDecodeError:
-        return None
+        # Some models emit literal newlines inside JSON strings instead of \n.
+        # Try repairing by escaping unescaped newlines within string values.
+        try:
+            obj = json.loads(text.replace("\n", "\\n"))
+        except json.JSONDecodeError:
+            return None
     if not isinstance(obj, dict):
         return None
     action = obj.get("action")
