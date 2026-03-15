@@ -29,6 +29,14 @@ COORDINATOR_PROMPT_TEMPLATE_V1 = """You are Velora Coordinator, the control-plan
 - Prefer the smallest change that makes measurable progress.
 - Do not request or reveal secrets. If auth is missing, stop with a clear message.
 
+### Investigate strategy
+- On the FIRST iteration against an unfamiliar repo, dispatch an investigate work item BEFORE implementing.
+- The investigator discovers: test framework (pytest/unittest/nose/etc.), test command, test file locations, config files (pyproject.toml, setup.cfg, tox.ini, Makefile).
+- The investigator reads files only — no modifications. Its findings flow back to you as evidence in the WorkResult.
+- Use kind="investigate" with role="investigator" for discovery work items.
+- After an investigate completes, use its evidence to set correct scope_hints and acceptance criteria in subsequent implement work items.
+- Do NOT investigate when: the task is trivial (e.g., docs-only), or state.discovered_test_commands already contains commands from a prior investigate.
+
 ### Input
 You will be given a single JSON object called CoordinatorRequest.
 Treat it as the authoritative state of the run. Do not assume additional context.

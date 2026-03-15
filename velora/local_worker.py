@@ -160,22 +160,43 @@ def build_local_worker_prompt(
             lines.append(f"- {item}")
     lines.append("")
 
+    is_investigate = work_item.kind == "investigate"
+
+    if is_investigate:
+        lines.append("## Investigate mode")
+        lines.append("This is a READ-ONLY investigation. Do NOT modify any files.")
+        lines.append("Your goal: discover the repo's test infrastructure and build system.")
+        lines.append("Look for: pyproject.toml, setup.cfg, tox.ini, Makefile, package.json, pytest.ini, .github/workflows/")
+        lines.append("Determine: test framework (pytest/unittest/nose/etc), test command, test file locations.")
+        lines.append("")
+        lines.append("When done, use work_complete with a findings dict:")
+        lines.append('{"action": "work_complete", "params": {"summary": "...", "findings": {"test_command": "python -m pytest -q", "test_framework": "pytest", "test_dirs": ["tests/"]}}}')
+        lines.append("")
+
     lines.append("## Available actions")
     lines.append('{"action": "read_file", "params": {"path": "relative/path"}}')
     lines.append('{"action": "list_files", "params": {"path": "relative/dir"}}')
-    lines.append('{"action": "write_file", "params": {"path": "relative/path", "content": "..."}}')
-    lines.append('{"action": "patch_file", "params": {"path": "relative/path", "old": "...", "new": "..."}}')
+    if not is_investigate:
+        lines.append('{"action": "write_file", "params": {"path": "relative/path", "content": "..."}}')
+        lines.append('{"action": "patch_file", "params": {"path": "relative/path", "old": "...", "new": "..."}}')
     lines.append('{"action": "search_files", "params": {"pattern": "search term"}}')
-    lines.append('{"action": "run_tests", "params": {"command": "python -m pytest -q"}}')
+    if not is_investigate:
+        lines.append('{"action": "run_tests", "params": {"command": "python -m pytest -q"}}')
     lines.append('{"action": "work_complete", "params": {"summary": "what you did"}}')
     lines.append('{"action": "work_blocked", "params": {"reason": "SCOPE_INSUFFICIENT|TASK_UNCLEAR|CANNOT_RESOLVE", "blockers": ["..."]}}')
     lines.append("")
 
     lines.append("## Rules")
-    lines.append("- You may only read/write files listed in scope.")
-    lines.append("- You may only run test commands listed above.")
+    if is_investigate:
+        lines.append("- This is read-only. Do NOT use write_file or patch_file.")
+        lines.append("- You may read any file in the repo, not just files listed in scope.")
+        lines.append("- Start by listing the repo root, then read config files (pyproject.toml, setup.cfg, Makefile, tox.ini, etc).")
+        lines.append("- Report your findings in the work_complete findings dict.")
+    else:
+        lines.append("- You may only read/write files listed in scope.")
+        lines.append("- You may only run test commands listed above.")
+        lines.append("- Start by reading the files you need, then make changes, then signal completion.")
     lines.append("- Emit one action per response. JSON only.")
-    lines.append("- Start by reading the files you need, then make changes, then signal completion.")
     lines.append("- If you cannot complete the task with the files in scope, use work_blocked.")
 
     return "\n".join(lines) + "\n"
@@ -261,6 +282,52 @@ class LoopOutcome:
     llm_summary: str        # from work_complete, empty otherwise
     llm_blockers: list[str] # from work_blocked, empty otherwise
     conversation: ConversationManager | None = None  # preserved for test retry re-entry
+    llm_findings: dict[str, Any] | None = None  # from work_complete findings param (investigate items)
+
+
+def _repair_json_newlines(text: str) -> str:
+    """Escape literal newlines/tabs/CRs inside JSON string values only.
+
+    Some local models emit raw newline characters inside JSON string values
+    instead of the escaped ``\\n`` sequence.  A naive ``text.replace("\\n",
+    "\\\\n")`` also replaces structural whitespace between keys, breaking
+    multi-line JSON.
+
+    This walks the text character-by-character, tracking whether we are
+    inside a JSON string (delimited by unescaped ``"``), and escapes
+    control characters only in that context.
+    """
+    out: list[str] = []
+    in_string = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if ch == "\\":
+                # Escaped character — pass through the backslash and the
+                # next char verbatim (whatever it is).
+                out.append(ch)
+                i += 1
+                if i < n:
+                    out.append(text[i])
+            elif ch == '"':
+                in_string = False
+                out.append(ch)
+            elif ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            else:
+                out.append(ch)
+        else:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _parse_action(raw: str) -> tuple[str, dict[str, Any]] | None:
@@ -277,9 +344,9 @@ def _parse_action(raw: str) -> tuple[str, dict[str, Any]] | None:
         obj = json.loads(text)
     except json.JSONDecodeError:
         # Some models emit literal newlines inside JSON strings instead of \n.
-        # Try repairing by escaping unescaped newlines within string values.
+        # Repair by escaping control chars only within string values.
         try:
-            obj = json.loads(text.replace("\n", "\\n"))
+            obj = json.loads(_repair_json_newlines(text))
         except json.JSONDecodeError:
             return None
     if not isinstance(obj, dict):
@@ -381,6 +448,7 @@ def run_local_worker_loop(
         if action == "work_complete":
             _log(f"turn {iteration}: work_complete — entering endgame")
             summary = params.get("summary", "")
+            findings = params.get("findings")
             return LoopOutcome(
                 success=True,
                 reason=HarnessReason.SUCCESS,
@@ -388,6 +456,7 @@ def run_local_worker_loop(
                 llm_summary=summary if isinstance(summary, str) else "",
                 llm_blockers=[],
                 conversation=conv,
+                llm_findings=findings if isinstance(findings, dict) else None,
             )
 
         if action == "work_blocked":
@@ -474,6 +543,7 @@ def _run_endgame(
     scope: WorkerScope,
     work_item: WorkItem,
     llm_summary: str,
+    discovered_test_commands: list[str] | None = None,
 ) -> EndgameOutcome:
     """Mechanical endgame: diff audit, test gates, commit."""
     _log("endgame: starting")
@@ -533,7 +603,11 @@ def _run_endgame(
         if gate in _SKIPPED_GATES:
             tests_run.append({"command": gate, "status": "not_run", "details": f"gate '{gate}' skipped by harness"})
             continue
-        cmd_list = GATE_COMMANDS.get(gate)
+        # Use discovered test commands for the "tests" gate when available.
+        if gate == "tests" and discovered_test_commands:
+            cmd_list = discovered_test_commands[0].split()
+        else:
+            cmd_list = GATE_COMMANDS.get(gate)
         if cmd_list is None:
             tests_run.append({"command": gate, "status": "not_run", "details": f"unknown gate '{gate}'"})
             continue
@@ -641,19 +715,28 @@ def _call_local_llm_chat(messages: list[dict[str, str]], cwd: Path) -> CmdResult
 _TEST_RETRY_CAP = int(os.environ.get("VELORA_HARNESS_TEST_RETRY_CAP", "3"))
 
 
-def _build_scope(work_item: WorkItem, repo_root: Path, work_branch: str) -> WorkerScope:
+def _build_scope(
+    work_item: WorkItem,
+    repo_root: Path,
+    work_branch: str,
+    *,
+    discovered_test_commands: list[str] | None = None,
+) -> WorkerScope:
     likely_files = set(work_item.scope_hints.likely_files)
     allowed_dirs: set[str] = set()
     for f in likely_files:
         parts = Path(f).parts
         for i in range(len(parts) - 1):
             allowed_dirs.add(str(Path(*parts[: i + 1])))
-    # Map gates to command strings
+    # Use discovered test commands if available, otherwise fall back to GATE_COMMANDS.
     test_commands: list[str] = []
-    for gate in work_item.acceptance.gates:
-        cmd_list = GATE_COMMANDS.get(gate)
-        if cmd_list is not None:
-            test_commands.append(" ".join(cmd_list))
+    if discovered_test_commands:
+        test_commands.extend(discovered_test_commands)
+    else:
+        for gate in work_item.acceptance.gates:
+            cmd_list = GATE_COMMANDS.get(gate)
+            if cmd_list is not None:
+                test_commands.append(" ".join(cmd_list))
     return WorkerScope(
         repo_root=repo_root,
         allowed_files=likely_files,
@@ -702,6 +785,7 @@ def run_local_worker(
     verb: str,
     objective: str,
     iteration: int,
+    discovered_test_commands: list[str] | None = None,
 ) -> CmdResult:
     """Full local worker harness entry point.
 
@@ -711,7 +795,7 @@ def run_local_worker(
     """
     _log(f"run_local_worker: work_item={work_item.id} branch={work_branch} repo={repo_root}")
     _log(f"  scope: files={list(work_item.scope_hints.likely_files)} gates={work_item.acceptance.gates}")
-    scope = _build_scope(work_item, repo_root, work_branch)
+    scope = _build_scope(work_item, repo_root, work_branch, discovered_test_commands=discovered_test_commands)
 
     # Phase 0: Pre-flight
     _log("pre-flight: checking working tree")
@@ -769,11 +853,38 @@ def run_local_worker(
             )
             return CmdResult(returncode=0, stdout="", stderr="")
 
+        # Phase 3: Investigate items are read-only — skip endgame.
+        if work_item.kind == "investigate":
+            _log("investigate work item — skipping endgame")
+            evidence: list[str] = []
+            if loop_outcome.llm_findings and isinstance(loop_outcome.llm_findings, dict):
+                evidence.append(f"DISCOVERY:{json.dumps(loop_outcome.llm_findings, sort_keys=True)}")
+            head_sha = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
+            harness_outcome = HarnessOutcome(
+                success=True,
+                reason=HarnessReason.SUCCESS,
+                evidence=evidence,
+            )
+            wr = assemble_work_result(
+                outcome=harness_outcome,
+                work_item_id=work_item.id,
+                summary=loop_outcome.llm_summary,
+                branch=work_branch,
+                head_sha=head_sha,
+                files_touched=[],
+                tests_run=[],
+            )
+            (exchange_dir / "result.json").write_text(
+                json.dumps(wr, sort_keys=True) + "\n", encoding="utf-8",
+            )
+            return CmdResult(returncode=0, stdout="", stderr="")
+
         # Phase 3: Endgame
         endgame = _run_endgame(
             scope=scope,
             work_item=work_item,
             llm_summary=loop_outcome.llm_summary,
+            discovered_test_commands=discovered_test_commands,
         )
 
         if endgame.success:
