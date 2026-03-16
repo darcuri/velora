@@ -624,6 +624,11 @@ def _run_endgame(
                 head_sha="", files_touched=changed_files, tests_run=tests_run,
             )
         output = (proc.stdout or "") + (proc.stderr or "")
+        # Distinguish "tool not installed" from "tool found a problem".
+        if proc.returncode != 0 and "No module named" in output:
+            _log(f"endgame: gate '{gate}' → not_run (tool not installed)")
+            tests_run.append({"command": " ".join(cmd_list), "status": "not_run", "details": output[:2000]})
+            continue
         status = "pass" if proc.returncode == 0 else "fail"
         _log(f"endgame: gate '{gate}' → {status} (rc={proc.returncode})")
         tests_run.append({"command": " ".join(cmd_list), "status": status, "details": output[:2000]})
