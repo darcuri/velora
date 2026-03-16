@@ -798,6 +798,8 @@ class TestInvestigatePrompt(unittest.TestCase):
         self.assertNotIn('"write_file"', actions_section)
         self.assertNotIn('"patch_file"', actions_section)
         self.assertNotIn('"run_tests"', actions_section)
+        # run_probe SHOULD be available for investigate
+        self.assertIn('"run_probe"', actions_section)
         self.assertIn("READ-ONLY", prompt)
         self.assertIn("Investigate mode", prompt)
 

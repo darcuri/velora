@@ -165,7 +165,8 @@ def build_local_worker_prompt(
     if is_investigate:
         lines.append("## Investigate mode")
         lines.append("This is a READ-ONLY investigation. Do NOT modify any files.")
-        lines.append("Figure out how to run tests in this repo. List the root directory, read whatever config files actually exist, and determine the test command.")
+        lines.append("Figure out how to run tests in this repo.")
+        lines.append("List the root directory, read config files that exist, and use run_probe to verify what test tools are actually installed.")
         lines.append("Report the exact shell command to run tests — no annotations or comments, just the command.")
         lines.append("")
         lines.append("When done, use work_complete with a findings dict:")
@@ -179,7 +180,9 @@ def build_local_worker_prompt(
         lines.append('{"action": "write_file", "params": {"path": "relative/path", "content": "..."}}')
         lines.append('{"action": "patch_file", "params": {"path": "relative/path", "old": "...", "new": "..."}}')
     lines.append('{"action": "search_files", "params": {"pattern": "search term"}}')
-    if not is_investigate:
+    if is_investigate:
+        lines.append('{"action": "run_probe", "params": {"command": "python -m pytest --version"}}')
+    else:
         lines.append('{"action": "run_tests", "params": {"command": "python -m pytest -q"}}')
     lines.append('{"action": "work_complete", "params": {"summary": "what you did"}}')
     lines.append('{"action": "work_blocked", "params": {"reason": "SCOPE_INSUFFICIENT|TASK_UNCLEAR|CANNOT_RESOLVE", "blockers": ["..."]}}')
