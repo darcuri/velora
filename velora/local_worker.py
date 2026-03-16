@@ -401,7 +401,7 @@ def run_local_worker_loop(
 
         # -- Call LLM --
         _log(f"turn {iteration}: calling LLM ({conv.context_bytes} context bytes, {len(conv.messages())} messages)")
-        llm_result = _call_local_llm_chat(conv.messages(), scope.repo_root)
+        llm_result = _call_harness_llm(conv.messages(), scope.repo_root)
 
         if llm_result.returncode != 0:
             _log(f"turn {iteration}: LLM call failed: {llm_result.stderr[:200]}")
@@ -667,6 +667,83 @@ def _run_endgame(
         evidence=[], head_sha=head_sha,
         files_touched=changed_files, tests_run=tests_run,
     )
+
+
+def _call_harness_llm(messages: list[dict[str, str]], cwd: Path) -> CmdResult:
+    """Dispatch to the configured LLM backend for the harness.
+
+    VELORA_HARNESS_LLM_BACKEND selects the backend:
+      - "local" (default): OpenAI-compatible endpoint (LM Studio, etc.)
+      - "anthropic": Anthropic Messages API (Claude Sonnet, etc.)
+    """
+    backend = os.environ.get("VELORA_HARNESS_LLM_BACKEND", "local").strip().lower()
+    if backend == "anthropic":
+        return _call_anthropic_chat(messages, cwd)
+    return _call_local_llm_chat(messages, cwd)
+
+
+def _call_anthropic_chat(messages: list[dict[str, str]], cwd: Path) -> CmdResult:
+    """Call the Anthropic Messages API (Claude Sonnet, etc.).
+
+    Uses ANTHROPIC_API_KEY for auth. Set VELORA_HARNESS_MODEL to override
+    the model (default: claude-sonnet-4-20250514).
+    """
+    import urllib.request
+    import urllib.error
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+    if not api_key:
+        return CmdResult(returncode=1, stdout="", stderr="ANTHROPIC_API_KEY not set")
+
+    model = os.environ.get("VELORA_HARNESS_MODEL", "claude-sonnet-4-20250514")
+    timeout_s = int(os.environ.get("VELORA_LOCAL_TIMEOUT", "600"))
+
+    # Convert OpenAI-style messages to Anthropic format.
+    system_text = ""
+    api_messages: list[dict[str, str]] = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_text = msg["content"]
+        else:
+            api_messages.append({"role": msg["role"], "content": msg["content"]})
+
+    body: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 8192,
+        "messages": api_messages,
+    }
+    if system_text:
+        body["system"] = system_text
+
+    req = urllib.request.Request(
+        url="https://api.anthropic.com/v1/messages",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        data=json.dumps(body).encode("utf-8"),
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic HTTP {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic connection failed: {exc.reason}")
+    except TimeoutError:
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic timed out after {timeout_s}s")
+
+    try:
+        payload = json.loads(raw)
+        text = payload["content"][0]["text"]
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        return CmdResult(returncode=1, stdout="", stderr=f"Anthropic response parse error: {exc}")
+
+    return CmdResult(returncode=0, stdout=text, stderr="")
 
 
 def _call_local_llm_chat(messages: list[dict[str, str]], cwd: Path) -> CmdResult:
