@@ -40,10 +40,10 @@ What this means right now:
 - **Orchestrator is a state machine** — `run_task_mode_a` is 7 handler functions dispatched from a loop, not a 1200-line procedure. States: PREFLIGHT, AWAITING_DECISION, DISPATCHING_WORKER, POLLING_CI, DISPATCHING_REVIEW, PROCESSING_DISMISSAL, TERMINAL.
 - **Coordinator has 5 decisions** — `execute_work_item`, `request_review`, `dismiss_finding`, `finalize_success`, `stop_failure`
 - **Review is protocol-driven** — `ReviewBrief` (coordinator tells reviewer what to check), `ReviewResult` with `ReviewFinding` objects (structured output), `FindingDismissal` (coordinator justifies dismissing findings). No more prose parsing for the new path.
-- **Local LLM backend exists** — `direct-local` backend calls any OpenAI-compatible endpoint (e.g., LM Studio at localhost:1234). Works for coordinator; worker harness still needed.
-- **Dogfooded** — qwen3.5-35b (local) produced valid `execute_work_item` and `request_review` responses against the new protocol
-
-Active next step: **design and build a local worker harness** — see `docs/plans/2026-03-15-next-session-plan.md`
+- **Local LLM backend exists** — `direct-local` backend calls any OpenAI-compatible endpoint (e.g., LM Studio at localhost:1234). Works for coordinator and worker.
+- **Worker harness complete** — local worker action loop with investigate, implement, test, commit. Supports both local LLMs and Anthropic API via `VELORA_HARNESS_LLM_BACKEND`.
+- **Investigator-based test discovery** — coordinator dispatches `kind: "investigate"` to discover test infrastructure before implementing. Worker uses `run_probe` to verify what's installed. Soft cap (default 2) prevents infinite investigate loops.
+- **Dogfooded end-to-end** — Opus coordinator + Sonnet worker (API): investigate → implement → test → commit succeeded on tiny-lab. Opus coordinator + qwen3.5-9b worker (local): also succeeded — sloppier (21 turns vs 8) but faster due to zero network latency. 4B models (nemotron-nano) are below the quality floor.
 
 ## First files to read before changing anything
 
@@ -71,15 +71,36 @@ export VELORA_WORKER_BACKEND=direct-codex
 export VELORA_MODE_A_REVIEW_ENABLED=true
 ```
 
-Local LLM testing (no API tokens burned):
+Hybrid (Opus coordinator + local worker, best cost/quality):
+
+```bash
+export VELORA_COORDINATOR_BACKEND=direct-claude
+export VELORA_COORDINATOR_MODEL=claude-opus-4-6
+export VELORA_WORKER_BACKEND=direct-local
+export VELORA_HARNESS_LLM_BACKEND=local
+export VELORA_LOCAL_BASE_URL=http://localhost:1234
+export VELORA_LOCAL_MODEL=qwen/qwen3.5-9b
+export VELORA_MODE_A_MAX_WALL_SECONDS=3600
+```
+
+Fully local (no API tokens burned):
 
 ```bash
 export VELORA_COORDINATOR_BACKEND=direct-local
-export VELORA_WORKER_BACKEND=direct-local  # needs worker harness, not yet built
-# optional:
+export VELORA_WORKER_BACKEND=direct-local
 export VELORA_LOCAL_BASE_URL=http://localhost:1234
-export VELORA_LOCAL_MODEL=qwen/qwen3.5-35b-a3b
+export VELORA_LOCAL_MODEL=qwen/qwen3.5-9b
 export VELORA_LOCAL_TIMEOUT=600
+```
+
+Worker via Anthropic API (most reliable):
+
+```bash
+export VELORA_COORDINATOR_BACKEND=direct-claude
+export VELORA_COORDINATOR_MODEL=claude-opus-4-6
+export VELORA_WORKER_BACKEND=direct-local
+export VELORA_HARNESS_LLM_BACKEND=anthropic
+export VELORA_HARNESS_MODEL=claude-sonnet-4-6
 ```
 
 Auth expected for production backends:
@@ -132,14 +153,17 @@ High-value files and directories:
 - `velora/protocol.py` — all protocol objects (WorkItem, WorkResult, ReviewBrief, ReviewResult, ReviewFinding, FindingDismissal, CoordinatorResponse)
 - `velora/coordinator.py` — coordinator prompt template and execution
 - `velora/runners.py` — backend dispatch (acp-claude, acp-codex, direct-claude, direct-codex, direct-local)
+- `velora/local_worker.py` — local worker harness: action loop, investigate mode, endgame, LLM dispatch (local + anthropic)
+- `velora/worker_actions.py` — action executors (read_file, write_file, patch_file, search_files, run_tests, run_probe)
 - `velora/acpx.py` — LLM API calls including run_local_llm and run_structured_review
 - `velora/cli.py` — CLI surface including `audit inspect`
 - `velora/audit.py` — run-scoped audit artifacts
 - `tests/test_mode_a_work_result_integration.py` — most important integration-style safety net
 - `tests/test_review_protocol_integration.py` — end-to-end review protocol flow tests
 - `tests/test_state_machine.py` — state machine transition and review gate tests
+- `tests/test_local_worker.py` — harness unit tests (JSON repair, investigate, scope, prompts)
+- `tests/test_investigate_integration.py` — end-to-end investigate → implement flow with unittest repo
 - `docs/plans/` — current working state + near-term roadmap
-- `docs/plans/2026-03-15-next-session-plan.md` — immediate next steps
 
 ## Working rules
 
