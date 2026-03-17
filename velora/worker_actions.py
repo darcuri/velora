@@ -27,6 +27,7 @@ class WorkerScope:
     allowed_dirs: set[str]    # parent dirs of allowed_files
     test_commands: list[str]  # joined allowlist strings
     work_branch: str
+    unrestricted_read: bool = False  # investigate items can read any file
 
 
 def resolve_scoped_path(
@@ -73,7 +74,7 @@ def resolve_scoped_path(
             raise ScopeViolation(
                 f"path not in allowed_files: {repo_relative}"
             )
-    else:
+    elif not scope.unrestricted_read:
         # Must be in allowed_files OR within an allowed_dir
         if repo_relative not in scope.allowed_files:
             parts = Path(repo_relative).parts
@@ -187,7 +188,8 @@ def execute_search_files(scope: WorkerScope, params: dict[str, Any]) -> dict[str
         return _action_result("error", f"Invalid regex: {e}")
 
     matches: list[str] = []
-    for dir_name in sorted(scope.allowed_dirs):
+    search_dirs = sorted(scope.allowed_dirs) if not scope.unrestricted_read else ["."]
+    for dir_name in search_dirs:
         dir_path = scope.repo_root / dir_name
         if not dir_path.is_dir():
             continue
@@ -243,6 +245,40 @@ def execute_run_tests(scope: WorkerScope, params: dict[str, Any]) -> dict[str, s
     return _action_result(status, output)
 
 
+_PROBE_TIMEOUT_S = 10
+
+
+def execute_run_probe(scope: WorkerScope, params: dict[str, Any]) -> dict[str, str]:
+    """Run a probe command during investigation. No allowlist — the point is discovery.
+
+    Only available when scope.unrestricted_read is True (investigate items).
+    No shell expansion. Short timeout. Returns output regardless of exit code.
+    """
+    if not scope.unrestricted_read:
+        return _action_result("error", "run_probe is only available during investigate")
+    command_str = params.get("command", "").strip()
+    if not command_str:
+        return _action_result("error", "command must be non-empty")
+    cmd_parts = command_str.split()
+    try:
+        proc = subprocess.run(
+            cmd_parts,
+            cwd=str(scope.repo_root),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return _action_result("error", f"Probe timed out after {_PROBE_TIMEOUT_S}s")
+    except OSError as e:
+        return _action_result("error", f"Probe failed: {e}")
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    rc = proc.returncode
+    return _action_result("ok" if rc == 0 else "not_found", f"exit_code={rc}\n{output}")
+
+
 # Terminal actions return None — the loop handles them specially.
 def _terminal_noop(scope: WorkerScope, params: dict[str, Any]) -> dict[str, str]:
     """Placeholder executor for terminal actions (work_complete, work_blocked).
@@ -257,6 +293,7 @@ KNOWN_ACTIONS: dict[str, Any] = {
     "patch_file": execute_patch_file,
     "search_files": execute_search_files,
     "run_tests": execute_run_tests,
+    "run_probe": execute_run_probe,
     "work_complete": _terminal_noop,
     "work_blocked": _terminal_noop,
 }

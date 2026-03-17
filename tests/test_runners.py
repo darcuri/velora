@@ -238,6 +238,7 @@ class TestLocalBackend(unittest.TestCase):
             verb="fix",
             objective="fix the bug",
             iteration=1,
+            discovered_test_commands=None,
         )
 
     def test_run_worker_direct_local_requires_work_item(self) -> None:

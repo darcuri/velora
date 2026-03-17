@@ -269,6 +269,7 @@ def run_worker(
     verb: str = "",
     objective: str = "",
     iteration: int = 0,
+    discovered_test_commands: list[str] | None = None,
 ) -> CmdResult:
     """Run the worker through the selected backend."""
 
@@ -295,6 +296,7 @@ def run_worker(
             verb=verb,
             objective=objective,
             iteration=iteration,
+            discovered_test_commands=discovered_test_commands,
         )
 
     raise AssertionError(f"unreachable worker backend: {backend_key}")

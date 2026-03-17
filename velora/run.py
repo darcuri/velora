@@ -1647,6 +1647,8 @@ def _state_preflight(ctx: RunContext) -> OrchestratorState:
             "latest_handoff": None,
             "latest_ci": None,
             "latest_review": None,
+            "discovered_test_commands": [],
+            "investigate_count": 0,
             "latest_post_success_review": None,
         },
         "evaluation": {
@@ -1886,6 +1888,25 @@ def _state_awaiting_decision(ctx: RunContext) -> OrchestratorState:
     )
     _ctx_sync_replay(ctx)
 
+    # Investigate budget gate — if the coordinator chose investigate but the
+    # budget is exhausted, reject the decision without burning an iteration.
+    # Inject a hard note and loop back to re-call the coordinator.
+    _INVESTIGATE_CAP = int(os.environ.get("VELORA_INVESTIGATE_CAP", "2"))
+    if (
+        coord_resp.decision == "execute_work_item"
+        and coord_resp.work_item is not None
+        and coord_resp.work_item.kind == "investigate"
+    ):
+        inv_count = int(request.get("state", {}).get("investigate_count", 0))
+        if inv_count >= _INVESTIGATE_CAP:
+            _dbg(dbg_dir, "investigate_cap_reached", {"count": inv_count, "cap": _INVESTIGATE_CAP})
+            request["state"].setdefault("notes", []).append(
+                f"INVESTIGATE UNAVAILABLE: budget exhausted ({inv_count}/{_INVESTIGATE_CAP}). "
+                "You MUST choose implement, repair, or another non-investigate kind."
+            )
+            # Do NOT increment ctx.iteration — this is a coordinator retry, not a full attempt.
+            return OrchestratorState.AWAITING_DECISION
+
     # Route on decision type.
     if coord_resp.decision == "execute_work_item":
         return OrchestratorState.DISPATCHING_WORKER
@@ -1975,6 +1996,11 @@ def _state_dispatching_worker(ctx: RunContext) -> OrchestratorState:
     if coord_resp.work_item is None:
         raise RuntimeError("CoordinatorResponse missing work_item")
 
+    # Track investigate dispatches (cap is enforced in _state_awaiting_decision).
+    if coord_resp.work_item.kind == "investigate":
+        inv_count = int(request.get("state", {}).get("investigate_count", 0))
+        request["state"]["investigate_count"] = inv_count + 1
+
     worker_runner = coord_resp.selected_specialist.runner
     try:
         worker_backend_key = normalize_worker_backend(backend=ctx.worker_backend, runner=worker_runner)
@@ -2060,6 +2086,7 @@ def _state_dispatching_worker(ctx: RunContext) -> OrchestratorState:
     worker_t0 = time.monotonic()
 
     try:
+        _discovered_cmds = request.get("state", {}).get("discovered_test_commands") or None
         agent_result = run_worker(
             session_name=worker_session,
             cwd=repo_path,
@@ -2075,6 +2102,7 @@ def _state_dispatching_worker(ctx: RunContext) -> OrchestratorState:
             verb=ctx.verb if worker_backend_key == "direct-local" else "",
             objective=str(request["objective"]) if worker_backend_key == "direct-local" else "",
             iteration=attempt if worker_backend_key == "direct-local" else 0,
+            discovered_test_commands=_discovered_cmds if worker_backend_key == "direct-local" else None,
         )
     except Exception as exc:  # noqa: BLE001
         detail = _format_preflight_error(exc)
@@ -2306,6 +2334,39 @@ def _state_dispatching_worker(ctx: RunContext) -> OrchestratorState:
         )
         _ctx_sync_replay(ctx)
         _ctx_audit(ctx, attempt, AUDIT_ITERATION_END, outcome="worker_handoff", status="handoff")
+        ctx.iteration += 1
+        return OrchestratorState.AWAITING_DECISION
+
+    # Investigate items are read-only — extract discoveries, skip publish/PR/CI.
+    if coord_resp.work_item.kind == "investigate" and work_result.status == "completed":
+        for ev in work_result.evidence:
+            if isinstance(ev, str) and ev.startswith("DISCOVERY:"):
+                try:
+                    discovery = json.loads(ev[len("DISCOVERY:"):])
+                    if isinstance(discovery, dict):
+                        test_cmd = discovery.get("test_command")
+                        if isinstance(test_cmd, str) and test_cmd.strip():
+                            # Sanitize: strip parenthetical annotations LLMs may add
+                            clean_cmd = re.sub(r"\s*\(.*?\)\s*$", "", test_cmd).strip()
+                            if clean_cmd:
+                                discovered = request["state"].setdefault("discovered_test_commands", [])
+                                if clean_cmd not in discovered:
+                                    discovered.append(clean_cmd)
+                except json.JSONDecodeError:
+                    pass
+        hist["no_progress_streak"] = 0
+        ctx.last_failure_sig = None
+        hist["last_iteration_seconds"] = round(time.monotonic() - ctx.iter_start, 2)
+        _append_iteration_history_entry(
+            request,
+            iteration=attempt,
+            work_item=coord_resp.work_item,
+            selected_specialist=coord_resp.selected_specialist,
+            worker_result=work_result,
+            outcome="investigate_completed",
+        )
+        _ctx_sync_replay(ctx)
+        _ctx_audit(ctx, attempt, AUDIT_ITERATION_END, outcome="investigate_completed", status="completed")
         ctx.iteration += 1
         return OrchestratorState.AWAITING_DECISION
 

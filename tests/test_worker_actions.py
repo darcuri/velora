@@ -270,7 +270,7 @@ class TestDispatch(unittest.TestCase):
 
     def test_known_actions_list(self):
         expected = {"read_file", "list_files", "write_file", "patch_file",
-                    "search_files", "run_tests", "work_complete", "work_blocked"}
+                    "search_files", "run_tests", "run_probe", "work_complete", "work_blocked"}
         self.assertEqual(set(KNOWN_ACTIONS.keys()), expected)
 
 
